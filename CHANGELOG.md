@@ -1,5 +1,18 @@
 # Změny
 
+## 0.4.0
+
+- Přístup k serveru v profilu: lokálně nebo přes SSH (jen klíče/agent, BatchMode),
+  práva správce přes sudo bez hesla nebo pkexec (lokálně). Návrh pravidla sudoers v aplikaci.
+- Nová obrazovka Služba a logy: stav systemd jednotky, PID, doba běhu, spuštění po startu,
+  obsazení disku s daty; spuštění, restart a zastavení (zastavení vyžaduje opsat název);
+  journal nebo error log s filtrem a úrovní.
+- Trvalá konfigurace: Harbor zapisuje jen vlastní soubor `zz-harbor.cnf` (skupina [mariadb])
+  v adresáři konfigurace; před zápisem ho ověří binárkou serveru nanečisto, předchozí verzi
+  uloží jako .bak. Proměnnou lze uložit do konfigurace přímo z obrazovky Proměnné.
+- Ověřeno i proti MariaDB 10.5 (AlmaLinux 9) včetně restartu a projevení uložené hodnoty.
+- TUI: obrazovka Služba (7), klávesa 0 pro Nastavení, dlouhé formuláře se posouvají.
+
 ## 0.3.0
 
 - Zálohy do ZIP vlastním dumpem v Rustu (konzistentní snímek InnoDB, SHA-256 manifest,

@@ -293,6 +293,16 @@ pub struct Session {
     /// Background jobs (backups, restores, verifications), newest last. They keep
     /// running across server switches; each has its own connection.
     pub jobs: Vec<Job>,
+    /// Commands on the server machine (service, logs, configuration); None when the
+    /// profile has no host access.
+    pub host: Option<HostWorker>,
+    pub host_status: Option<ServiceStatus>,
+    pub host_logs: Option<Vec<String>>,
+    pub host_config: Option<HarborConfig>,
+    /// Last host error (shown on the service page, not as a session error).
+    pub host_error: Option<String>,
+    /// Result of the last service action or configuration write.
+    pub host_message: Option<String>,
     /// Read-only for UIs; set through the session so `error_at` stays in sync.
     pub error: Option<String>,
     pub error_at: Instant,
@@ -327,6 +337,12 @@ impl Default for Session {
             health: None,
             change_output: Vec::new(),
             jobs: Vec::new(),
+            host: None,
+            host_status: None,
+            host_logs: None,
+            host_config: None,
+            host_error: None,
+            host_message: None,
             error: None,
             error_at: Instant::now(),
             test_result: None,
@@ -354,6 +370,34 @@ impl Session {
         self.variables = None;
         self.health = None;
         self.change_output.clear();
+        self.host_status = None;
+        self.host_logs = None;
+        self.host_config = None;
+        self.host_error = None;
+        self.host_message = None;
+    }
+    /// Sends a host command; false while another one runs or without host access.
+    pub fn host_request(&mut self, request: HostRequest) -> bool {
+        match &mut self.host {
+            Some(host) => {
+                if host.send(request) {
+                    self.host_error = None;
+                    true
+                } else {
+                    false
+                }
+            }
+            None => {
+                self.host_error = Some(
+                    "Profil nemá nastavený přístup k serveru (Připojení → Přístup k serveru)."
+                        .into(),
+                );
+                false
+            }
+        }
+    }
+    pub fn host_busy(&self) -> bool {
+        self.host.as_ref().is_some_and(|h| h.busy)
     }
     /// Starts a background job: a verification runs locally at once, backup and
     /// restore go through the worker (they need the connected server's settings).
@@ -384,7 +428,7 @@ impl Session {
         if self.worker.busy || !self.pending.is_empty() {
             return Duration::from_millis(100);
         }
-        if self.jobs_running() {
+        if self.jobs_running() || self.host_busy() {
             return Duration::from_millis(250);
         }
         if self.snapshot.is_none() {
@@ -474,6 +518,8 @@ impl Session {
             self.clear_details();
             self.rate = Rate::default();
             self.qps = None;
+            self.host = (demo || profile.host.enabled())
+                .then(|| HostWorker::new(profile.host.clone(), demo));
             self.profile = Some(profile);
             self.error = None;
             self.test_result = None;
@@ -497,6 +543,7 @@ impl Session {
         }
         self.pending.clear();
         self.clear_details();
+        self.host = None;
         self.snapshot = None;
         self.profile = None;
         self.history.clear();
@@ -615,6 +662,27 @@ impl Session {
                 Ok(Response::Disconnected) => self.status = "Odpojeno".into(),
                 Err(error) => self.failed(kind, error),
             }
+        }
+        let host_result = self.host.as_mut().and_then(HostWorker::poll);
+        match host_result {
+            Some(Ok(HostResponse::Status(status))) => self.host_status = Some(status),
+            Some(Ok(HostResponse::Logs(lines))) => self.host_logs = Some(lines),
+            Some(Ok(HostResponse::Config(config))) => self.host_config = Some(config),
+            Some(Ok(HostResponse::Controlled(message))) => {
+                self.host_message = Some(message);
+                // The service changed: refresh its state and reconnect the monitoring.
+                self.host_status = None;
+                self.worker.send(Operation::Refresh);
+            }
+            Some(Ok(HostResponse::ConfigWritten(config))) => {
+                self.host_message = Some(format!(
+                    "Konfigurace uložena do {}; projeví se po restartu serveru.",
+                    config.path
+                ));
+                self.host_config = Some(config);
+            }
+            Some(Err(error)) => self.host_error = Some(error.to_string()),
+            None => (),
         }
         for job in &self.jobs {
             if job.take_finished_report() {

@@ -524,3 +524,49 @@ fn clicking_on_the_text_of_a_row_selects_the_row() {
     click_at(&ctx, &mut app, pos);
     assert_eq!(app.selected_db.as_deref(), Some("identity"));
 }
+#[test]
+fn service_page_loads_from_the_host_and_guards_actions() {
+    let (ctx, mut app) = demo();
+    app.page = SERVICE;
+    let start = std::time::Instant::now();
+    while (app.session.host_logs.is_none() || app.session.host_busy())
+        && start.elapsed() < Duration::from_secs(3)
+    {
+        frame(&ctx, &mut app);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(app
+        .session
+        .host_status
+        .as_ref()
+        .is_some_and(|s| s.running()));
+    assert!(app.session.host_config.is_some());
+    let all = texts(&frame(&ctx, &mut app).shapes).join("\n");
+    assert!(all.contains("běží") && all.contains("Konfigurace Harboru"));
+    // Stopping needs the typed unit name; config values are validated first.
+    app.ask = Some(Ask::Service(ServiceAction::Stop));
+    frame(&ctx, &mut app);
+    let all = texts(&frame(&ctx, &mut app).shapes).join("\n");
+    assert!(
+        all.contains("Pro potvrzení napište název: mariadb"),
+        "{all}"
+    );
+    app.ask = None;
+    app.session.request(Operation::Variables);
+    let start = std::time::Instant::now();
+    while app.session.variables.is_none() && start.elapsed() < Duration::from_secs(3) {
+        frame(&ctx, &mut app);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        app.config_change("max_connections", "5").is_err(),
+        "below minimum"
+    );
+    assert!(
+        app.config_change("max_connections", "300 # x").is_err(),
+        "comment injection"
+    );
+    let entries = app.config_change("max_connections", "300").unwrap();
+    assert!(entries.contains(&("max_connections".into(), "300".into())));
+    assert!(entries.iter().any(|(n, _)| n == "innodb_buffer_pool_size"));
+}

@@ -37,8 +37,8 @@ sestavení DEB v Ubuntu samo o sobě tuto kontrolu nenahrazuje.
 ## TUI
 
 F10 (nebo F9 či Alt+M, pokud F10 zachytí terminál) otevře nabídku všech akcí. F1 zobrazí nápovědu, F3 profily a F5
-obnoví data. Klávesy 1–9 přepínají obrazovky (Server, Databáze, Uživatelé, Spojení,
-Proměnné, Doktor, Zálohy, Profily, Nastavení). Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
+obnoví data. Klávesy 1–9 a 0 přepínají obrazovky (Server, Databáze, Uživatelé, Spojení,
+Proměnné, Doktor, Služba, Zálohy, Profily, Nastavení; klávesa 0 = Nastavení). Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
 Tab přepíná seznam a detail; v detailu šipky posouvají dlouhý text, na obrazovce
 Databáze vybírají tabulku a Enter zobrazí její strukturu. V editoru oprávnění
 mezerník přepíná zaškrtnutí a ←/→ střídá existující rozsahy. Vlevo/vpravo
@@ -117,6 +117,22 @@ Při chybě se data označí jako neaktuální. Práva omezují viditelnost dat.
 - **Plánované zálohy** jako uživatelský časovač systemd (`~/.config/systemd/user`),
   s náhledem jednotek před instalací. Pro běh bez přihlášení je třeba `loginctl enable-linger`.
 
+### Služba, logy a konfigurace (od verze 0.4)
+
+V profilu lze nastavit **přístup k serveru**: lokálně (Harbor běží na stejném stroji) nebo
+přes **SSH** (`uživatel@hostitel`, přihlášení klíčem nebo agentem; SSH běží v dávkovém režimu
+a nikdy nečeká na heslo). Administrativní příkazy získají práva přes `sudo -n` (pravidlo
+NOPASSWD jen pro vybrané příkazy, návrh je v aplikaci) nebo lokálně přes `pkexec`.
+
+- **Služba a logy:** stav jednotky systemd, PID, doba běhu, obsazení disku s daty;
+  spuštění, restart, zastavení (opsat název služby); journal nebo error log s filtrem.
+- **Trvalá konfigurace:** Harbor spravuje jen vlastní soubor `zz-harbor.cnf` ve skupině
+  `[mariadb]` (`/etc/my.cnf.d` na AlmaLinux, `/etc/mysql/mariadb.conf.d` na Ubuntu).
+  Před zápisem nový soubor ověří binárkou serveru (`mariadbd --defaults-file=… --help`),
+  předchozí verzi uloží jako `.bak`. Změny se projeví po restartu.
+- Všechny příkazy jsou pevné programy s argumenty; hodnoty jsou ověřené a pro SSH
+  escapované pro vzdálený shell.
+
 Každá změna má potvrzení se serverem, popisem a **přesným SQL**, které se provede
 (hesla i jejich hashe jsou skryté). Smazání databáze, účtu nebo role vyžaduje opsat
 název. Heslo se serveru posílá jen jako hash `mysql_native_password`. Změna hesla
@@ -135,6 +151,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 python3 scripts/test-pty.py
 bash scripts/test-instances.sh
+bash scripts/test-host.sh
 bash scripts/package.sh
 bash scripts/smoke-packages.sh
 bash scripts/test-upgrade.sh

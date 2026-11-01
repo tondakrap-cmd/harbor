@@ -4,13 +4,14 @@ use harbor_themes::{desktop, rgb, ThemeId};
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 9] = [
+const PAGES: [&str; 10] = [
     "Přehled serveru",
     "Databáze",
     "Uživatelé a oprávnění",
     "Aktivní spojení",
     "Proměnné",
     "Doktor",
+    "Služba a logy",
     "Zálohy",
     "Připojení",
     "Nastavení",
@@ -21,9 +22,10 @@ const ACCOUNTS: usize = 2;
 const PROCESSES: usize = 3;
 const VARIABLES: usize = 4;
 const HEALTH: usize = 5;
-const BACKUPS: usize = 6;
-const CONNECTION: usize = 7;
-const SETTINGS: usize = 8;
+const SERVICE: usize = 6;
+const BACKUPS: usize = 7;
+const CONNECTION: usize = 8;
+const SETTINGS: usize = 9;
 
 /// Forms that prepare one change; the change itself is confirmed in a modal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +78,9 @@ enum Ask {
     Restore(RestoreRequest),
     DeleteBackup(std::path::PathBuf),
     Unschedule(String),
+    Service(ServiceAction),
+    /// The complete new content of Harbor's option file.
+    WriteConfig(Vec<(String, String)>),
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TableSort {
@@ -92,7 +97,7 @@ pub struct Harbor {
     page: usize,
     /// One search per list page (index = page), so typing on one page does not
     /// filter another.
-    filters: [String; 9],
+    filters: [String; 10],
     system: bool,
     long_only: bool,
     key_only: bool,
@@ -163,6 +168,16 @@ pub struct Harbor {
     selected_finding: Option<String>,
     backup_form_open: bool,
     schedule_open: bool,
+    log_from_file: bool,
+    log_lines: u32,
+    /// 0 = all, 1 = errors, 2 = warnings and errors.
+    log_level: u8,
+    /// Variable whose value is being saved into Harbor's option file.
+    config_variable: Option<String>,
+    config_value: String,
+    /// Last SSH settings typed in the profile form (kept when switching access type).
+    ssh_target: String,
+    ssh_port: u16,
 }
 #[derive(Clone, Copy)]
 struct Palette {
@@ -401,6 +416,13 @@ impl Harbor {
             selected_finding: None,
             backup_form_open: false,
             schedule_open: false,
+            log_from_file: false,
+            log_lines: 300,
+            log_level: 0,
+            config_variable: None,
+            config_value: String::new(),
+            ssh_target: String::new(),
+            ssh_port: 22,
         };
         app.backup_dir_text = app.settings.backup_dir().display().to_string();
         if demo {
@@ -454,7 +476,12 @@ impl Harbor {
             // after an explicit new choice.
             self.backup_selection.clear();
             self.restore_open = false;
-            if matches!(self.ask, Some(Ask::Restore(_))) {
+            self.config_variable = None;
+            // Restores, service actions and configuration writes target one server.
+            if matches!(
+                self.ask,
+                Some(Ask::Restore(_) | Ask::Service(_) | Ask::WriteConfig(_))
+            ) {
                 self.ask = None;
             }
             if self.draft == Some(Draft::SetVariable) {
@@ -839,6 +866,83 @@ impl Harbor {
         ui.label(self.profile.security_label());
         if let Some(result) = &self.session.test_result {
             ui.label(result);
+        }
+        ui.add_space(10.0);
+        ui.heading("Přístup k serveru");
+        ui.label(
+            RichText::new(
+                "Volitelné: pro spouštění a zastavení služby, logy a trvalou konfiguraci.",
+            )
+            .small(),
+        );
+        let host = &mut self.profile.host;
+        let mut kind = match host.access {
+            HostAccess::None => 0,
+            HostAccess::Local => 1,
+            HostAccess::Ssh { .. } => 2,
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut kind, 0, "žádný");
+            ui.radio_value(&mut kind, 1, "lokálně (stejný počítač)");
+            ui.radio_value(&mut kind, 2, "SSH");
+        });
+        let (mut target, mut port) = match &host.access {
+            HostAccess::Ssh { target, port } => (target.clone(), *port),
+            _ => (self.ssh_target.clone(), self.ssh_port),
+        };
+        if kind == 2 {
+            field(
+                ui,
+                "SSH cíl (uživatel@hostitel; přihlášení klíčem nebo agentem)",
+                &mut target,
+                false,
+            );
+            ui.horizontal(|ui| {
+                ui.label("SSH port");
+                ui.add(egui::DragValue::new(&mut port).range(1..=65535));
+            });
+            self.ssh_target = target.clone();
+            self.ssh_port = port;
+        }
+        host.access = match kind {
+            1 => HostAccess::Local,
+            2 => HostAccess::Ssh { target, port },
+            _ => HostAccess::None,
+        };
+        if kind != 0 {
+            ui.label("Práva správce:");
+            ui.horizontal_wrapped(|ui| {
+                ui.radio_value(
+                    &mut host.elevation,
+                    Elevation::Sudo,
+                    Elevation::Sudo.label(),
+                );
+                if kind == 1 {
+                    ui.radio_value(
+                        &mut host.elevation,
+                        Elevation::Pkexec,
+                        Elevation::Pkexec.label(),
+                    );
+                }
+                ui.radio_value(
+                    &mut host.elevation,
+                    Elevation::None,
+                    Elevation::None.label(),
+                );
+            });
+            field(ui, "Služba systemd", &mut host.service, false);
+            field(
+                ui,
+                "Adresář konfigurace (prázdné = najít automaticky)",
+                &mut host.config_dir,
+                false,
+            );
+            egui::CollapsingHeader::new("Pravidlo sudo pro správce serveru")
+                .id_salt("sudoers")
+                .show(ui, |ui| {
+                    ui.label("Do /etc/sudoers.d/harbor (visudo -f) na serveru vložte, s vaším uživatelem:");
+                    ui.monospace(SUDOERS_EXAMPLE);
+                });
         }
     }
     fn overview(&mut self, ui: &mut egui::Ui, p: Palette) {
@@ -1640,14 +1744,31 @@ impl Harbor {
                     |app, ui| {
                         ui.heading(safe_text(&variable.name));
                         if ui
-                            .add_enabled(variable.settable(), egui::Button::new("Změnit hodnotu…"))
+                            .add_enabled(variable.settable(), egui::Button::new("Změnit za běhu…"))
                             .clicked()
                         {
                             app.variable_value = variable.value.clone();
                             app.draft = Some(Draft::SetVariable);
                         }
+                        if ui
+                            .add_enabled(
+                                app.session.host.is_some(),
+                                egui::Button::new("Uložit do konfigurace…"),
+                            )
+                            .on_disabled_hover_text("Nastavte v profilu přístup k serveru.")
+                            .clicked()
+                        {
+                            app.config_value = app
+                                .session
+                                .host_config
+                                .as_ref()
+                                .and_then(|c| c.entries.iter().find(|(n, _)| *n == variable.name))
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_else(|| variable.value.clone());
+                            app.config_variable = Some(variable.name.clone());
+                        }
                     },
-                    |_, ui| {
+                    |app, ui| {
                         if let Some(description) = variable.key_description() {
                             ui.label(description);
                         }
@@ -1664,6 +1785,17 @@ impl Harbor {
                             row("Hodnota", safe_text(&variable_value(&variable)));
                             row("Výchozí", variable.default.as_deref().map(safe_text).unwrap_or_else(|| "—".into()));
                             row("Původ", origin_label(&variable).into());
+                            if let Some(config) = &app.session.host_config {
+                                row(
+                                    "V konfiguraci Harboru",
+                                    config
+                                        .entries
+                                        .iter()
+                                        .find(|(n, _)| *n == variable.name)
+                                        .map(|(_, v)| safe_text(v))
+                                        .unwrap_or_else(|| "—".into()),
+                                );
+                            }
                             row("Typ", safe_text(&variable.var_type));
                             if variable.min.is_some() || variable.max.is_some() {
                                 row(
@@ -1682,7 +1814,7 @@ impl Harbor {
                         ui.add_space(6.0);
                         ui.label(
                             RichText::new(if variable.settable() {
-                                "Změna přes SET GLOBAL platí okamžitě, ale jen do restartu serveru."
+                                "Změna za běhu (SET GLOBAL) platí okamžitě, ale jen do restartu. Trvale ji uloží Uložit do konfigurace."
                             } else {
                                 "Tuto proměnnou nelze měnit za běhu; patří do konfiguračního souboru."
                             })
@@ -1796,6 +1928,347 @@ impl Harbor {
                 );
             },
         );
+    }
+    /// Loads what the service page and the variables page need from the host, one
+    /// request at a time (the host worker runs a single command).
+    fn host_autoload(&mut self) {
+        if self.session.host.is_none()
+            || self.session.host_busy()
+            || self.session.host_error.is_some()
+        {
+            return;
+        }
+        let datadir = self
+            .session
+            .snapshot
+            .as_ref()
+            .map(|s| s.datadir.clone())
+            .unwrap_or_default();
+        if self.page == SERVICE {
+            if self.session.host_status.is_none() {
+                self.session.host_request(HostRequest::Status { datadir });
+            } else if self.session.host_config.is_none() {
+                self.session.host_request(HostRequest::ReadConfig);
+            } else if self.session.host_logs.is_none() {
+                let source = self.log_source();
+                self.session.host_request(HostRequest::Logs {
+                    source,
+                    lines: self.log_lines,
+                });
+            }
+        } else if self.page == VARIABLES && self.session.host_config.is_none() {
+            self.session.host_request(HostRequest::ReadConfig);
+        }
+    }
+    fn log_source(&self) -> LogSource {
+        let file = self
+            .session
+            .snapshot
+            .as_ref()
+            .map(|s| s.log_error.clone())
+            .filter(|f| f.starts_with('/'));
+        match file {
+            Some(file) if self.log_from_file => LogSource::File(file),
+            _ => LogSource::Journal,
+        }
+    }
+    fn log_visible(&self, line: &str) -> bool {
+        let level = match self.log_level {
+            1 => line.contains("[ERROR]") || line.contains("ERROR"),
+            2 => line.contains("[ERROR]") || line.contains("[Warning]") || line.contains("ERROR"),
+            _ => true,
+        };
+        level && matches_filter(&self.filters[SERVICE], &[line])
+    }
+    fn service_page(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let host = self.session.profile.as_ref().map(|p| p.host.clone());
+        let demo = self.session.snapshot.as_ref().is_some_and(|s| s.demo);
+        if self.session.host.is_none() {
+            panel_frame(p).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.heading("Přístup k serveru není nastavený");
+                ui.label("Pro spouštění a zastavení služby, logy a trvalou konfiguraci nastavte v profilu přístup k serveru: lokálně (Harbor běží na stejném stroji) nebo přes SSH s klíčem.");
+                ui.label(RichText::new("Administrativní příkazy potřebují práva správce: sudo bez hesla pro vybrané příkazy, nebo pkexec s dotazem na heslo (jen lokálně).").color(p.muted));
+                if ui.button("Nastavit v Připojení →").clicked() {
+                    if let Some(profile) = self.session.profile.clone() {
+                        self.load_profile(profile);
+                    }
+                    self.page = CONNECTION;
+                }
+            });
+            return;
+        }
+        let busy = self.session.host_busy();
+        let running = self.session.host_status.as_ref().map(|s| s.running());
+        toolbar(ui, |ui| {
+            if ui
+                .add_enabled(!busy, egui::Button::new("Obnovit stav"))
+                .clicked()
+            {
+                self.session.host_status = None;
+                self.session.host_logs = None;
+                self.session.host_config = None;
+                self.session.host_error = None;
+            }
+            if ui
+                .add_enabled(
+                    !busy && running == Some(false),
+                    egui::Button::new("▶ Spustit"),
+                )
+                .clicked()
+            {
+                self.ask = Some(Ask::Service(ServiceAction::Start));
+            }
+            if ui
+                .add_enabled(
+                    !busy && running == Some(true),
+                    egui::Button::new("⟳ Restartovat…"),
+                )
+                .clicked()
+            {
+                self.ask_text.clear();
+                self.ask = Some(Ask::Service(ServiceAction::Restart));
+            }
+            if ui
+                .add_enabled(
+                    !busy && running == Some(true),
+                    egui::Button::new("■ Zastavit…"),
+                )
+                .clicked()
+            {
+                self.ask_text.clear();
+                self.ask = Some(Ask::Service(ServiceAction::Stop));
+            }
+            if busy {
+                ui.spinner();
+                ui.label("Provádím příkaz na serveru…");
+            }
+            ui.label(
+                RichText::new(if demo {
+                    "DEMO • simulovaný hostitel".to_string()
+                } else {
+                    host.as_ref()
+                        .map(|h| safe_text(&h.label()))
+                        .unwrap_or_default()
+                })
+                .color(p.muted),
+            );
+        });
+        if let Some(error) = self.session.host_error.clone() {
+            if banner(ui, p, Severity::Critical, &error, Some("Zkusit znovu")) {
+                self.session.host_error = None;
+            }
+        }
+        if let Some(message) = self.session.host_message.clone() {
+            if banner(ui, p, Severity::Info, &message, Some("Zavřít")) {
+                self.session.host_message = None;
+            }
+        }
+        self.split(
+            ui,
+            "service_split",
+            |app, ui| {
+                panel_frame(p).show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    egui::ScrollArea::vertical().id_salt("service_left").auto_shrink([false, false]).show(ui, |ui| {
+                        ui.heading("Služba");
+                        match &app.session.host_status {
+                            None => {
+                                ui.label("Zjišťuji stav…");
+                            }
+                            Some(status) => {
+                                let color = if status.running() {
+                                    p.accent
+                                } else {
+                                    p.severity(Severity::Critical)
+                                };
+                                ui.label(
+                                    RichText::new(format!(
+                                        "● {} ({})",
+                                        if status.running() { "běží" } else { "neběží" },
+                                        safe_text(&status.sub)
+                                    ))
+                                    .strong()
+                                    .color(color),
+                                );
+                                egui::Grid::new("service_status").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                                    let mut row = |label: &str, value: String| {
+                                        ui.label(RichText::new(label).color(p.muted));
+                                        ui.label(value);
+                                        ui.end_row();
+                                    };
+                                    row("Jednotka", safe_text(&status.unit));
+                                    row("Popis", safe_text(&status.description));
+                                    row("PID", if status.pid > 0 { status.pid.to_string() } else { "—".into() });
+                                    row("Běží od", safe_text(&status.since));
+                                    row("Po startu systému", if status.enabled == "enabled" { "spouští se".into() } else { safe_text(&status.enabled) });
+                                });
+                                if let Some(disk) = &status.disk {
+                                    ui.add_space(8.0);
+                                    ui.strong(format!("Disk s daty ({})", safe_text(&disk.mount)));
+                                    let used = disk.used_percent();
+                                    let fraction = used as f32 / 100.0;
+                                    let bar = egui::ProgressBar::new(fraction)
+                                        .desired_width(ui.available_width().min(420.0))
+                                        .text(format!(
+                                            "{used} % • volno {}",
+                                            human_bytes(disk.available_kib * 1024)
+                                        ));
+                                    ui.add(if used >= 85 {
+                                        bar.fill(p.severity(Severity::Critical))
+                                    } else {
+                                        bar
+                                    });
+                                    if used >= 85 {
+                                        ui.label(RichText::new("Disk je téměř plný: zvažte smazání starých binlogů, záloh nebo zvětšení disku.").color(p.warn));
+                                    }
+                                }
+                            }
+                        }
+                        ui.add_space(12.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.heading("Konfigurace Harboru");
+                            ui.label(RichText::new("klepnutím na řádek volbu odeberete").color(p.muted));
+                        });
+                        match app.session.host_config.clone() {
+                            None => {
+                                ui.label("Načítám…");
+                            }
+                            Some(config) => {
+                                ui.label(RichText::new(safe_text(&config.path)).monospace().color(p.muted));
+                                if config.entries.is_empty() {
+                                    ui.label("Harbor zatím nic neuložil. Hodnotu uložíte na obrazovce Proměnné → Uložit do konfigurace.");
+                                }
+                                let entries = config.entries.clone();
+                                if let Some(i) = data_table(ui, "harbor_config", &["VOLBA", "HODNOTA"], &[Some(220.0), None], entries.len(), None, Some(240.0), |ui, row, col| {
+                                    let (name, value) = &entries[row];
+                                    cell(ui, if col == 0 { name } else { value });
+                                }) {
+                                    let mut rest = entries.clone();
+                                    rest.remove(i);
+                                    app.ask = Some(Ask::WriteConfig(rest));
+                                }
+                                ui.label(RichText::new("Změny se projeví po restartu serveru. Předchozí verze souboru zůstává jako záloha .bak.").small().color(p.muted));
+                                egui::CollapsingHeader::new("Obsah souboru").id_salt("cnf_raw").show(ui, |ui| {
+                                    ui.monospace(safe_text(&config.raw));
+                                });
+                            }
+                        }
+                    });
+                });
+            },
+            |app, ui| {
+                panel_frame(p).show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    ui.horizontal_wrapped(|ui| {
+                        ui.heading("Log");
+                        let has_file = app.session.snapshot.as_ref().is_some_and(|s| s.log_error.starts_with('/'));
+                        let before = (app.log_from_file, app.log_lines);
+                        ui.radio_value(&mut app.log_from_file, false, "journal");
+                        ui.add_enabled_ui(has_file, |ui| {
+                            ui.radio_value(&mut app.log_from_file, true, "error log");
+                        });
+                        egui::ComboBox::from_id_salt("log_lines")
+                            .selected_text(format!("{} řádků", app.log_lines))
+                            .show_ui(ui, |ui| {
+                                for n in [100, 300, 1000, 3000] {
+                                    ui.selectable_value(&mut app.log_lines, n, format!("{n} řádků"));
+                                }
+                            });
+                        if before != (app.log_from_file, app.log_lines) || ui.button("Načíst").clicked() {
+                            app.session.host_logs = None;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        search(ui, &mut app.filters[SERVICE]);
+                        ui.radio_value(&mut app.log_level, 0, "vše");
+                        ui.radio_value(&mut app.log_level, 2, "varování a chyby");
+                        ui.radio_value(&mut app.log_level, 1, "jen chyby");
+                    });
+                    ui.separator();
+                    let Some(lines) = app.session.host_logs.clone() else {
+                        ui.label("Načítám log…");
+                        return;
+                    };
+                    let visible: Vec<&String> = lines.iter().filter(|l| app.log_visible(l)).collect();
+                    ui.label(RichText::new(format!("{} z {} řádků • nejnovější dole", visible.len(), lines.len())).small().color(p.muted));
+                    egui::ScrollArea::both()
+                        .id_salt("log_lines")
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show_rows(ui, 18.0, visible.len(), |ui, range| {
+                            for line in &visible[range] {
+                                let text = RichText::new(safe_text(line)).monospace();
+                                // One line per entry (fixed row height); long lines scroll sideways.
+                                ui.add(
+                                    egui::Label::new(if line.contains("ERROR") {
+                                        text.color(p.severity(Severity::Critical))
+                                    } else if line.contains("[Warning]") {
+                                        text.color(p.warn)
+                                    } else {
+                                        text
+                                    })
+                                    .extend(),
+                                );
+                            }
+                        });
+                });
+            },
+        );
+    }
+    fn config_window(&mut self, ctx: &egui::Context) {
+        let Some(name) = self.config_variable.clone() else {
+            return;
+        };
+        let mut open = true;
+        let p = Palette::new(self.theme);
+        let mut review = None;
+        centered_window("Uložit do konfigurace", ctx).open(&mut open).show(ctx, |ui| {
+            ui.label(format!("Volba {} v souboru {}", safe_text(&name), host::HARBOR_CONFIG_FILE));
+            field(ui, "Hodnota (velikosti lze s příponou K/M/G)", &mut self.config_value, false);
+            ui.label(RichText::new("Uloží se do vlastního souboru Harboru, ostatní konfigurace se nemění. Server hodnotu ověří nanečisto; projeví se po restartu.").small().color(p.muted));
+            if ui.button("Zkontrolovat…").clicked() {
+                review = Some(name.clone());
+            }
+        });
+        if let Some(name) = review {
+            match self.config_change(&name, &self.config_value.clone()) {
+                Ok(entries) => {
+                    self.ask = Some(Ask::WriteConfig(entries));
+                    self.config_variable = None;
+                }
+                Err(error) => self.message = error.to_string(),
+            }
+        }
+        if !open {
+            self.config_variable = None;
+        }
+    }
+    /// Harbor's option file with `name = value` set (validated against the server's
+    /// metadata for the variable).
+    fn config_change(&self, name: &str, value: &str) -> Result<Vec<(String, String)>> {
+        let config = self.session.host_config.as_ref().ok_or_else(|| {
+            Error::Validation("Konfigurace serveru se ještě načítá; zkuste to za chvíli.".into())
+        })?;
+        if let Some(variable) = self
+            .session
+            .variables
+            .as_ref()
+            .and_then(|list| list.iter().find(|v| v.name == name))
+        {
+            let mut check = variable.clone();
+            check.read_only = false;
+            check.literal(value)?;
+        }
+        let entry = host::config_entry(name, value)?;
+        let mut entries: Vec<(String, String)> = config
+            .entries
+            .iter()
+            .filter(|(n, _)| *n != entry.0)
+            .cloned()
+            .collect();
+        entries.push(entry);
+        Ok(entries)
     }
     fn backups_page(&mut self, ui: &mut egui::Ui, p: Palette) {
         if !self.backups_loaded {
@@ -2433,6 +2906,64 @@ impl Harbor {
                     None,
                     "Smazat",
                 ),
+                Ask::Service(action) => {
+                    let sessions = self.session.snapshot.as_ref().map_or(0, |s| s.connections);
+                    let unit = self
+                        .session
+                        .profile
+                        .as_ref()
+                        .map(|p| p.host.service.clone())
+                        .unwrap_or_default();
+                    (
+                        match action {
+                            ServiceAction::Start => "Spustit MariaDB?",
+                            ServiceAction::Restart => "Restartovat MariaDB?",
+                            ServiceAction::Stop => "Zastavit MariaDB?",
+                        },
+                        vec![
+                            format!(
+                                "Server: {} • služba {}",
+                                self.session
+                                    .profile
+                                    .as_ref()
+                                    .map(|p| safe_text(&p.name))
+                                    .unwrap_or_default(),
+                                safe_text(&unit)
+                            ),
+                            match action {
+                                ServiceAction::Start => "Služba se spustí.".to_string(),
+                                _ => format!(
+                                    "Aktuálně {sessions} spojení; všechna se přeruší a běžící transakce se vrátí zpět."
+                                ),
+                            },
+                        ],
+                        (*action == ServiceAction::Stop).then_some(unit),
+                        match action {
+                            ServiceAction::Start => "Spustit",
+                            ServiceAction::Restart => "Restartovat",
+                            ServiceAction::Stop => "Zastavit",
+                        },
+                    )
+                }
+                Ask::WriteConfig(entries) => {
+                    let mut lines = vec![
+                        "Nový obsah souboru Harboru (ověří se nanečisto binárkou serveru):".to_string(),
+                    ];
+                    lines.extend(
+                        host::render_config(entries, "…")
+                            .unwrap_or_else(|e| e.to_string())
+                            .lines()
+                            .filter(|l| !l.starts_with('#'))
+                            .map(|l| format!("    {}", safe_text(l))),
+                    );
+                    lines.push("Projeví se po restartu serveru; předchozí soubor zůstane jako .bak.".into());
+                    (
+                        "Uložit konfiguraci na server?",
+                        lines,
+                        None,
+                        "Uložit",
+                    )
+                }
                 Ask::Unschedule(name) => (
                     "Odebrat plánovanou zálohu?",
                     vec![format!(
@@ -2480,6 +3011,29 @@ impl Harbor {
                             }
                             self.ask = None;
                             self.reload_backups();
+                        }
+                        Ask::Service(action) => {
+                            if self.session.host_request(HostRequest::Control(action)) {
+                                self.ask = None;
+                            } else {
+                                self.message = "Na serveru právě běží jiný příkaz.".into();
+                            }
+                        }
+                        Ask::WriteConfig(entries) => {
+                            let profile = self
+                                .session
+                                .profile
+                                .as_ref()
+                                .map(|p| p.name.clone())
+                                .unwrap_or_default();
+                            if self
+                                .session
+                                .host_request(HostRequest::WriteConfig { entries, profile })
+                            {
+                                self.ask = None;
+                            } else {
+                                self.message = "Na serveru právě běží jiný příkaz.".into();
+                            }
                         }
                         Ask::Unschedule(name) => {
                             if let Err(error) = schedule::remove(&name) {
@@ -2897,6 +3451,7 @@ impl Harbor {
         self.properties_window(ctx);
         self.restore_window(ctx);
         self.backup_form_window(ctx);
+        self.config_window(ctx);
         self.schedule_window(ctx);
         self.ask_modal(ctx);
         if let Some(id) = self.delete_profile.clone() {
@@ -3011,6 +3566,7 @@ impl Harbor {
         self.session.tick(self.settings.refresh_seconds);
         self.sync_server_scope();
         self.autoload();
+        self.host_autoload();
         // Results arrive over a channel egui cannot see: poll quickly only while work is
         // in flight, otherwise wake for the next refresh.
         ctx.request_repaint_after(self.session.next_wakeup(self.settings.refresh_seconds));
@@ -3151,6 +3707,7 @@ impl Harbor {
                     VARIABLES => self.variables(ui, p),
                     HEALTH => self.health(ui, p),
                     BACKUPS => self.backups_page(ui, p),
+                    SERVICE => self.service_page(ui, p),
                     CONNECTION => self.connection(ui, p),
                     _ => self.overview(ui, p),
                 }
@@ -3161,6 +3718,8 @@ impl Harbor {
         self.dialogs(ctx);
     }
 }
+/// sudoers rule allowing exactly the commands Harbor runs with elevation.
+const SUDOERS_EXAMPLE: &str = "uzivatel ALL=(root) NOPASSWD: /usr/bin/systemctl, /usr/bin/journalctl, \\\n  /usr/bin/tail, /usr/bin/cat, /usr/bin/tee, /usr/bin/cp, /usr/bin/mv, \\\n  /usr/bin/rm, /usr/bin/mktemp, /usr/sbin/mariadbd, /usr/libexec/mariadbd";
 /// Short description under the page title.
 fn page_subtitle(page: usize) -> &'static str {
     match page {
@@ -3170,6 +3729,7 @@ fn page_subtitle(page: usize) -> &'static str {
         PROCESSES => "kdo je připojen a co právě běží",
         VARIABLES => "parametry serveru a jejich změna za běhu",
         HEALTH => "kontrola bezpečnosti, výkonu a údržby",
+        SERVICE => "spuštění a zastavení, disk, logy a trvalá konfigurace",
         BACKUPS => "zálohy do ZIP, obnova a plánování",
         CONNECTION => "uložené profily a připojení",
         _ => "vzhled a chování aplikace",

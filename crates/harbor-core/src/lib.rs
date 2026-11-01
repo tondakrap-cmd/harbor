@@ -3,6 +3,7 @@ mod backend;
 mod backup;
 pub mod cli;
 mod config;
+pub mod host;
 mod model;
 pub mod schedule;
 mod sql;
@@ -15,6 +16,10 @@ pub use backup::{
     Progress, RestoreRequest, Statements,
 };
 pub use config::{ConfigStore, Settings};
+pub use host::{
+    Disk, Elevation, HarborConfig, HostAccess, HostRequest, HostResponse, HostSettings, HostWorker,
+    LogSource, ServiceAction, ServiceStatus,
+};
 pub use model::*;
 pub use sql::preview;
 pub use worker::{Operation, OperationKind, Response, Session, Worker};

@@ -6,7 +6,7 @@ export CARGO_HOME="$PWD/.build-tools/cargo"
 export PATH="$HOME/.cargo/bin:$PATH"
 mkdir -p .test-data
 chmod 700 .test-data
-for version in 10.11 11.4; do
+for version in 10.5 10.11 11.4; do
   instance="$PWD/.test-data/mariadb-$version"
   container="harbor-test-${version/./-}"
   mkdir -p "$instance/data" "$instance/run"

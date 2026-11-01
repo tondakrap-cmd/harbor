@@ -1,4 +1,5 @@
 use crate::admin::*;
+use crate::host::HostSettings;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -105,6 +106,9 @@ pub struct Profile {
     pub user: String,
     pub tls: TlsMode,
     pub ca: Option<String>,
+    /// Access to the server machine (service, logs, configuration); optional.
+    #[serde(default)]
+    pub host: HostSettings,
     /// Fields written by a newer Harbor version; kept so an older client does not drop them.
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
@@ -121,6 +125,7 @@ impl Default for Profile {
             user: "harbor".into(),
             tls: TlsMode::VerifyIdentity,
             ca: None,
+            host: HostSettings::default(),
             extra: serde_json::Map::new(),
         }
     }
@@ -141,7 +146,7 @@ impl Profile {
             Transport::Unix { path } if !path.starts_with('/') => {
                 Err(Error::Validation("Socket musí mít absolutní cestu.".into()))
             }
-            _ => Ok(()),
+            _ => self.host.validate(),
         }
     }
     pub fn security_label(&self) -> &'static str {
@@ -223,6 +228,9 @@ pub struct Snapshot {
     pub demo: bool,
     /// Server connection the counters were read on; a reconnect restarts rate sampling.
     pub source: u64,
+    /// @@datadir and @@log_error (for disk usage and the log viewer).
+    pub datadir: String,
+    pub log_error: String,
 }
 impl Snapshot {
     pub fn bytes(&self) -> u64 {

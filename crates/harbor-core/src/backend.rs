@@ -92,6 +92,8 @@ impl Backend {
                 ],
                 notices: vec!["DEMO: ukázková data, změny platí jen v paměti do odpojení.".into()],
                 timezone: "Nezjištěno (demo)".into(),
+                datadir: "/var/lib/mysql/".into(),
+                log_error: String::new(),
                 demo: true,
                 source: 0,
             }),
@@ -168,7 +170,8 @@ impl Backend {
              CAST((SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'UPTIME') AS UNSIGNED) AS uptime, \
              CAST((SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'QUESTIONS') AS UNSIGNED) AS questions, \
              CAST((SELECT VARIABLE_VALUE FROM information_schema.SESSION_STATUS WHERE VARIABLE_NAME = 'QUESTIONS') AS UNSIGNED) AS own_questions, \
-             CAST((SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'THREADS_CONNECTED') AS UNSIGNED) AS threads",
+             CAST((SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'THREADS_CONNECTED') AS UNSIGNED) AS threads, \
+             CONVERT(@@datadir USING utf8mb4) AS datadir, CONVERT(@@log_error USING utf8mb4) AS log_error",
         )
         .fetch_one(pool)
         .await?;
@@ -183,6 +186,12 @@ impl Backend {
             uptime: counter("uptime")?,
             questions: counter("questions")?.saturating_sub(counter("own_questions")?),
             connections: counter("threads")?,
+            datadir: row
+                .try_get::<Option<String>, _>("datadir")?
+                .unwrap_or_default(),
+            log_error: row
+                .try_get::<Option<String>, _>("log_error")?
+                .unwrap_or_default(),
             ..Default::default()
         };
         let due = server

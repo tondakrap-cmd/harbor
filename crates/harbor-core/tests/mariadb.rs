@@ -744,9 +744,11 @@ async fn isolated_mariadb_administration() {
     let titles: Vec<&str> = findings.iter().map(|f| f.title.as_str()).collect();
     assert!(titles.contains(&"Účty bez hesla"), "{titles:?}");
     assert!(titles.contains(&"Tabulky bez primárního klíče"));
+    // The list is shortened to 8 names on servers with many such tables.
     assert!(findings
         .iter()
-        .any(|f| f.detail.contains("harbor_adm_db.legacy")));
+        .any(|f| f.detail.contains("harbor_adm_db.legacy")
+            || (f.title == "Tabulky MyISAM" && f.detail.contains("a dalších"))));
 
     // --- drop database
     run(&mut admin, "CREATE DATABASE harbor_drop_db").await;

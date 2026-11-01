@@ -17,7 +17,33 @@ impl Tour {
     pub fn new(ctx: &egui::Context, dir: PathBuf, socket: Option<String>) -> Self {
         let mut app = Harbor::new(ctx, socket.is_none());
         app.store = None;
-        if let Some(path) = socket {
+        if let Ok(port) = std::env::var("HARBOR_TOUR_HOST_DB_PORT") {
+            app.session.connect(
+                Profile {
+                    name: "AlmaLinux 9 přes SSH".into(),
+                    user: "harbor".into(),
+                    transport: Transport::Tcp {
+                        host: "127.0.0.1".into(),
+                        port: port.parse().unwrap_or(3306),
+                    },
+                    tls: TlsMode::InsecureTestOnly,
+                    host: HostSettings {
+                        access: HostAccess::Ssh {
+                            target: "harbor@127.0.0.1".into(),
+                            port: std::env::var("HARBOR_TOUR_SSH_PORT")
+                                .ok()
+                                .and_then(|p| p.parse().ok())
+                                .unwrap_or(22),
+                        },
+                        elevation: Elevation::Sudo,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Secret::new(std::env::var("HARBOR_TOUR_PASSWORD").unwrap_or_default()),
+                false,
+            );
+        } else if let Some(path) = socket {
             app.session.connect(
                 Profile {
                     name: "Velký testovací server".into(),
@@ -142,6 +168,21 @@ impl Tour {
                 Box::new(move |a| set(a, HEALTH)),
             ));
             steps.push((
+                format!("{}-5b-sluzba", t.key()),
+                Box::new(move |a| set(a, SERVICE)),
+            ));
+            steps.push((
+                format!("{}-5c-profil", t.key()),
+                Box::new(move |a| {
+                    if a.page != CONNECTION {
+                        if let Some(profile) = a.session.profile.clone() {
+                            a.load_profile(profile);
+                        }
+                    }
+                    set(a, CONNECTION)
+                }),
+            ));
+            steps.push((
                 format!("{}-6-zalohy", t.key()),
                 Box::new(move |a| {
                     set(a, BACKUPS);
@@ -216,7 +257,11 @@ impl eframe::App for Tour {
             && !self.app.session.worker.busy
             && !self.app.session.has_pending()
             && (self.app.page != HEALTH || self.app.session.health.is_some())
-            && (self.app.page != VARIABLES || self.app.session.variables.is_some());
+            && (self.app.page != VARIABLES || self.app.session.variables.is_some())
+            && (self.app.page != SERVICE
+                || self.app.session.host.is_none()
+                || (!self.app.session.host_busy() && self.app.session.host_logs.is_some())
+                || self.app.session.host_error.is_some());
         self.frames += 1;
         if idle && self.frames > 12 && !self.requested && self.step < self.steps.len() {
             self.requested = true;

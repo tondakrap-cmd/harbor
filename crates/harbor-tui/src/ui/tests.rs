@@ -322,7 +322,8 @@ fn type_text(app: &mut App, text: &str) {
 fn number_keys_switch_pages_and_every_menu_action_is_safe_everywhere() {
     let mut app = demo();
     for (i, page) in PAGES.iter().enumerate() {
-        key(&mut app, K::Char(char::from(b'1' + i as u8)));
+        // 1–9, then 0 for the tenth screen.
+        key(&mut app, K::Char(char::from(b'0' + ((i + 1) % 10) as u8)));
         assert_eq!(app.page, i, "{page}");
     }
     for page in 0..PAGES.len() {
@@ -512,7 +513,7 @@ fn backups_page_lists_archives_and_refuses_demo_and_bad_input() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("cizi.zip"), b"x").unwrap();
-    key(&mut app, K::Char('7'));
+    key(&mut app, K::Char('8'));
     assert_eq!(app.page, BACKUPS);
     assert_eq!(app.backups.len(), 1);
     assert!(render(&app, 120, 35).contains("není záloha Harboru"));
@@ -591,4 +592,135 @@ fn menu_lists_the_current_screens_actions_first() {
     app.menu = Some(separator);
     key(&mut app, K::Enter);
     assert_eq!(app.menu, Some(separator));
+}
+fn settle_host(app: &mut App) {
+    let start = std::time::Instant::now();
+    loop {
+        app.tick();
+        let done = !app.session.host_busy()
+            && app.session.host_status.is_some()
+            && app.session.host_config.is_some()
+            && app.session.host_logs.is_some();
+        if done || start.elapsed() > std::time::Duration::from_secs(3) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+#[test]
+fn service_page_shows_status_logs_and_guards_a_stop() {
+    let mut app = demo();
+    key(&mut app, K::Char('7'));
+    assert_eq!(app.page, SERVICE);
+    settle_host(&mut app);
+    let screen = render(&app, 120, 35);
+    assert!(
+        screen.contains("BĚŽÍ") && screen.contains("DISK TÉMĚŘ PLNÝ"),
+        "status and disk"
+    );
+    assert!(screen.contains("Aborted connection"), "log lines listed");
+    app.run(Action::LogsLevel);
+    app.run(Action::LogsLevel);
+    assert!(
+        app.log_lines().iter().all(|l| l.contains("ERROR")),
+        "errors only"
+    );
+    // Stopping needs the unit name typed.
+    app.run(Action::ServiceStop);
+    key(&mut app, K::Tab);
+    key(&mut app, K::Enter);
+    assert!(app.confirm.is_some());
+    type_text(&mut app, "mariadb");
+    key(&mut app, K::Enter);
+    assert!(app.confirm.is_none());
+    let start = std::time::Instant::now();
+    while app.session.host_message.is_none() && start.elapsed() < std::time::Duration::from_secs(3)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.tick();
+    }
+    settle_host(&mut app);
+    assert!(render(&app, 120, 35).contains("NEBĚŽÍ"));
+}
+#[test]
+fn a_variable_is_saved_into_harbors_option_file() {
+    let mut app = demo();
+    key(&mut app, K::Char('5'));
+    settle(&mut app);
+    let start = std::time::Instant::now();
+    while app.session.host_config.is_none() && start.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.tick();
+    }
+    app.selected = app
+        .variables()
+        .iter()
+        .position(|v| v.name == "max_connections")
+        .unwrap();
+    app.run(Action::VariableToConfig);
+    let dialog = app.dialog.as_mut().unwrap();
+    dialog.fields[0].value = Zeroizing::new("5".into());
+    dialog.focus = dialog.fields.len() + 1;
+    key(&mut app, K::Enter);
+    assert!(app.confirm.is_none(), "below the server's minimum");
+    let dialog = app.dialog.as_mut().unwrap();
+    dialog.fields[0].value = Zeroizing::new("400".into());
+    key(&mut app, K::Enter);
+    assert!(render(&app, 120, 35).contains("max_connections = 400"));
+    key(&mut app, K::Tab);
+    key(&mut app, K::Enter);
+    let start = std::time::Instant::now();
+    while app.session.host_message.is_none() && start.elapsed() < std::time::Duration::from_secs(3)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.tick();
+    }
+    let entries = &app.session.host_config.as_ref().unwrap().entries;
+    assert!(entries.contains(&("max_connections".to_string(), "400".to_string())));
+    assert!(
+        entries.iter().any(|(n, _)| n == "innodb_buffer_pool_size"),
+        "other entries kept"
+    );
+}
+#[test]
+fn long_profile_form_scrolls_and_saves_ssh_access() {
+    let directory = std::env::temp_dir().join(format!("harbor-tui-host-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let mut app = App::new(&[]);
+    app.store = Some(ConfigStore::at(directory.clone()));
+    app.settings = Settings::default();
+    app.profile_dialog(None);
+    let dialog = app.dialog.as_mut().unwrap();
+    dialog.fields[0].value = Zeroizing::new("Produkce".into());
+    dialog.fields[8].value = Zeroizing::new("SSH".into());
+    dialog.fields[9].value = Zeroizing::new("admin@db1.example.cz".into());
+    dialog.fields[11].value = Zeroizing::new("SUDO".into());
+    dialog.focus = 12;
+    let screen = render(&app, 80, 24);
+    assert!(
+        screen.contains("Služba systemd"),
+        "focused field visible at 80×24"
+    );
+    assert!(screen.contains("↑ další pole"));
+    let dialog = app.dialog.as_mut().unwrap();
+    dialog.focus = dialog.fields.len() + 1; // "Uložit"
+    assert!(render(&app, 80, 24).contains("Uložit"), "buttons visible");
+    key(&mut app, K::Enter);
+    let saved = &app.settings.profiles[0];
+    assert_eq!(
+        saved.host.access,
+        HostAccess::Ssh {
+            target: "admin@db1.example.cz".into(),
+            port: 22
+        }
+    );
+    assert_eq!(saved.host.elevation, Elevation::Sudo);
+    // Option injection through the SSH target is refused.
+    app.profile_dialog(Some(saved.clone()));
+    let dialog = app.dialog.as_mut().unwrap();
+    dialog.fields[9].value = Zeroizing::new("-oProxyCommand=sh".into());
+    dialog.focus = dialog.fields.len() + 1;
+    key(&mut app, K::Enter);
+    assert!(app.status_line().contains("SSH"), "{}", app.status_line());
+    std::fs::remove_dir_all(directory).unwrap();
 }

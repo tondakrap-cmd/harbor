@@ -13,13 +13,14 @@ use ratatui::{
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 9] = [
+const PAGES: [&str; 10] = [
     "Server",
     "Databáze",
-    "Uživatelé",
+    "Účty",
     "Spojení",
     "Proměnné",
     "Doktor",
+    "Služba",
     "Zálohy",
     "Profily",
     "Nastavení",
@@ -30,9 +31,10 @@ const ACCOUNTS: usize = 2;
 const PROCESSES: usize = 3;
 const VARIABLES: usize = 4;
 const HEALTH: usize = 5;
-const BACKUPS: usize = 6;
-const PROFILES: usize = 7;
-const SETTINGS: usize = 8;
+const SERVICE: usize = 6;
+const BACKUPS: usize = 7;
+const PROFILES: usize = 8;
+const SETTINGS: usize = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
@@ -58,6 +60,14 @@ enum Action {
     KillQuery,
     SetVariable,
     RunHealth,
+    HostRefresh,
+    ServiceStart,
+    ServiceRestart,
+    ServiceStop,
+    LogsSource,
+    LogsLevel,
+    ConfigRemove,
+    VariableToConfig,
     BackupStart,
     BackupVerify,
     BackupRestore,
@@ -82,9 +92,10 @@ const MENU: &[(&str, Action)] = &[
     ("Spojení (4)", Action::Page(PROCESSES)),
     ("Proměnné (5)", Action::Page(VARIABLES)),
     ("Doktor (6)", Action::Page(HEALTH)),
-    ("Zálohy (7)", Action::Page(BACKUPS)),
-    ("Profily (8, F3)", Action::Page(PROFILES)),
-    ("Nastavení (9)", Action::Page(SETTINGS)),
+    ("Služba a logy (7)", Action::Page(SERVICE)),
+    ("Zálohy (8)", Action::Page(BACKUPS)),
+    ("Profily (9, F3)", Action::Page(PROFILES)),
+    ("Nastavení (0)", Action::Page(SETTINGS)),
     ("Nápověda", Action::Help),
     ("Obnovit", Action::Refresh),
     ("Nový profil", Action::NewProfile),
@@ -109,6 +120,17 @@ const MENU: &[(&str, Action)] = &[
     ("Spojení: ukončit vybraný dotaz", Action::KillQuery),
     ("Proměnná: změnit hodnotu (SET GLOBAL)", Action::SetVariable),
     ("Doktor: spustit kontrolu", Action::RunHealth),
+    (
+        "Služba: obnovit stav, konfiguraci a log",
+        Action::HostRefresh,
+    ),
+    ("Služba: spustit", Action::ServiceStart),
+    ("Služba: restartovat…", Action::ServiceRestart),
+    ("Služba: zastavit…", Action::ServiceStop),
+    ("Log: journal / error log", Action::LogsSource),
+    ("Log: vše / varování a chyby / chyby", Action::LogsLevel),
+    ("Konfigurace: odebrat volbu Harboru…", Action::ConfigRemove),
+    ("Proměnná: uložit do konfigurace…", Action::VariableToConfig),
     ("Záloha: vytvořit…", Action::BackupStart),
     ("Záloha: ověřit vybranou", Action::BackupVerify),
     ("Záloha: obnovit vybranou…", Action::BackupRestore),
@@ -155,11 +177,22 @@ fn page_actions(page: usize) -> &'static [Action] {
         PROCESSES => &[Action::KillQuery, Action::Search, Action::ToggleLong],
         VARIABLES => &[
             Action::SetVariable,
+            Action::VariableToConfig,
             Action::Search,
             Action::ToggleKeyVariables,
             Action::ToggleChangedVariables,
         ],
         HEALTH => &[Action::RunHealth, Action::Search],
+        SERVICE => &[
+            Action::HostRefresh,
+            Action::ServiceStart,
+            Action::ServiceRestart,
+            Action::ServiceStop,
+            Action::LogsSource,
+            Action::LogsLevel,
+            Action::ConfigRemove,
+            Action::Search,
+        ],
         BACKUPS => &[
             Action::BackupStart,
             Action::BackupVerify,
@@ -238,6 +271,7 @@ enum RowKey {
     Variable(String),
     Finding(String),
     Backup(std::path::PathBuf),
+    Log(usize),
     Profile(String),
 }
 enum Outcome {
@@ -265,6 +299,9 @@ enum Kind {
     Restore(std::path::PathBuf),
     Schedule,
     Unschedule,
+    /// Value of this option in Harbor's option file.
+    ConfigValue(String),
+    ConfigRemove,
     /// Search for the list on this page.
     Search(usize),
 }
@@ -284,7 +321,12 @@ impl Kind {
         self.account().is_some()
             || matches!(
                 self,
-                Self::Maintenance(_) | Self::Variable(_) | Self::Backup | Self::Restore(_)
+                Self::Maintenance(_)
+                    | Self::Variable(_)
+                    | Self::Backup
+                    | Self::Restore(_)
+                    | Self::ConfigValue(_)
+                    | Self::ConfigRemove
             )
     }
 }
@@ -335,11 +377,17 @@ fn scope_text(scope: &GrantScope) -> String {
 #[allow(clippy::large_enum_variant)]
 enum Pending {
     Server(Change),
-    DeleteProfile { id: String },
+    DeleteProfile {
+        id: String,
+    },
     Restore(RestoreRequest),
     DeleteBackup(std::path::PathBuf),
     Schedule(schedule::Schedule),
     Unschedule(String),
+    /// Action and the service unit (typed to confirm a stop).
+    Service(ServiceAction, String),
+    /// The complete new content of Harbor's option file.
+    WriteConfig(Vec<(String, String)>),
 }
 struct Confirmation {
     action: Pending,
@@ -359,6 +407,7 @@ impl Confirmation {
         match &self.action {
             Pending::Server(change) => change.destructive_name(),
             Pending::Restore(r) if r.replace => Some(&r.target),
+            Pending::Service(ServiceAction::Stop, unit) => Some(unit),
             _ => None,
         }
     }
@@ -366,7 +415,10 @@ impl Confirmation {
     fn returns_to_form(&self) -> bool {
         !matches!(
             self.action,
-            Pending::DeleteProfile { .. } | Pending::DeleteBackup(_) | Pending::Unschedule(_)
+            Pending::DeleteProfile { .. }
+                | Pending::DeleteBackup(_)
+                | Pending::Unschedule(_)
+                | Pending::Service(..)
         )
     }
 }
@@ -395,7 +447,7 @@ pub struct App {
     picker: Option<PrivilegePicker>,
     confirm: Option<Confirmation>,
     /// One search per page, like the desktop.
-    filters: [String; 9],
+    filters: [String; 10],
     system: bool,
     long: bool,
     key_only: bool,
@@ -412,6 +464,9 @@ pub struct App {
     jobs_finished_seen: usize,
     /// Installed timers; read with the backup list (asks systemctl), not per frame.
     schedules: Vec<schedule::InstalledSchedule>,
+    log_from_file: bool,
+    /// 0 = all, 1 = warnings and errors, 2 = errors.
+    log_level: u8,
     pub quit: bool,
 }
 #[derive(Clone, Copy)]
@@ -475,6 +530,8 @@ impl App {
             backups_loaded: false,
             jobs_finished_seen: 0,
             schedules: Vec::new(),
+            log_from_file: false,
+            log_level: 0,
             quit: false,
         };
         if args.iter().any(|a| a == "--demo") {
@@ -496,6 +553,7 @@ impl App {
         self.sync_server_scope();
         self.reconcile_selection();
         self.autoload();
+        self.host_autoload();
     }
     /// The variables and health pages load their data the first time they are shown
     /// for a server; afterwards only on request.
@@ -538,6 +596,141 @@ impl App {
         }
         file
     }
+    /// Loads the service page's data from the host, one command at a time.
+    fn host_autoload(&mut self) {
+        if self.session.host.is_none()
+            || self.session.host_busy()
+            || self.session.host_error.is_some()
+        {
+            return;
+        }
+        let snapshot = self.session.snapshot.clone();
+        let datadir = snapshot
+            .as_ref()
+            .map(|s| s.datadir.clone())
+            .unwrap_or_default();
+        if self.page == SERVICE {
+            if self.session.host_status.is_none() {
+                self.session.host_request(HostRequest::Status { datadir });
+            } else if self.session.host_config.is_none() {
+                self.session.host_request(HostRequest::ReadConfig);
+            } else if self.session.host_logs.is_none() {
+                let file = snapshot
+                    .map(|s| s.log_error.clone())
+                    .filter(|f| f.starts_with('/') && self.log_from_file);
+                self.session.host_request(HostRequest::Logs {
+                    source: file.map(LogSource::File).unwrap_or(LogSource::Journal),
+                    lines: 500,
+                });
+            }
+        } else if self.page == VARIABLES && self.session.host_config.is_none() {
+            self.session.host_request(HostRequest::ReadConfig);
+        }
+    }
+    fn log_lines(&self) -> Vec<&String> {
+        self.session
+            .host_logs
+            .as_ref()
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter(|l| {
+                        let level = match self.log_level {
+                            1 => l.contains("ERROR") || l.contains("[Warning]"),
+                            2 => l.contains("ERROR"),
+                            _ => true,
+                        };
+                        level && matches_filter(&self.filters[SERVICE], &[l])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn service_text(&self) -> String {
+        let mut lines = Vec::new();
+        if let Some(error) = &self.session.host_error {
+            lines.push(format!("! {}", safe_text(error)));
+        }
+        if let Some(message) = &self.session.host_message {
+            lines.push(safe_text(message));
+        }
+        match &self.session.host_status {
+            Some(st) => {
+                lines.push(format!(
+                    "{} {} ({}) • PID {} • od {} • po startu: {}",
+                    safe_text(&st.unit),
+                    if st.running() { "BĚŽÍ" } else { "NEBĚŽÍ" },
+                    safe_text(&st.sub),
+                    st.pid,
+                    safe_text(&st.since),
+                    safe_text(&st.enabled)
+                ));
+                if let Some(disk) = &st.disk {
+                    lines.push(format!(
+                        "Disk {}: {} % obsazeno, volno {}{}",
+                        safe_text(&disk.mount),
+                        disk.used_percent(),
+                        human_bytes(disk.available_kib * 1024),
+                        if disk.used_percent() >= 85 {
+                            " • DISK TÉMĚŘ PLNÝ"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
+            None if self.session.host.is_some() => lines.push("Zjišťuji stav služby…".into()),
+            None => lines.push(
+                "Profil nemá přístup k serveru: F3 → profil → Přístup LOCAL nebo SSH.".into(),
+            ),
+        }
+        if let Some(config) = &self.session.host_config {
+            lines.push(format!("Konfigurace Harboru: {}", safe_text(&config.path)));
+            if config.entries.is_empty() {
+                lines.push(
+                    "  (prázdná; hodnoty ukládá Proměnné → F10 → uložit do konfigurace)".into(),
+                );
+            }
+            for (name, value) in &config.entries {
+                lines.push(format!("  {} = {}", safe_text(name), safe_text(value)));
+            }
+        }
+        lines.push(format!(
+            "Log: {} • {}",
+            if self.log_from_file {
+                "error log"
+            } else {
+                "journal"
+            },
+            ["vše", "varování a chyby", "jen chyby"][self.log_level as usize % 3]
+        ));
+        lines.join("\n")
+    }
+    /// Harbor's option file with `name = value` set, checked against the variable.
+    fn config_change(&self, name: &str, value: &str) -> Result<Vec<(String, String)>> {
+        let config = self.session.host_config.as_ref().ok_or_else(|| {
+            Error::Validation("Konfigurace serveru se ještě načítá; zkuste to za chvíli.".into())
+        })?;
+        if let Some(variable) = self
+            .session
+            .variables
+            .as_ref()
+            .and_then(|list| list.iter().find(|v| v.name == name))
+        {
+            let mut check = variable.clone();
+            check.read_only = false;
+            check.literal(value)?;
+        }
+        let entry = host::config_entry(name, value)?;
+        let mut entries: Vec<(String, String)> = config
+            .entries
+            .iter()
+            .filter(|(n, _)| *n != entry.0)
+            .cloned()
+            .collect();
+        entries.push(entry);
+        Ok(entries)
+    }
     fn filter(&self) -> &str {
         &self.filters[self.page]
     }
@@ -573,6 +766,7 @@ impl App {
                 .iter()
                 .map(|b| RowKey::Backup(b.path.clone()))
                 .collect(),
+            SERVICE => (0..self.log_lines().len()).map(RowKey::Log).collect(),
             PROFILES => self
                 .settings
                 .profiles
@@ -877,7 +1071,7 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(
-                " F1 Pomoc  F3 Profily  F5 Obnovit  F10/F9/Alt+M Menu  1–9 Obrazovky  Esc Zpět",
+                " F1 Pomoc  F3 Profily  F5 Obnovit  F10/F9/Alt+M Menu  1–9,0 Obrazovky  Esc",
             )
             .style(p.menu),
             rows[4],
@@ -894,7 +1088,7 @@ impl App {
         if self.help {
             let area = centered(area, 76, 22);
             frame.render_widget(Clear, area);
-            frame.render_widget(Paragraph::new("F10, F9 nebo Alt+M: všechny akce v nabídce\n1–9: přímo na obrazovku (Server … Nastavení)\nZálohy: F10 → Záloha: vytvořit / ověřit / obnovit; průběh vidíte v detailu\nŠipky / PageUp / PageDown: výběr a posuv\nEnter: otevřít detail, upravit profil nebo nastavení\nTab: přepnout na detail (Databáze: výběr tabulky, Enter = struktura)\nVlevo/vpravo: vodorovný posuv seznamu\nEsc: zavřít; formulář zůstane rozpracovaný\nF3: profily; F5: obnovit (na Doktorovi znovu zkontrolovat)\n\nOprávnění: mezerník zaškrtne, Enter na Zkontrolovat ukáže SQL.\nZápisy vyžadují potvrzení s náhledem SQL; výchozí je Zrušit.\nMazání vyžaduje opsat název objektu.\nSET GLOBAL platí jen do restartu serveru.\nDEMO je simulace bez skutečného serveru.\nTCP standardně vyžaduje ověřenou identitu TLS.\n\nEsc zavře nápovědu.").block(self.block(" Nápověda ", p)).style(p.base).wrap(Wrap { trim: false }), area);
+            frame.render_widget(Paragraph::new("F10, F9 nebo Alt+M: všechny akce v nabídce\n1–9 a 0: přímo na obrazovku (Server … Nastavení)\nSlužba (7): stav, restart, log, konfigurace; vyžaduje přístup k serveru v profilu\nZálohy: F10 → Záloha: vytvořit / ověřit / obnovit; průběh vidíte v detailu\nŠipky / PageUp / PageDown: výběr a posuv\nEnter: otevřít detail, upravit profil nebo nastavení\nTab: přepnout na detail (Databáze: výběr tabulky, Enter = struktura)\nVlevo/vpravo: vodorovný posuv seznamu\nEsc: zavřít; formulář zůstane rozpracovaný\nF3: profily; F5: obnovit (na Doktorovi znovu zkontrolovat)\n\nOprávnění: mezerník zaškrtne, Enter na Zkontrolovat ukáže SQL.\nZápisy vyžadují potvrzení s náhledem SQL; výchozí je Zrušit.\nMazání vyžaduje opsat název objektu.\nSET GLOBAL platí do restartu; trvale: Proměnná → uložit do konfigurace.\nDEMO je simulace bez skutečného serveru.\nTCP standardně vyžaduje ověřenou identitu TLS.\n\nEsc zavře nápovědu.").block(self.block(" Nápověda ", p)).style(p.base).wrap(Wrap { trim: false }), area);
         }
         if let Some(index) = self.menu {
             let area = centered(area, 64, 26);
@@ -1003,6 +1197,39 @@ impl App {
                     "Odebrat plán {}? Časovač se zastaví, zálohy zůstanou.",
                     safe_text(name)
                 ));
+            }
+            Pending::Service(action, unit) => {
+                lines.push(format!(
+                    "Server: {} • služba {}",
+                    safe_text(profile),
+                    safe_text(unit)
+                ));
+                lines.push(match action {
+                    ServiceAction::Start => "Služba se spustí.".to_string(),
+                    _ => format!(
+                        "{}: všech {} spojení se přeruší, běžící transakce se vrátí zpět.",
+                        if *action == ServiceAction::Stop {
+                            "ZASTAVENÍ"
+                        } else {
+                            "Restart"
+                        },
+                        self.session.snapshot.as_ref().map_or(0, |s| s.connections)
+                    ),
+                });
+            }
+            Pending::WriteConfig(entries) => {
+                lines.push(
+                    "Nový obsah souboru Harboru (ověří se binárkou serveru nanečisto):".into(),
+                );
+                match host::render_config(entries, "…") {
+                    Ok(text) => lines.extend(
+                        text.lines()
+                            .filter(|l| !l.starts_with('#'))
+                            .map(|l| format!("  {}", safe_text(l))),
+                    ),
+                    Err(error) => lines.push(format!("NELZE: {error}")),
+                }
+                lines.push("Projeví se po restartu; předchozí soubor zůstane jako .bak.".into());
             }
         }
         if let Some(name) = confirm.required_name() {
@@ -1251,6 +1478,7 @@ impl App {
                     ),
                 })
                 .collect(),
+            SERVICE => self.log_lines().iter().map(|l| safe_text(l)).collect(),
             PROFILES => self
                 .settings
                 .profiles
@@ -1273,6 +1501,10 @@ impl App {
             VARIABLES if self.session.variables.is_none() => Some("Načítám proměnné…"),
             HEALTH if self.session.health.is_none() => Some("Probíhá kontrola…"),
             HEALTH if self.findings().is_empty() => Some("Bez nálezů."),
+            SERVICE if self.session.host.is_none() => {
+                Some("Profil nemá přístup k serveru (F3 → profil → Přístup k serveru).")
+            }
+            SERVICE if self.session.host_logs.is_none() => Some("Načítám log…"),
             BACKUPS if self.backups.is_empty() => Some("Žádné zálohy. F10 → Záloha: vytvořit…"),
             _ => None,
         }
@@ -1290,6 +1522,7 @@ impl App {
                 None => String::new(),
             },
             BACKUPS => self.backups_text(),
+            SERVICE => self.service_text(),
             HEALTH => match self.findings().get(self.selected) {
                 Some(f) => format!(
                     "{} • {}\n{}\nDoporučení: {}",
@@ -1580,8 +1813,19 @@ impl App {
         let block = self.block(" Formulář • Tab / Shift+Tab • Esc ponechá rozpracované ", p);
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        // Long forms (profile) scroll so the focused field and the buttons stay visible.
+        let capacity = ((inner.height as usize).saturating_sub(3) / 2).max(1);
+        let start = if d.focus < d.fields.len() {
+            d.focus.saturating_sub(capacity - 1)
+        } else {
+            d.fields.len().saturating_sub(capacity)
+        };
+        let end = (start + capacity).min(d.fields.len());
         let mut lines = Vec::new();
-        for (i, field) in d.fields.iter().enumerate() {
+        if start > 0 {
+            lines.push(Line::from(format!("  ↑ další pole ({start})")));
+        }
+        for (i, field) in d.fields.iter().enumerate().take(end).skip(start) {
             lines.push(Line::from(format!(
                 "{}{}",
                 if i == d.focus { "> " } else { "  " },
@@ -1597,7 +1841,14 @@ impl App {
                 if i == d.focus { p.selected } else { p.base },
             ));
         }
-        lines.push(Line::from(""));
+        if end < d.fields.len() {
+            lines.push(Line::from(format!(
+                "  ↓ další pole ({})",
+                d.fields.len() - end
+            )));
+        } else {
+            lines.push(Line::from(""));
+        }
         let buttons = if matches!(d.kind, Kind::Profile(_)) {
             vec!["Zrušit", "Uložit", "Test", "Připojit"]
         } else {
@@ -1735,6 +1986,7 @@ impl App {
             K::Char(c @ '1'..='9') if key.modifiers.is_empty() => {
                 self.run(Action::Page(c as usize - '1' as usize));
             }
+            K::Char('0') if key.modifiers.is_empty() => self.run(Action::Page(SETTINGS)),
             K::F(3) => self.run(Action::Page(PROFILES)),
             K::F(5) => {
                 self.session.request(Operation::Refresh);
@@ -2168,6 +2420,80 @@ impl App {
                 self.session.request(Operation::Health);
                 self.page = HEALTH;
             }
+            Action::HostRefresh => {
+                self.session.host_status = None;
+                self.session.host_config = None;
+                self.session.host_logs = None;
+                self.session.host_error = None;
+                self.page = SERVICE;
+            }
+            Action::ServiceStart | Action::ServiceRestart | Action::ServiceStop => {
+                let Some(unit) = self
+                    .session
+                    .profile
+                    .as_ref()
+                    .filter(|p| p.host.enabled() || self.session.host.is_some())
+                    .map(|p| p.host.service.clone())
+                    .filter(|_| self.session.host.is_some())
+                else {
+                    self.say("Profil nemá přístup k serveru (F3 → profil → Přístup k serveru).");
+                    return;
+                };
+                let service_action = match action {
+                    Action::ServiceStart => ServiceAction::Start,
+                    Action::ServiceRestart => ServiceAction::Restart,
+                    _ => ServiceAction::Stop,
+                };
+                self.confirm = Some(Confirmation::new(Pending::Service(service_action, unit)));
+            }
+            Action::LogsSource => {
+                self.log_from_file = !self.log_from_file;
+                self.session.host_logs = None;
+                self.selected = 0;
+            }
+            Action::LogsLevel => {
+                self.log_level = (self.log_level + 1) % 3;
+                self.selected = 0;
+            }
+            Action::ConfigRemove => match &self.session.host_config {
+                Some(config) if !config.entries.is_empty() => {
+                    let first = config.entries[0].0.clone();
+                    self.dialog = dialog(
+                        Kind::ConfigRemove,
+                        vec![Field::new("Volba k odebrání z konfigurace Harboru", &first)],
+                    );
+                }
+                Some(_) => self.say("Konfigurace Harboru je prázdná."),
+                None => self.say("Konfigurace se načítá na obrazovce Služba (7)."),
+            },
+            Action::VariableToConfig => {
+                if self.session.host.is_none() {
+                    self.say("Profil nemá přístup k serveru (F3 → profil → Přístup k serveru).");
+                    return;
+                }
+                let variable = (self.page == VARIABLES)
+                    .then(|| self.variables().get(self.selected).map(|v| (*v).clone()))
+                    .flatten();
+                match variable {
+                    Some(v) => {
+                        let current = self
+                            .session
+                            .host_config
+                            .as_ref()
+                            .and_then(|c| c.entries.iter().find(|(n, _)| *n == v.name))
+                            .map(|(_, value)| value.clone())
+                            .unwrap_or_else(|| v.value.clone());
+                        self.dialog = dialog(
+                            Kind::ConfigValue(v.name.clone()),
+                            vec![Field::new(
+                                &format!("Hodnota {} v konfiguraci (po restartu)", v.name),
+                                &current,
+                            )],
+                        );
+                    }
+                    None => self.say("Proměnnou vyberte na obrazovce Proměnné (5)."),
+                }
+            }
             Action::BackupStart => {
                 if self.session.snapshot.as_ref().is_none_or(|s| s.demo) {
                     self.say("Zálohovat lze jen připojený skutečný server (ne demo).");
@@ -2320,7 +2646,11 @@ impl App {
     fn profile_dialog(&mut self, profile: Option<Profile>) {
         let original_id = profile.as_ref().map(|p| p.id.clone());
         let profile = profile.unwrap_or_default();
-        let (host, port, socket) = match profile.transport {
+        let (ssh_target, ssh_port) = match &profile.host.access {
+            HostAccess::Ssh { target, port } => (target.clone(), port.to_string()),
+            _ => (String::new(), "22".to_string()),
+        };
+        let (host, port, socket) = match profile.transport.clone() {
             Transport::Tcp { host, port } => (host, port.to_string(), String::new()),
             Transport::Unix { path } => ("localhost".into(), "3306".into(), path),
         };
@@ -2341,6 +2671,29 @@ impl App {
                     } else {
                         "INSECURE_TEST_ONLY"
                     },
+                ),
+                Field::new(
+                    "Přístup k serveru: NONE / LOCAL / SSH",
+                    match profile.host.access {
+                        HostAccess::None => "NONE",
+                        HostAccess::Local => "LOCAL",
+                        HostAccess::Ssh { .. } => "SSH",
+                    },
+                ),
+                Field::new("SSH cíl (uživatel@hostitel)", &ssh_target),
+                Field::new("SSH port", &ssh_port),
+                Field::new(
+                    "Práva správce: SUDO / PKEXEC / NONE",
+                    match profile.host.elevation {
+                        Elevation::Sudo => "SUDO",
+                        Elevation::Pkexec => "PKEXEC",
+                        Elevation::None => "NONE",
+                    },
+                ),
+                Field::new("Služba systemd", &profile.host.service),
+                Field::new(
+                    "Adresář konfigurace (prázdné = najít)",
+                    &profile.host.config_dir,
                 ),
             ],
             focus: 0,
@@ -2555,6 +2908,39 @@ impl App {
                     } else {
                         Transport::Unix { path: v(5) }
                     },
+                    host: HostSettings {
+                        access: match v(8).to_ascii_uppercase().as_str() {
+                            "NONE" | "" => HostAccess::None,
+                            "LOCAL" => HostAccess::Local,
+                            "SSH" => HostAccess::Ssh {
+                                target: v(9),
+                                port: v(10)
+                                    .parse()
+                                    .map_err(|_| Error::Validation("Neplatný SSH port.".into()))?,
+                            },
+                            _ => {
+                                return Err(Error::Validation(
+                                    "Přístup k serveru musí být NONE, LOCAL nebo SSH.".into(),
+                                ))
+                            }
+                        },
+                        elevation: match v(11).to_ascii_uppercase().as_str() {
+                            "SUDO" => Elevation::Sudo,
+                            "PKEXEC" => Elevation::Pkexec,
+                            "NONE" | "" => Elevation::None,
+                            _ => {
+                                return Err(Error::Validation(
+                                    "Práva správce musí být SUDO, PKEXEC nebo NONE.".into(),
+                                ))
+                            }
+                        },
+                        service: if v(12).is_empty() {
+                            "mariadb".into()
+                        } else {
+                            v(12)
+                        },
+                        config_dir: v(13),
+                    },
                     // upsert_profile keeps unknown fields of the stored profile.
                     extra: Default::default(),
                 };
@@ -2748,6 +3134,33 @@ impl App {
                 self.confirm = Some(Confirmation::new(Pending::Schedule(plan)));
                 return Ok(Outcome::Suspend);
             }
+            Kind::ConfigValue(name) => {
+                let entries = self.config_change(name, &v(0))?;
+                self.confirm = Some(Confirmation::new(Pending::WriteConfig(entries)));
+                return Ok(Outcome::Suspend);
+            }
+            Kind::ConfigRemove => {
+                let config = self
+                    .session
+                    .host_config
+                    .as_ref()
+                    .ok_or_else(|| Error::Validation("Konfigurace se ještě načítá.".into()))?;
+                let name = v(0).to_ascii_lowercase().replace('-', "_");
+                if !config.entries.iter().any(|(n, _)| *n == name) {
+                    return Err(Error::Validation(format!(
+                        "Volba {} v konfiguraci Harboru není.",
+                        safe_text(&name)
+                    )));
+                }
+                let rest = config
+                    .entries
+                    .iter()
+                    .filter(|(n, _)| *n != name)
+                    .cloned()
+                    .collect();
+                self.confirm = Some(Confirmation::new(Pending::WriteConfig(rest)));
+                return Ok(Outcome::Suspend);
+            }
             Kind::Unschedule => {
                 self.confirm = Some(Confirmation::new(Pending::Unschedule(v(0))));
                 return Ok(Outcome::Close);
@@ -2840,6 +3253,29 @@ impl App {
                             Err(error) => self.say(error.to_string()),
                         }
                         self.reload_backups();
+                        return;
+                    }
+                    Pending::Service(action, _) => {
+                        if !self.session.host_request(HostRequest::Control(*action)) {
+                            self.say("Na serveru právě běží jiný příkaz.");
+                        }
+                        return;
+                    }
+                    Pending::WriteConfig(entries) => {
+                        let profile = self
+                            .session
+                            .profile
+                            .as_ref()
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default();
+                        if self.session.host_request(HostRequest::WriteConfig {
+                            entries: entries.clone(),
+                            profile,
+                        }) {
+                            self.suspended = None;
+                        } else {
+                            self.say("Na serveru právě běží jiný příkaz.");
+                        }
                         return;
                     }
                     Pending::Unschedule(name) => {
