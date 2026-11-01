@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "default_skin": "original",
+  "purpose": "Design reference tokens, not a final runtime configuration schema",
+  "skins": {
+    "original": {
+      "label": "Original",
+      "design_reference": "Original",
+      "colors": {
+        "bg": "#F5F8F9",
+        "surface": "#FFFFFF",
+        "side": "#142D35",
+        "inset": "#F0F4F6",
+        "ink": "#172B36",
+        "muted": "#71828C",
+        "border": "#E2E9EB",
+        "accent": "#087F75",
+        "bright": "#27B6A2",
+        "tint": "#2C4D53",
+        "good": "#087F75",
+        "good_bg": "#E5F4EF",
+        "warn": "#94631A",
+        "warn_bg": "#FFF2D8"
+      },
+      "typography": {
+        "ui_font": "Inter",
+        "title_font": "Inter",
+        "mono_font": "Liberation Mono",
+        "title_size": 30
+      },
+      "shape": {
+        "card_radius": 12
+      },
+      "overview_layout": "standard"
+    },
+    "terra": {
+      "label": "Terra",
+      "design_reference": "Anthropic / Terra",
+      "colors": {
+        "bg": "#FAF9F5",
+        "surface": "#FFFFFF",
+        "side": "#F0EEE6",
+        "inset": "#F4F2EB",
+        "ink": "#25241F",
+        "muted": "#706C62",
+        "border": "#DFDDD3",
+        "accent": "#B65C3D",
+        "bright": "#D97757",
+        "tint": "#F2E1D6",
+        "good": "#4F6945",
+        "good_bg": "#E8EDE0",
+        "warn": "#825C2F",
+        "warn_bg": "#F3E9D5"
+      },
+      "typography": {
+        "ui_font": "Inter",
+        "title_font": "Merriweather",
+        "mono_font": "Liberation Mono",
+        "title_size": 40
+      },
+      "shape": {
+        "card_radius": 6
+      },
+      "overview_layout": "standard"
+    },
+    "clarity": {
+      "label": "Clarity",
+      "design_reference": "Apple / Clarity",
+      "colors": {
+        "bg": "#F4F5F8",
+        "surface": "#FFFFFF",
+        "side": "#EBEDF3",
+        "inset": "#F3F5F9",
+        "ink": "#1D2330",
+        "muted": "#687180",
+        "border": "#E1E5ED",
+        "accent": "#0766D8",
+        "bright": "#0A84FF",
+        "tint": "#DFEBFF",
+        "good": "#23805A",
+        "good_bg": "#E7F5EC",
+        "warn": "#946018",
+        "warn_bg": "#FFF3DB"
+      },
+      "typography": {
+        "ui_font": "Inter",
+        "title_font": "Inter",
+        "mono_font": "Liberation Mono",
+        "title_size": 32
+      },
+      "shape": {
+        "card_radius": 18
+      },
+      "overview_layout": "standard"
+    },
+    "nocturne": {
+      "label": "Nocturne",
+      "design_reference": "Nocturne",
+      "colors": {
+        "bg": "#0C1017",
+        "surface": "#141B25",
+        "side": "#10151E",
+        "inset": "#1B2432",
+        "ink": "#EDF4FA",
+        "muted": "#A0ACBE",
+        "border": "#293547",
+        "accent": "#9BE7C4",
+        "bright": "#9BE7C4",
+        "tint": "#243F39",
+        "good": "#9BE7C4",
+        "good_bg": "#243F39",
+        "warn": "#E8BD7E",
+        "warn_bg": "#3C3024"
+      },
+      "typography": {
+        "ui_font": "Inter",
+        "title_font": "Inter",
+        "mono_font": "Liberation Mono",
+        "title_size": 34
+      },
+      "shape": {
+        "card_radius": 14
+      },
+      "overview_layout": "hero_metric"
+    }
+  }
+}

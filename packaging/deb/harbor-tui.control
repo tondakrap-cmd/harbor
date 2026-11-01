@@ -1,0 +1,10 @@
+Package: harbor-tui
+Version: @VERSION@-@REVISION@
+Architecture: amd64
+Maintainer: Harbor contributors <harbor@example.invalid>
+Section: database
+Priority: optional
+Depends: libc6 (>= 2.35), libgcc-s1
+Description: Terminalovy spravce MariaDB pro lokalni terminal a SSH
+ Standalone Rust terminal client. No desktop or MariaDB server dependency.
+

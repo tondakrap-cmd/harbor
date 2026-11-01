@@ -1,0 +1,10 @@
+Package: harbor
+Version: @VERSION@-@REVISION@
+Architecture: amd64
+Maintainer: Harbor contributors <harbor@example.invalid>
+Section: database
+Priority: optional
+Depends: libc6 (>= 2.35), libgcc-s1, libx11-6, libxcursor1, libxrandr2, libxi6, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libegl1, libgl1
+Description: Desktopovy spravce MariaDB
+ Rust desktop client with four skins and shared Harbor database core.
+

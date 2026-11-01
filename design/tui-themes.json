@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "default_skin": "turbo_classic",
+  "purpose": "Terminal design reference, validate contrast on target terminals",
+  "skins": {
+    "original": {
+      "label": "Original",
+      "colors": {
+        "background": "#F5F8F9",
+        "foreground": "#172B36",
+        "panel": "#FFFFFF",
+        "muted": "#71828C",
+        "border": "#E2E9EB",
+        "accent": "#087F75",
+        "selected_background": "#2C4D53",
+        "selected_foreground": "#FFFFFF",
+        "menu_background": "#142D35",
+        "menu_foreground": "#FFFFFF",
+        "success": "#087F75",
+        "warning": "#94631A",
+        "error": "#B33C37"
+      },
+      "ansi16_reference": "light"
+    },
+    "terra": {
+      "label": "Terra",
+      "colors": {
+        "background": "#FAF9F5",
+        "foreground": "#25241F",
+        "panel": "#FFFFFF",
+        "muted": "#706C62",
+        "border": "#DFDDD3",
+        "accent": "#B65C3D",
+        "selected_background": "#F2E1D6",
+        "selected_foreground": "#25241F",
+        "menu_background": "#F0EEE6",
+        "menu_foreground": "#25241F",
+        "success": "#4F6945",
+        "warning": "#825C2F",
+        "error": "#B33C37"
+      },
+      "ansi16_reference": "light"
+    },
+    "clarity": {
+      "label": "Clarity",
+      "colors": {
+        "background": "#F4F5F8",
+        "foreground": "#1D2330",
+        "panel": "#FFFFFF",
+        "muted": "#687180",
+        "border": "#E1E5ED",
+        "accent": "#0766D8",
+        "selected_background": "#DFEBFF",
+        "selected_foreground": "#1D2330",
+        "menu_background": "#EBEDF3",
+        "menu_foreground": "#1D2330",
+        "success": "#23805A",
+        "warning": "#946018",
+        "error": "#B33C37"
+      },
+      "ansi16_reference": "light"
+    },
+    "nocturne": {
+      "label": "Nocturne",
+      "colors": {
+        "background": "#0C1017",
+        "foreground": "#EDF4FA",
+        "panel": "#141B25",
+        "muted": "#A0ACBE",
+        "border": "#293547",
+        "accent": "#9BE7C4",
+        "selected_background": "#243F39",
+        "selected_foreground": "#EDF4FA",
+        "menu_background": "#10151E",
+        "menu_foreground": "#EDF4FA",
+        "success": "#9BE7C4",
+        "warning": "#E8BD7E",
+        "error": "#F19B93"
+      },
+      "ansi16_reference": "dark"
+    },
+    "turbo_classic": {
+      "label": "Turbo Classic",
+      "colors": {
+        "background": "#0000AA",
+        "foreground": "#AAAAAA",
+        "panel": "#0000AA",
+        "muted": "#AAAAAA",
+        "border": "#55FFFF",
+        "accent": "#FFFF55",
+        "selected_background": "#00AAAA",
+        "selected_foreground": "#000000",
+        "menu_background": "#AAAAAA",
+        "menu_foreground": "#000000",
+        "success": "#55FF55",
+        "warning": "#FFFF55",
+        "error": "#FF5555"
+      },
+      "ansi16_reference": "turbo_classic"
+    }
+  },
+  "ansi16_palettes": {
+    "light": {
+      "background": "White",
+      "foreground": "Black",
+      "panel": "White",
+      "muted": "DarkGrey",
+      "border": "DarkGrey",
+      "accent": "DarkBlue",
+      "selected_background": "DarkBlue",
+      "selected_foreground": "White",
+      "menu_background": "Grey",
+      "menu_foreground": "Black",
+      "success": "DarkGreen",
+      "warning": "DarkRed",
+      "error": "DarkRed"
+    },
+    "dark": {
+      "background": "Black",
+      "foreground": "White",
+      "panel": "Black",
+      "muted": "Grey",
+      "border": "Grey",
+      "accent": "Cyan",
+      "selected_background": "DarkCyan",
+      "selected_foreground": "White",
+      "menu_background": "Black",
+      "menu_foreground": "White",
+      "success": "Green",
+      "warning": "Yellow",
+      "error": "Red"
+    },
+    "turbo_classic": {
+      "background": "DarkBlue",
+      "foreground": "Grey",
+      "panel": "DarkBlue",
+      "muted": "Grey",
+      "border": "Cyan",
+      "accent": "Yellow",
+      "selected_background": "DarkCyan",
+      "selected_foreground": "Black",
+      "menu_background": "Grey",
+      "menu_foreground": "Black",
+      "success": "Green",
+      "warning": "Yellow",
+      "error": "Red"
+    }
+  },
+  "monochrome": {
+    "focus": "reverse and selection marker",
+    "error": "explicit error label",
+    "status": "explicit text",
+    "borders": "ASCII optional"
+  }
+}

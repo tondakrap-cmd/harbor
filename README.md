@@ -1,0 +1,107 @@
+# Harbor
+
+Správce MariaDB v Rustu: desktop `harbor` (egui/eframe) a samostatný terminálový
+`harbor-tui` (Ratatui/Crossterm). Oba klienti používají `harbor-core`; SQL je pouze
+v jádře. Stav vývoje a skutečné výsledky kontrol uvádí [docs/VALIDATION.md](docs/VALIDATION.md).
+
+## Spuštění ze zdrojů
+
+Rust 1.88.0, Linux x86_64. Připnuté závislosti jsou v Cargo.toml a Cargo.lock.
+Pro desktop jsou potřeba vývojové knihovny X11/Wayland, xkbcommon, EGL a OpenGL.
+Za běhu potřebuje také `libxkbcommon-x11-0` na Ubuntu, respektive
+`libxkbcommon-x11` na AlmaLinux; desktopové balíčky ji od revize 2 vyžadují automaticky.
+TUI vyžaduje pouze Rust/C linker a při běhu interaktivní UTF-8 terminál.
+
+```bash
+cargo build --locked --workspace
+cargo run --locked -p harbor-desktop -- --demo
+cargo run --locked -p harbor-tui -- --demo
+```
+
+Bez `--demo` se klient automaticky nepřipojuje k žádnému serveru. V Připojení /
+Profilech zadejte **testovací** server. TCP standardně ověřuje TLS certifikát i
+identitu, volitelně s vlastní CA. Nešifrované TCP musí být výslovně zvolené jako
+testovací. Lokální Unix socket TLS nepoužívá. Hesla jsou pouze v paměti procesu.
+Zapamatování hesla přes systémové úložiště zatím není implementované.
+
+Desktop nabízí Original (výchozí), Terra, Clarity a Nocturne. Terminál přidává
+výchozí Turbo Classic. Změna motivu nemění spojení ani formuláře. Desktop používá
+přibalená otevřená písma Liberation Sans/Serif/Mono, včetně licence; Terra má patkové
+nadpisy. Fonty jsou náhradou za Inter/Merriweather z referencí. FigCraft není
+potřeba při sestavení ani při běhu.
+
+V Ubuntu 24.04 se předpokládá i běh pod LXQt: aplikace používá X11/Wayland a nemá
+závislost na konkrétním desktopu. Běh přímo v relaci LXQt zatím není ověřený;
+sestavení DEB v Ubuntu samo o sobě tuto kontrolu nenahrazuje.
+
+## TUI
+
+F10 nebo Ctrl+M otevře nabídku všech akcí. F1 zobrazí nápovědu, F3 profily a F5
+obnoví data. Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
+Tab přepíná seznam a detail; v detailu šipky posouvají dlouhý text. Vlevo/vpravo
+posouvá široký seznam. Ve formuláři Tab/Shift+Tab střídá pole a tlačítka.
+Esc ponechá formulář rozpracovaný; otevřete ho přes nabídku. Ctrl+C ukončuje.
+
+```bash
+harbor-tui --colors=16 --ascii
+harbor-tui --colors=mono
+ssh -t test-server harbor-tui
+```
+
+Barvy lze měnit i v nastavení. `auto` respektuje NO_COLOR a COLORTERM; jinak volí
+16 barev. Monochromatický režim používá inverzi a značku výběru. Pod 80×24 zůstává
+možnost Ctrl+C. Terminál se obnovuje guardem, panic hookem a při SIGINT/TERM/HUP.
+
+## Data a změny
+
+Profily a samostatná volba motivu každého klienta: `$XDG_CONFIG_HOME/harbor/settings.json`,
+jinak `~/.config/harbor/settings.json`. Zápis je atomický a zamčený s načtením aktuální
+konfigurace. Žádný profil neobsahuje heslo. Připojení mají pool nejvýše jedné relace;
+pracovní vlákno s Tokio přijímá typované zprávy, má časové limity a rušení při změně
+serveru. Výsledky staré generace se zahazují. Obnovování se nehromadí.
+
+QPS = rozdíl globálního `Questions` / skutečný monotónní čas; první vzorek nemá
+rychlost, restart/reset začíná nový úsek. Čítač zahrnuje také monitoring. Graf drží
+nejvýše 120 skutečně odebraných vzorků; historie před připojením se nevymýšlí.
+Velikosti a počty řádků jsou odhady z information_schema. OS se neodhaduje.
+Při chybě se data označí jako neaktuální. Práva omezují viditelnost dat.
+
+Zápisy: vytvoření DB s kolací ověřenou serverem, účet uživatel@hostitel, změna hesla
+samostatného mysql_native_password, GRANT/REVOKE SELECT/INSERT/UPDATE/DELETE a
+KILL QUERY. Potvrzení ukazuje server i cíl a skrývá heslo. Změna hesla odmítne
+neznámý nebo vícenásobný autentizační mechanismus. KILL QUERY znovu porovná dostupné
+údaje o cíli; MariaDB neposkytuje atomický příkaz „porovnej a ukonči“, mezi kontrolou
+a KILL zůstává krátké časové okno. Relace se neukončuje.
+
+Demo simuluje pouze vytvoření DB/účtu a KILL QUERY; ostatní zápisy výslovně odmítá.
+Demo hodnoty se nikdy nepoužívají jako náhrada selhaného skutečného spojení.
+
+## Kontroly a balíčky
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
+python3 scripts/test-pty.py
+bash scripts/test-instances.sh
+bash scripts/package.sh
+bash scripts/smoke-packages.sh
+bash scripts/test-upgrade.sh
+bash scripts/test-ssh-tmux.sh
+```
+
+Změna pouze balicích metadat může na vývojovém AlmaLinux využít dříve sestavené
+Ubuntu binárky: `bash scripts/build-ubuntu.sh --repackage`. Skript ověří shodu
+zdrojů s původním sestavením, přebalí DEB v Ubuntu 24.04 a porovná binárky po bajtech.
+Původní balíčky zachová v `previous-revision`. Při změně kódu vyžaduje úplné sestavení.
+
+Skript test-instances vyžaduje rootless Podman a založí pouze projektové izolované
+MariaDB 10.11/11.4 bez TCP. Integrační test vyžaduje explicitní cestu socketu pod
+`.test-data` a kontrolní tabulku instance. Testuje čtení, chybné heslo, omezený účet,
+zápisy i ukončení dotazu při zachování relace. Produkční připojení nepoužívejte.
+
+package.sh povoluje DEB pouze na Ubuntu 24.04, RPM pouze na AlmaLinux 9. Každý systém
+vytvoří samostatné `harbor` a `harbor-tui` do `dist/<distribuce-verze>/` s SHA256SUMS.
+Neinstaluje MariaDB ani službu a nemění firewall nebo SELinux. Balíčky nemají
+odinstalační skripty odstraňující uživatelské profily. Instalace/upgrade/odinstalace,
+skutečné GUI X11/Wayland, SSH a tmux vyžadují vlastní ověření v cílových systémech.

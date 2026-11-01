@@ -1,0 +1,16 @@
+[package]
+name = "harbor-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "harbor"
+path = "src/main.rs"
+
+[dependencies]
+harbor-core.workspace = true
+harbor-themes.workspace = true
+eframe.workspace = true
+

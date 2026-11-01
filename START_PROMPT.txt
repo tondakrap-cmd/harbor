@@ -1,0 +1,11 @@
+Vyvíjej aplikaci Harbor podle PROJECT_BRIEF.md, docs/ARCHITECTURE.md a docs/TUI.md. Nejprve si tyto soubory přečti a prohlédni design/DESIGN_HANDOFF.md, design/themes.json, design/tui-themes.json a náhledy všech čtyř desktopových skinů. Konverzace, ve které vznikly návrhy, není pro práci potřeba.
+
+Produkt je správce MariaDB v Rustu pro Ubuntu a AlmaLinux se dvěma povinnými rozhraními: desktopovým GUI a terminálovým TUI. Oba klienti sdílejí harbor-core a podporují stejné databázové operace. Povinné výstupy jsou samostatné balíčky harbor a harbor-tui ve formátu DEB i RPM, celkem čtyři instalační soubory pro první cílovou matici. TUI se musí instalovat a spouštět bez desktopových závislostí, také v SSH relaci.
+
+Všechny čtyři návrhy Original, Terra, Clarity a Nocturne implementuj jako přepínatelné desktopové skiny. TUI nabídne jejich terminálové barevné adaptace a navíc výchozí Turbo Classic ve stylu Turbo Pascalu 6: modré plochy, rámečky, horní nabídku, dialogy a lištu funkčních kláves. Výchozí desktopový skin je Original. Přepínání motivů musí zachovat spojení, rozpracované formuláře a výběr.
+
+Začni etapou 1: připrav Cargo workspace, sdílené aplikační jádro, desktopové rozhraní v egui/eframe, TUI v Ratatui/Crossterm, demo backend a hlavní obrazovky obou klientů. Potom pokračuj skutečným připojením k testovací MariaDB, přehledy, řízenými změnami a balením podle etap v zadání. Veškeré síťové a databázové operace musí běžet mimo vykreslování UI. Nevytvářej pomocný server, webový frontend ani druhou implementaci SQL. Nespoléhej na přítomnost FigCraftu při běhu aplikace.
+
+Předpoklady: x86_64, Ubuntu 24.04 LTS, AlmaLinux 9, testovací MariaDB 10.11 a 11.4. Začni kontrolou prostředí a připni ověřené závislosti. Na Windows můžeš editovat zdroje; Linuxové sestavení a balíčky ověř v odpovídajícím Linuxovém prostředí. Kompatibilitu nepotvrzuj jen podle překladu. Nepřipojuj se k produkčnímu serveru a neprováděj v něm změny. Pokud chybí testovací server, použij izolované testovací instance; demo provoz musí být jasně označený.
+
+Nevytvářej pouze další obrázek návrhu. Dodej postupně funkční program, ověřené balíčky, dokumentaci a pravdivý přehled provedených kontrol a zbývajících omezení.

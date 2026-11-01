@@ -1,0 +1,265 @@
+{
+  "project": "Harbor",
+  "purpose": "Rust desktop and TUI implementation brief with design references",
+  "clients": [
+    "desktop",
+    "tui"
+  ],
+  "desktop_skin_count": 4,
+  "tui_skin_count": 5,
+  "native_figcraft_projects": 5,
+  "reference_screens": 20,
+  "implementation_included": false,
+  "files": [
+    {
+      "path": "design/build_design.py",
+      "bytes": 13161,
+      "sha256": "d321c3028c44c730e408a4e6de6cbd3e09f8eeca87973c0123085a2e1cfbeae2"
+    },
+    {
+      "path": "design/build_variants.py",
+      "bytes": 29821,
+      "sha256": "947dedadd99a2d1149720c49272bf46a9becd48631438e37b8262cb918d2e678"
+    },
+    {
+      "path": "design/DESIGN_HANDOFF.md",
+      "bytes": 3146,
+      "sha256": "4cd9f6290703bfe5b110c02757a8566c85aacd544ac188c8b9c990d63789d60a"
+    },
+    {
+      "path": "design/harbor-mariadb.figcraft",
+      "bytes": 64454,
+      "sha256": "149f2425a51fa4ad4fa47496d5b16679c9d8a164c1690038c13a4ed263cc6a04"
+    },
+    {
+      "path": "design/harbor.commands.json",
+      "bytes": 217170,
+      "sha256": "0a3847818580214489570b819df1d6e0844fd77f388e82f33386d78ec4143162"
+    },
+    {
+      "path": "design/previews/01 Přehled serveru.png",
+      "bytes": 189475,
+      "sha256": "a229d4aad0a66d536447fbd209505744a89e594df1213371a83b4d63ebec7552"
+    },
+    {
+      "path": "design/previews/02 Databáze.png",
+      "bytes": 146044,
+      "sha256": "f030ce17341cfa28adc2010d984166ce9768e43bb6033b8b6d2ec6ecfadf63fe"
+    },
+    {
+      "path": "design/previews/03 Uživatelé a oprávnění.png",
+      "bytes": 167857,
+      "sha256": "a01f0f6332b0e9ff7ec72aded9a118dee805b59ee40ca133e436c96be7614284"
+    },
+    {
+      "path": "design/previews/04 Aktivní spojení.png",
+      "bytes": 159935,
+      "sha256": "663625f87f45e2e75fa656ec175ee9336d2b730c365d2ca363d265d1ec4a37b3"
+    },
+    {
+      "path": "design/previews/05 Nové připojení.png",
+      "bytes": 180731,
+      "sha256": "4e367cfa17e3de19c0469bf15dd7f0a5c8e953365ef8281048b82efbea9f5f18"
+    },
+    {
+      "path": "design/README.md",
+      "bytes": 2059,
+      "sha256": "ebe237de8bd5060c911a541510eb0d9630f424486fd46be78bcd079866109c70"
+    },
+    {
+      "path": "design/themes.json",
+      "bytes": 3301,
+      "sha256": "5cd2f0a53214a8bb20c7b896a8deed56f1a65c3824f4026adca557cbc7d68c01"
+    },
+    {
+      "path": "design/tui-themes.json",
+      "bytes": 4437,
+      "sha256": "53f2763d97f06806326d663e5330222213ce5eac7146839051211e353bd03d00"
+    },
+    {
+      "path": "design/variants/anthropic/build.commands.json",
+      "bytes": 466445,
+      "sha256": "aea368151d6dcbab7b29dc46b42400ef587af6ce207f929eea987f4ffa36d830"
+    },
+    {
+      "path": "design/variants/anthropic/harbor-anthropic.figcraft",
+      "bytes": 82178,
+      "sha256": "faf6db593bdf749d6474fb04e970575776891d0ebddbcbce4f9c03ddc7beba10"
+    },
+    {
+      "path": "design/variants/anthropic/previews/01 Přehled serveru.png",
+      "bytes": 181116,
+      "sha256": "9a07e1237dbd7ccf1b2f257bcb6e4e01bcd28d0571867b2dc7679610c535ed6d"
+    },
+    {
+      "path": "design/variants/anthropic/previews/02 Databáze.png",
+      "bytes": 153158,
+      "sha256": "71a0cd824a58d036e7290c7c9080ce39f010adc127344168be96d0a3c008d2d8"
+    },
+    {
+      "path": "design/variants/anthropic/previews/03 Uživatelé a oprávnění.png",
+      "bytes": 174450,
+      "sha256": "574197763b716941e1052e3c8e9496877ebcad0b0dc698efa3ce176142963231"
+    },
+    {
+      "path": "design/variants/anthropic/previews/04 Aktivní spojení.png",
+      "bytes": 163284,
+      "sha256": "aedbcb2655961e6a2ffc02fac9679404baa8d68d84a0d13c5a925e84f5891719"
+    },
+    {
+      "path": "design/variants/anthropic/previews/05 Nové připojení.png",
+      "bytes": 190678,
+      "sha256": "d133a519b9a2746e69d009d69a98850933a7a9d0fff165a71564a4b343814dc6"
+    },
+    {
+      "path": "design/variants/apple/build.commands.json",
+      "bytes": 448841,
+      "sha256": "9b2cac5abf5372286879662aeb070a6a35fc6bacf0418604f292674925bd1451"
+    },
+    {
+      "path": "design/variants/apple/harbor-apple.figcraft",
+      "bytes": 84870,
+      "sha256": "89b7ca3ec6b50890d3033be584d2fd65bb2fa869aef3da10d78d8f8f6aabf98b"
+    },
+    {
+      "path": "design/variants/apple/previews/01 Přehled serveru.png",
+      "bytes": 200410,
+      "sha256": "5de98893cba60e20f6b0f2ba485e12e3438898e4a71b80f5f3ff0763aeddebea"
+    },
+    {
+      "path": "design/variants/apple/previews/02 Databáze.png",
+      "bytes": 158514,
+      "sha256": "c6893c88ee6ad1c4f265762cc6f41c825713c2a2ac0a2a909ff4d6413a5d7f2f"
+    },
+    {
+      "path": "design/variants/apple/previews/03 Uživatelé a oprávnění.png",
+      "bytes": 178678,
+      "sha256": "a507cc63693c085320e37140006a7dc1bdb6ca4d36b1afe2c1b2a5ff1076a6d8"
+    },
+    {
+      "path": "design/variants/apple/previews/04 Aktivní spojení.png",
+      "bytes": 168849,
+      "sha256": "569b1efe14049e40a0383068cdb616cc21e7432ee2f414d02f33eabe0e2d3c3a"
+    },
+    {
+      "path": "design/variants/apple/previews/05 Nové připojení.png",
+      "bytes": 197889,
+      "sha256": "21a8468e64a51da4513229d5a8cdff0ccce455145ebe023e3fddc04eb4c2fe08"
+    },
+    {
+      "path": "design/variants/combine.py",
+      "bytes": 2873,
+      "sha256": "cd3d6c07979eeb4ba561eee4f62b4ead29dd8afb279ed83d450b13362c622d2f"
+    },
+    {
+      "path": "design/variants/combined-verification.json",
+      "bytes": 161,
+      "sha256": "241cf56e010ea50538ea84d06d2f170b90a745ddcf1e27a27e103d330a947a12"
+    },
+    {
+      "path": "design/variants/comparison.png",
+      "bytes": 311461,
+      "sha256": "d98767d71375289d36148967db998a45513826540f3d63361a6519418fcbe6c6"
+    },
+    {
+      "path": "design/variants/harbor-all-variants.figcraft",
+      "bytes": 177306,
+      "sha256": "34f2004e70e1ecad98ec68b692306a71cb7b5f48630be6e69438591eed501b81"
+    },
+    {
+      "path": "design/variants/nocturne/build.commands.json",
+      "bytes": 455743,
+      "sha256": "d9b2e28d8b709beda3f977a5f9665bcdd5ba9efb4280ab3a9d75465d9c113d23"
+    },
+    {
+      "path": "design/variants/nocturne/harbor-nocturne.figcraft",
+      "bytes": 82776,
+      "sha256": "b9ff5160d95e719af66b73745caa66fb86de4d760d6ce671fa7fac8022b8cca4"
+    },
+    {
+      "path": "design/variants/nocturne/previews/01 Přehled serveru.png",
+      "bytes": 184756,
+      "sha256": "3fc8dee8162e2115ddbf787a13dd760937d3375b7729879e129ec6a85906e845"
+    },
+    {
+      "path": "design/variants/nocturne/previews/02 Databáze.png",
+      "bytes": 154307,
+      "sha256": "7c6e508829dc274af5fcf613a1f87915eac770504f76992d71cad8d59ed35c99"
+    },
+    {
+      "path": "design/variants/nocturne/previews/03 Uživatelé a oprávnění.png",
+      "bytes": 175338,
+      "sha256": "24ec66b2f3f645c52488ec2b259ba4c554542c8ae7de40fa2b6b03ba25ac1552"
+    },
+    {
+      "path": "design/variants/nocturne/previews/04 Aktivní spojení.png",
+      "bytes": 165469,
+      "sha256": "c0f05345a3e274fe0488f8d890849b080373bb33d2e7ebbe4ec3ed53c50f9ea2"
+    },
+    {
+      "path": "design/variants/nocturne/previews/05 Nové připojení.png",
+      "bytes": 190419,
+      "sha256": "c8804364a8e7c19164f51bf7adad76056f26f7b62b2e23d3687c02be4136e7a8"
+    },
+    {
+      "path": "design/variants/original/previews/01 Přehled serveru.png",
+      "bytes": 189475,
+      "sha256": "a229d4aad0a66d536447fbd209505744a89e594df1213371a83b4d63ebec7552"
+    },
+    {
+      "path": "design/variants/original/previews/02 Databáze.png",
+      "bytes": 146044,
+      "sha256": "f030ce17341cfa28adc2010d984166ce9768e43bb6033b8b6d2ec6ecfadf63fe"
+    },
+    {
+      "path": "design/variants/original/previews/03 Uživatelé a oprávnění.png",
+      "bytes": 167857,
+      "sha256": "a01f0f6332b0e9ff7ec72aded9a118dee805b59ee40ca133e436c96be7614284"
+    },
+    {
+      "path": "design/variants/original/previews/04 Aktivní spojení.png",
+      "bytes": 159935,
+      "sha256": "663625f87f45e2e75fa656ec175ee9336d2b730c365d2ca363d265d1ec4a37b3"
+    },
+    {
+      "path": "design/variants/original/previews/05 Nové připojení.png",
+      "bytes": 180731,
+      "sha256": "4e367cfa17e3de19c0469bf15dd7f0a5c8e953365ef8281048b82efbea9f5f18"
+    },
+    {
+      "path": "design/variants/README.md",
+      "bytes": 3561,
+      "sha256": "4106ac0bd094dfa8a1f163dcde95ea67d954b91a9c43851b8b02e775d46f1e12"
+    },
+    {
+      "path": "design/variants/verification.json",
+      "bytes": 577,
+      "sha256": "db7b2f33c132697739984f20cc628caaa537ef165f8cb44cd194e923cf3951c3"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "bytes": 7653,
+      "sha256": "f1819885b65ec8c4a9d5d5dfee700a54d45e6dce260c69a0586ddcc21d154183"
+    },
+    {
+      "path": "docs/TUI.md",
+      "bytes": 5430,
+      "sha256": "2380bd14440937301883dca562081b63b5a1fbc87af4c23d162ce2c7251d7a20"
+    },
+    {
+      "path": "PROJECT_BRIEF.md",
+      "bytes": 13037,
+      "sha256": "2c40773aee0260c88528e18c06d50d7a49e874ea6374f6b23d768c0fd9be87a0"
+    },
+    {
+      "path": "START_HERE.md",
+      "bytes": 2860,
+      "sha256": "7ff47c91e12b1e7b16b4106103a6eec4554f6bee3de7035022767587791ec80e"
+    },
+    {
+      "path": "START_PROMPT.txt",
+      "bytes": 2406,
+      "sha256": "4af87077fa20d37cc238e9961e40ba307a8a7bb27862c3e43a8fd3e44b81ded0"
+    }
+  ]
+}

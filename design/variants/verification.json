@@ -1,0 +1,26 @@
+{
+  "anthropic": {
+    "screens": 5,
+    "native_layers": 572,
+    "navigation_links": 27,
+    "shared_styles": 53,
+    "missing_fonts": [],
+    "all_navigation_targets_valid": true
+  },
+  "apple": {
+    "screens": 5,
+    "native_layers": 519,
+    "navigation_links": 27,
+    "shared_styles": 59,
+    "missing_fonts": [],
+    "all_navigation_targets_valid": true
+  },
+  "nocturne": {
+    "screens": 5,
+    "native_layers": 536,
+    "navigation_links": 27,
+    "shared_styles": 62,
+    "missing_fonts": [],
+    "all_navigation_targets_valid": true
+  }
+}
