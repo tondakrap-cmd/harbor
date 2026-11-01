@@ -88,6 +88,26 @@ impl Palette {
         }
     }
 }
+/// Light text on the dark Original sidebar: the navigation buttons must get dark fills too,
+/// otherwise egui's light-theme button background makes them white on white.
+const SIDEBAR_TEXT: Color32 = Color32::from_rgb(220, 238, 239);
+fn dark_sidebar(v: &mut egui::Visuals, p: Palette) {
+    v.override_text_color = Some(SIDEBAR_TEXT);
+    let idle = Color32::from_rgb(0x1E, 0x3B, 0x44);
+    for (widget, fill) in [
+        (&mut v.widgets.inactive, idle),
+        (&mut v.widgets.hovered, p.tint),
+        (&mut v.widgets.active, p.tint),
+    ] {
+        widget.bg_fill = fill;
+        widget.weak_bg_fill = fill;
+        widget.bg_stroke = Stroke::new(1.0, p.tint);
+        widget.fg_stroke.color = SIDEBAR_TEXT;
+    }
+    // Darker than the accent so the light label keeps WCAG AA contrast.
+    v.selection.bg_fill = Color32::from_rgb(0x06, 0x66, 0x5E);
+    v.selection.stroke = Stroke::new(1.0, SIDEBAR_TEXT);
+}
 fn card<R>(ui: &mut egui::Ui, p: Palette, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
         .fill(p.surface)
@@ -903,7 +923,7 @@ impl Harbor {
             .frame(egui::Frame::new().fill(p.side).inner_margin(20.0))
             .show(ctx, |ui| {
                 if self.theme == ThemeId::Original {
-                    ui.visuals_mut().override_text_color = Some(Color32::from_rgb(220, 238, 239));
+                    dark_sidebar(ui.visuals_mut(), p);
                 }
                 ui.add_space(12.0);
                 ui.heading(RichText::new("h  harbor").size(28.0));
@@ -1077,6 +1097,43 @@ fn chart(ui: &mut egui::Ui, values: &[f64], p: Palette) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let lum = |c: Color32| {
+            let ch = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
+        };
+        let (x, y) = (lum(a), lum(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn original_sidebar_buttons_are_readable() {
+        let p = Palette::new(ThemeId::Original);
+        let mut v = egui::Visuals::light();
+        dark_sidebar(&mut v, p);
+        let text = v.override_text_color.unwrap();
+        for fill in [
+            v.widgets.inactive.weak_bg_fill,
+            v.widgets.hovered.weak_bg_fill,
+            v.widgets.active.weak_bg_fill,
+            v.selection.bg_fill,
+            p.side,
+        ] {
+            assert!(
+                contrast(text, fill) >= 4.5,
+                "{fill:?}: {}",
+                contrast(text, fill)
+            );
+        }
+    }
     #[test]
     fn themes_preserve_drafts_selection_and_render_at_both_sizes() {
         let ctx = egui::Context::default();
