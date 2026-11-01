@@ -30,6 +30,13 @@ pub enum Error {
     Protocol,
     #[error("Databázová operace selhala (kód {0}). Citlivé údaje nejsou vypsány.")]
     Database(String),
+    #[error("Soubor: {0}")]
+    File(String),
+    #[error("Zrušeno uživatelem.")]
+    Cancelled,
+    /// Result of a background job; the text is already complete.
+    #[error("{0}")]
+    Job(String),
 }
 impl From<sqlx::Error> for Error {
     fn from(error: sqlx::Error) -> Self {

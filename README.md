@@ -37,8 +37,8 @@ sestavení DEB v Ubuntu samo o sobě tuto kontrolu nenahrazuje.
 ## TUI
 
 F10 (nebo F9 či Alt+M, pokud F10 zachytí terminál) otevře nabídku všech akcí. F1 zobrazí nápovědu, F3 profily a F5
-obnoví data. Klávesy 1–8 přepínají obrazovky (Server, Databáze, Uživatelé, Spojení,
-Proměnné, Doktor, Profily, Nastavení). Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
+obnoví data. Klávesy 1–9 přepínají obrazovky (Server, Databáze, Uživatelé, Spojení,
+Proměnné, Doktor, Zálohy, Profily, Nastavení). Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
 Tab přepíná seznam a detail; v detailu šipky posouvají dlouhý text, na obrazovce
 Databáze vybírají tabulku a Enter zobrazí její strukturu. V editoru oprávnění
 mezerník přepíná zaškrtnutí a ←/→ střídá existující rozsahy. Vlevo/vpravo
@@ -93,6 +93,29 @@ Při chybě se data označí jako neaktuální. Práva omezují viditelnost dat.
   vzdálený root, využití spojení, neúspěšná připojení, buffer pool, dočasné tabulky na
   disku, tabulky bez PK a MyISAM, fragmentace, binlogy bez expirace, slow log, dlouhé
   transakce, TLS. Kontroly, na které účet nemá právo, uvede jako neprovedené.
+
+### Zálohy (od verze 0.3)
+
+- **Záloha do ZIP** vlastním logickým dumpem v Rustu přes SQL spojení: funguje i vzdáleně
+  a nepotřebuje `mariadb-dump`. Tabulky InnoDB se čtou v jednom konzistentním snímku,
+  netransakční (MyISAM, Aria) jsou v manifestu označené. Archiv obsahuje jeden SQL soubor
+  na databázi (tabulky, data, pohledy, procedury, funkce, triggery, události, sekvence)
+  a `manifest.json` s kontrolními součty SHA-256. Binární data jsou v hexadecimálním zápisu,
+  generované sloupce se neukládají. Volitelné šifrování AES-256 heslem. Soubor má práva
+  0600 a vzniká pod dočasným názvem; zrušená nebo neúspěšná záloha nic nezanechá.
+- **Obnova** do nové databáze (kopie vedle originálu) nebo nahrazení existující (vyžaduje
+  opsat název). Před obnovou se ověří kontrolní součet. Pohledy závislé na jiných pohledech
+  se vytvoří ve správném pořadí. SQL soubor obnoví i samotný klient:
+  `unzip -p záloha.zip shop.sql | mariadb`.
+- **Ověření** archivu: kontrolní součty a úplné rozparsování SQL bez zápisu na server.
+- Zálohy a obnovy běží na pozadí s vlastním spojením, ukazují průběh a lze je zrušit;
+  sledování serveru mezitím pokračuje.
+- **Příkazová řádka** (oba programy, bez okna): `harbor-tui backup --profile NÁZEV
+  [--databases a,b] [--dir ADRESÁŘ] [--keep N] [--password-file SOUBOR]`, dále `restore`,
+  `verify` a `backups`. Heslo nikdy v argumentech, jen v souboru s právy 600.
+  `--keep N` maže jen nejstarší zálohy daného profilu pojmenované Harborem.
+- **Plánované zálohy** jako uživatelský časovač systemd (`~/.config/systemd/user`),
+  s náhledem jednotek před instalací. Pro běh bez přihlášení je třeba `loginctl enable-linger`.
 
 Každá změna má potvrzení se serverem, popisem a **přesným SQL**, které se provede
 (hesla i jejich hashe jsou skryté). Smazání databáze, účtu nebo role vyžaduje opsat

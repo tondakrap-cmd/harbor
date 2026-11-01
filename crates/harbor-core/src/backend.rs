@@ -11,6 +11,8 @@ use std::{
 pub struct Backend {
     inner: Kind,
 }
+// One backend per session; boxing the server would only add indirection.
+#[allow(clippy::large_enum_variant)]
 enum Kind {
     Demo(Snapshot),
     MariaDb(Server),
@@ -22,6 +24,9 @@ pub const SIZE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 type SchemaSizes = (Instant, HashMap<String, (u64, u64)>);
 struct Server {
     pool: MySqlPool,
+    /// For extra connections of background jobs (backup, restore); the password lives
+    /// in memory exactly as long as the pool, which needs it to reconnect anyway.
+    options: MySqlConnectOptions,
     sizes: Option<SchemaSizes>,
     size_interval: Duration,
 }
@@ -93,32 +98,7 @@ impl Backend {
         }
     }
     pub async fn connect(profile: &Profile, password: Secret) -> Result<Self> {
-        profile.validate()?;
-        let mut options = MySqlConnectOptions::new()
-            .username(&profile.user)
-            .disable_statement_logging();
-        if !password.0.is_empty() {
-            options = options.password(&password.0);
-        }
-        options =
-            match &profile.transport {
-                Transport::Tcp { host, port } => options.host(host).port(*port).ssl_mode(
-                    if profile.tls == TlsMode::VerifyIdentity {
-                        MySqlSslMode::VerifyIdentity
-                    } else {
-                        MySqlSslMode::Disabled
-                    },
-                ),
-                Transport::Unix { path } => options.socket(path).ssl_mode(MySqlSslMode::Disabled),
-            };
-        if let Some(ca) = &profile.ca {
-            if matches!(profile.transport, Transport::Tcp { .. })
-                && profile.tls == TlsMode::VerifyIdentity
-            {
-                check_ca_file(ca)?;
-            }
-            options = options.ssl_ca(ca);
-        }
+        let options = connect_options(profile, &password)?;
         let pool = MySqlPoolOptions::new()
             .max_connections(1)
             .min_connections(0)
@@ -134,7 +114,7 @@ impl Backend {
                     Ok(())
                 })
             })
-            .connect_with(options)
+            .connect_with(options.clone())
             .await?;
         let version: String = sqlx::query_scalar("SELECT VERSION()")
             .fetch_one(&pool)
@@ -148,10 +128,18 @@ impl Backend {
         Ok(Self {
             inner: Kind::MariaDb(Server {
                 pool,
+                options,
                 sizes: None,
                 size_interval: SIZE_REFRESH_INTERVAL,
             }),
         })
+    }
+    /// Connection settings for a background job; None in demo mode.
+    pub(crate) fn job_options(&self) -> Option<MySqlConnectOptions> {
+        match &self.inner {
+            Kind::MariaDb(server) => Some(server.options.clone()),
+            Kind::Demo(_) => None,
+        }
     }
     /// How often per-database sizes and table counts are re-measured (default 60 s).
     pub fn set_size_refresh_interval(&mut self, interval: Duration) {
@@ -895,6 +883,38 @@ impl Backend {
 }
 async fn processes(pool: &MySqlPool) -> Result<Vec<Process>> {
     Ok(sqlx::query("SELECT CAST(ID AS UNSIGNED) AS ID,CAST(QUERY_ID AS UNSIGNED) AS query_id,USER,HOST,COALESCE(DB,'') AS db_name,COMMAND,CAST(TIME AS UNSIGNED) AS elapsed,COALESCE(STATE,'') AS state_name,COALESCE(INFO,'') AS query_text FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() ORDER BY TIME DESC").fetch_all(pool).await?.iter().map(|r| Ok(Process { id: r.try_get("ID")?, query_id: r.try_get("query_id")?, user: r.try_get("USER")?, host: r.try_get("HOST")?, database: r.try_get("db_name")?, command: r.try_get("COMMAND")?, seconds: r.try_get("elapsed")?, state: r.try_get("state_name")?, query: r.try_get("query_text")? })).collect::<std::result::Result<_, sqlx::Error>>()?)
+}
+/// Connection settings of a profile (shared by the monitoring pool and job connections).
+pub(crate) fn connect_options(profile: &Profile, password: &Secret) -> Result<MySqlConnectOptions> {
+    profile.validate()?;
+    let mut options = MySqlConnectOptions::new()
+        .username(&profile.user)
+        .disable_statement_logging();
+    if !password.0.is_empty() {
+        options = options.password(&password.0);
+    }
+    options = match &profile.transport {
+        Transport::Tcp { host, port } => {
+            options
+                .host(host)
+                .port(*port)
+                .ssl_mode(if profile.tls == TlsMode::VerifyIdentity {
+                    MySqlSslMode::VerifyIdentity
+                } else {
+                    MySqlSslMode::Disabled
+                })
+        }
+        Transport::Unix { path } => options.socket(path).ssl_mode(MySqlSslMode::Disabled),
+    };
+    if let Some(ca) = &profile.ca {
+        if matches!(profile.transport, Transport::Tcp { .. })
+            && profile.tls == TlsMode::VerifyIdentity
+        {
+            check_ca_file(ca)?;
+        }
+        options = options.ssl_ca(ca);
+    }
+    Ok(options)
 }
 fn check_ca_file(path: &str) -> Result<()> {
     let data = std::fs::read(path)

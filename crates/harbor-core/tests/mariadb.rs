@@ -765,3 +765,275 @@ async fn isolated_mariadb_administration() {
         .any(|d| d.name == "harbor_drop_db"));
     run(&mut admin, "DROP DATABASE harbor_adm_db").await;
 }
+
+async fn table_checksum(admin: &mut MySqlConnection, db: &str, table: &str) -> Option<i64> {
+    let row = sqlx::raw_sql(&format!("CHECKSUM TABLE `{db}`.`{table}` EXTENDED"))
+        .fetch_one(&mut *admin)
+        .await
+        .unwrap();
+    use sqlx::Row;
+    row.try_get::<Option<i64>, _>(1).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "vyžaduje izolovanou instanci a HARBOR_TEST_SOCKET"]
+async fn isolated_mariadb_backup_and_restore() {
+    let (mut admin, profile) = isolated().await;
+    run(
+        &mut admin,
+        "DROP DATABASE IF EXISTS harbor_bk; DROP DATABASE IF EXISTS harbor_bk_copy",
+    )
+    .await;
+    run(&mut admin, r#"CREATE DATABASE harbor_bk CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+        USE harbor_bk;
+        CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(80), note TEXT, avatar BLOB, flags BIT(5),
+            price DECIMAL(12,4), ratio DOUBLE, born DATE, seen DATETIME(6), kind ENUM('a','b'), tags SET('x','y','z'),
+            doc JSON, place POINT, upper_name VARCHAR(80) AS (UPPER(name)) VIRTUAL, secret INT INVISIBLE DEFAULT 7) ENGINE=InnoDB;
+        INSERT INTO customers (id,name,note,avatar,flags,price,ratio,born,seen,kind,tags,doc,place,secret) VALUES
+          (1,'Žluťoučký kůň','it''s "quoted"\\ back\\slash; semi\nnew line',0x00FF00DE,b'10101',1234.5678,1.0E-300,'2024-02-29','2026-11-01 12:34:56.789012','b','x,z','{"a": [1, "č"]}',ST_GeomFromText('POINT(14.42 50.08)'),99),
+          (2,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,DEFAULT),
+          (3,'',  '', '', b'0', -0.0001, -2.5, '1000-01-01', '1970-01-01 00:00:01', 'a', '', '[]', NULL, 0);
+        CREATE TABLE orders (id INT AUTO_INCREMENT PRIMARY KEY, customer_id INT NOT NULL, total INT,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)) ENGINE=InnoDB;
+        INSERT INTO orders (customer_id,total) VALUES (1,10),(1,20),(3,30);
+        CREATE TABLE legacy (a INT, b VARCHAR(10)) ENGINE=MyISAM;
+        INSERT INTO legacy VALUES (1,'x');
+        CREATE TABLE latin (t VARCHAR(20)) CHARACTER SET latin1;
+        INSERT INTO latin VALUES ('café'),('naïve');
+        CREATE TABLE history (id INT PRIMARY KEY, v INT) WITH SYSTEM VERSIONING;
+        INSERT INTO history VALUES (1,1); UPDATE history SET v=2 WHERE id=1;
+        CREATE SEQUENCE ticket START WITH 100;
+        DO NEXTVAL(ticket); DO NEXTVAL(ticket);
+        "#).await;
+    // a_big_orders sorts before the view it depends on.
+    run(&mut admin, r#"USE harbor_bk;
+        CREATE VIEW z_orders_view AS SELECT id, total FROM orders;
+        CREATE VIEW a_big_orders AS SELECT * FROM z_orders_view WHERE total > 15;
+        CREATE FUNCTION add_one(x INT) RETURNS INT DETERMINISTIC RETURN x + 1;
+        CREATE PROCEDURE touch() BEGIN UPDATE orders SET total = total; SELECT 1; END;
+        CREATE TRIGGER orders_bi BEFORE INSERT ON orders FOR EACH ROW SET NEW.total = COALESCE(NEW.total, 0);
+        CREATE EVENT nightly ON SCHEDULE EVERY 1 DAY DISABLE DO DELETE FROM legacy WHERE a < 0;
+        "#).await;
+    let dir = std::env::temp_dir().join(format!("harbor-backup-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("bk.zip");
+    let job = start_job(
+        JobSpec::Backup(BackupRequest {
+            profile: "test".into(),
+            databases: vec!["harbor_bk".into()],
+            path: path.clone(),
+            encryption: None,
+        }),
+        Some((&profile, Secret::default())),
+    )
+    .unwrap();
+    let summary = job.wait(|_| ()).unwrap();
+    assert!(summary.contains("Netransakční"), "{summary}");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let manifest = read_manifest(&path).unwrap();
+    assert_eq!(manifest.databases[0].rows, 3 + 3 + 1 + 2 + 1);
+    assert!(
+        !manifest.consistent
+            && manifest.databases[0]
+                .non_transactional
+                .contains(&"legacy".to_string())
+    );
+    assert!(manifest.warnings.is_empty(), "{:?}", manifest.warnings);
+    let verified = start_job(
+        JobSpec::Verify {
+            path: path.clone(),
+            encryption: None,
+        },
+        None,
+    )
+    .unwrap()
+    .wait(|_| ())
+    .unwrap();
+    assert!(verified.contains("v pořádku"), "{verified}");
+
+    // Restore under another name and compare contents table by table.
+    let restore = |target: &str, replace: bool| {
+        start_job(
+            JobSpec::Restore(RestoreRequest {
+                path: path.clone(),
+                encryption: None,
+                database: "harbor_bk".into(),
+                target: target.into(),
+                replace,
+            }),
+            Some((&profile, Secret::default())),
+        )
+        .unwrap()
+        .wait(|_| ())
+    };
+    let summary = restore("harbor_bk_copy", false).unwrap();
+    assert!(summary.contains("harbor_bk_copy"), "{summary}");
+    for table in ["customers", "orders", "legacy", "latin"] {
+        assert_eq!(
+            table_checksum(&mut admin, "harbor_bk", table).await,
+            table_checksum(&mut admin, "harbor_bk_copy", table).await,
+            "{table}"
+        );
+    }
+    let invisible: (i64, String) =
+        sqlx::query_as("SELECT secret, upper_name FROM harbor_bk_copy.customers WHERE id=1")
+            .fetch_one(&mut admin)
+            .await
+            .unwrap();
+    assert_eq!(invisible, (99, "ŽLUŤOUČKÝ KŮŇ".to_string()));
+    let current: i64 = sqlx::query_scalar("SELECT v FROM harbor_bk_copy.history WHERE id=1")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(current, 2);
+    let next: i64 = sqlx::query_scalar("SELECT NEXTVAL(harbor_bk_copy.ticket)")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert!(next >= 102, "sequence continues, got {next}");
+    let big: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harbor_bk_copy.a_big_orders")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(big, 2, "view depending on a later view was restored");
+    let one: i32 = sqlx::query_scalar("SELECT harbor_bk_copy.add_one(1)")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(one, 2);
+    let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='harbor_bk_copy'), (SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='harbor_bk_copy')")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(counts, (1, 1));
+    let routines: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='harbor_bk_copy'",
+    )
+    .fetch_one(&mut admin)
+    .await
+    .unwrap();
+    assert_eq!(routines, 2);
+    // The original database was not touched by the renamed restore.
+    assert!(table_checksum(&mut admin, "harbor_bk", "orders")
+        .await
+        .is_some());
+
+    // Existing target: refused without replace, replaced on request.
+    let refused = restore("harbor_bk_copy", false).unwrap_err().to_string();
+    assert!(refused.contains("už existuje"), "{refused}");
+    run(
+        &mut admin,
+        "INSERT INTO harbor_bk_copy.orders (customer_id,total) VALUES (1,99)",
+    )
+    .await;
+    restore("harbor_bk_copy", true).unwrap();
+    let orders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM harbor_bk_copy.orders")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(orders, 3, "replace drops rows added after the backup");
+
+    // Encrypted backup: wrong or missing password is refused, the right one works.
+    let secret_path = dir.join("secret.zip");
+    start_job(
+        JobSpec::Backup(BackupRequest {
+            profile: "test".into(),
+            databases: vec!["harbor_bk".into()],
+            path: secret_path.clone(),
+            encryption: Some(Secret::new("dlouhé heslo".into())),
+        }),
+        Some((&profile, Secret::default())),
+    )
+    .unwrap()
+    .wait(|_| ())
+    .unwrap();
+    assert!(read_manifest(&secret_path).unwrap().encrypted);
+    for wrong in [None, Some(Secret::new("špatné heslo".into()))] {
+        assert!(start_job(
+            JobSpec::Verify {
+                path: secret_path.clone(),
+                encryption: wrong
+            },
+            None
+        )
+        .unwrap()
+        .wait(|_| ())
+        .is_err());
+    }
+    assert!(start_job(
+        JobSpec::Verify {
+            path: secret_path.clone(),
+            encryption: Some(Secret::new("dlouhé heslo".into()))
+        },
+        None
+    )
+    .unwrap()
+    .wait(|_| ())
+    .is_ok());
+    // A plaintext search of the encrypted archive finds no row data.
+    let raw = std::fs::read(&secret_path).unwrap();
+    assert!(!raw.windows(5).any(|w| w == b"quoted"));
+
+    // Cancelled backup leaves no file behind; existing files are never overwritten.
+    let cancelled_path = dir.join("cancelled.zip");
+    let job = start_job(
+        JobSpec::Backup(BackupRequest {
+            profile: "test".into(),
+            databases: vec!["harbor_bk".into()],
+            path: cancelled_path.clone(),
+            encryption: None,
+        }),
+        Some((&profile, Secret::default())),
+    )
+    .unwrap();
+    job.cancel();
+    assert!(job.wait(|_| ()).is_err());
+    assert!(!cancelled_path.exists());
+    assert!(std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .all(|e| !e.path().to_string_lossy().ends_with(".part")));
+    let existing = start_job(
+        JobSpec::Backup(BackupRequest {
+            profile: "test".into(),
+            databases: vec!["harbor_bk".into()],
+            path: path.clone(),
+            encryption: None,
+        }),
+        Some((&profile, Secret::default())),
+    )
+    .unwrap()
+    .wait(|_| ());
+    assert!(existing.unwrap_err().to_string().contains("už existuje"));
+
+    // A damaged archive fails verification and is not restored.
+    let mut damaged = std::fs::read(&path).unwrap();
+    let middle = damaged.len() / 3;
+    damaged[middle] ^= 0xFF;
+    let damaged_path = dir.join("damaged.zip");
+    std::fs::write(&damaged_path, damaged).unwrap();
+    assert!(start_job(
+        JobSpec::Verify {
+            path: damaged_path,
+            encryption: None
+        },
+        None
+    )
+    .unwrap()
+    .wait(|_| ())
+    .is_err());
+
+    // The listing reads manifests.
+    let listed = list_backups(&dir);
+    assert!(listed.iter().any(|b| b.path == path && b.manifest.is_ok()));
+    run(
+        &mut admin,
+        "DROP DATABASE harbor_bk; DROP DATABASE harbor_bk_copy",
+    )
+    .await;
+    std::fs::remove_dir_all(dir).unwrap();
+}

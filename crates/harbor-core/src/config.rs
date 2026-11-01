@@ -15,6 +15,8 @@ pub struct Settings {
     pub refresh_seconds: u64,
     pub terminal_colors: String,
     pub ascii: bool,
+    /// Directory for backups; empty = the default (~/.local/share/harbor/backups).
+    pub backup_dir: String,
     /// Keys written by a newer Harbor version (desktop and TUI packages can differ);
     /// kept on read-modify-write instead of being dropped.
     #[serde(flatten)]
@@ -29,6 +31,7 @@ impl Default for Settings {
             refresh_seconds: 5,
             terminal_colors: "auto".into(),
             ascii: false,
+            backup_dir: String::new(),
             extra: serde_json::Map::new(),
         }
     }
@@ -50,6 +53,14 @@ impl Settings {
                 profile.id = candidate;
             }
             seen.insert(profile.id.clone());
+        }
+    }
+    /// The configured backup directory or the default one.
+    pub fn backup_dir(&self) -> std::path::PathBuf {
+        if self.backup_dir.trim().is_empty() {
+            crate::default_backup_dir()
+        } else {
+            std::path::PathBuf::from(self.backup_dir.trim())
         }
     }
     pub fn profile(&self, id: &str) -> Option<&Profile> {

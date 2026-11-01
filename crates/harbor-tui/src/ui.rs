@@ -13,13 +13,14 @@ use ratatui::{
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 8] = [
+const PAGES: [&str; 9] = [
     "Server",
     "Databáze",
     "Uživatelé",
     "Spojení",
     "Proměnné",
     "Doktor",
+    "Zálohy",
     "Profily",
     "Nastavení",
 ];
@@ -29,8 +30,9 @@ const ACCOUNTS: usize = 2;
 const PROCESSES: usize = 3;
 const VARIABLES: usize = 4;
 const HEALTH: usize = 5;
-const PROFILES: usize = 6;
-const SETTINGS: usize = 7;
+const BACKUPS: usize = 6;
+const PROFILES: usize = 7;
+const SETTINGS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
@@ -56,6 +58,13 @@ enum Action {
     KillQuery,
     SetVariable,
     RunHealth,
+    BackupStart,
+    BackupVerify,
+    BackupRestore,
+    BackupDelete,
+    JobCancel,
+    ScheduleCreate,
+    ScheduleRemove,
     Search,
     ToggleSystem,
     ToggleLong,
@@ -73,8 +82,9 @@ const MENU: &[(&str, Action)] = &[
     ("Spojení (4)", Action::Page(PROCESSES)),
     ("Proměnné (5)", Action::Page(VARIABLES)),
     ("Doktor (6)", Action::Page(HEALTH)),
-    ("Profily (7, F3)", Action::Page(PROFILES)),
-    ("Nastavení (8)", Action::Page(SETTINGS)),
+    ("Zálohy (7)", Action::Page(BACKUPS)),
+    ("Profily (8, F3)", Action::Page(PROFILES)),
+    ("Nastavení (9)", Action::Page(SETTINGS)),
     ("Nápověda", Action::Help),
     ("Obnovit", Action::Refresh),
     ("Nový profil", Action::NewProfile),
@@ -99,6 +109,13 @@ const MENU: &[(&str, Action)] = &[
     ("Spojení: ukončit vybraný dotaz", Action::KillQuery),
     ("Proměnná: změnit hodnotu (SET GLOBAL)", Action::SetVariable),
     ("Doktor: spustit kontrolu", Action::RunHealth),
+    ("Záloha: vytvořit…", Action::BackupStart),
+    ("Záloha: ověřit vybranou", Action::BackupVerify),
+    ("Záloha: obnovit vybranou…", Action::BackupRestore),
+    ("Záloha: smazat vybraný soubor…", Action::BackupDelete),
+    ("Úloha: zrušit běžící", Action::JobCancel),
+    ("Plán záloh: vytvořit…", Action::ScheduleCreate),
+    ("Plán záloh: odebrat…", Action::ScheduleRemove),
     ("Hledat", Action::Search),
     ("Systémové databáze ano/ne", Action::ToggleSystem),
     ("Jen dlouhé dotazy ano/ne", Action::ToggleLong),
@@ -112,6 +129,69 @@ const MENU: &[(&str, Action)] = &[
     ("Odstranit vybraný uložený profil", Action::DeleteProfile),
     ("Konec", Action::Quit),
 ];
+/// Actions of a screen, offered first in the menu (F10) on that screen.
+fn page_actions(page: usize) -> &'static [Action] {
+    match page {
+        DATABASES => &[
+            Action::CreateDatabase,
+            Action::TableDetail,
+            Action::Maintenance,
+            Action::DropDatabase,
+            Action::Search,
+            Action::ToggleSystem,
+        ],
+        ACCOUNTS => &[
+            Action::EditPrivileges,
+            Action::Template,
+            Action::ChangePassword,
+            Action::AccountProperties,
+            Action::RoleMembership,
+            Action::DefaultRole,
+            Action::CreateAccount,
+            Action::CreateRole,
+            Action::DropAccount,
+            Action::Search,
+        ],
+        PROCESSES => &[Action::KillQuery, Action::Search, Action::ToggleLong],
+        VARIABLES => &[
+            Action::SetVariable,
+            Action::Search,
+            Action::ToggleKeyVariables,
+            Action::ToggleChangedVariables,
+        ],
+        HEALTH => &[Action::RunHealth, Action::Search],
+        BACKUPS => &[
+            Action::BackupStart,
+            Action::BackupVerify,
+            Action::BackupRestore,
+            Action::BackupDelete,
+            Action::JobCancel,
+            Action::ScheduleCreate,
+            Action::ScheduleRemove,
+        ],
+        PROFILES => &[Action::NewProfile, Action::DeleteProfile, Action::Demo],
+        _ => &[Action::Refresh, Action::Demo, Action::Disconnect],
+    }
+}
+/// Menu rows: this screen's actions, a separator (None), then everything else.
+fn menu_items(page: usize) -> Vec<(&'static str, Option<Action>)> {
+    let first = page_actions(page);
+    let label = |action: Action| {
+        MENU.iter()
+            .find(|(_, a)| *a == action)
+            .map(|(l, _)| *l)
+            .unwrap_or("")
+    };
+    let mut items: Vec<(&'static str, Option<Action>)> =
+        first.iter().map(|a| (label(*a), Some(*a))).collect();
+    items.push(("────────── všechny akce ──────────", None));
+    items.extend(
+        MENU.iter()
+            .filter(|(_, a)| !first.contains(a))
+            .map(|(l, a)| (*l, Some(*a))),
+    );
+    items
+}
 /// Values are wiped on drop; dialogs are moved (suspended/restored), never cloned, so a
 /// typed password exists in one buffer only.
 struct Field {
@@ -137,6 +217,17 @@ impl Field {
     fn secret(&self) -> Secret {
         Secret(self.value.clone())
     }
+    fn hidden(label: &str) -> Self {
+        Self {
+            label: label.into(),
+            value: Zeroizing::new(String::new()),
+            secret: true,
+        }
+    }
+    /// Secret or None when left empty.
+    fn optional_secret(&self) -> Option<Secret> {
+        (!self.value.is_empty()).then(|| self.secret())
+    }
 }
 /// Selected row identity; the index follows it when a refresh reorders the list.
 #[derive(Clone, PartialEq, Debug)]
@@ -146,6 +237,7 @@ enum RowKey {
     Process(u64),
     Variable(String),
     Finding(String),
+    Backup(std::path::PathBuf),
     Profile(String),
 }
 enum Outcome {
@@ -168,6 +260,11 @@ enum Kind {
     /// Maintenance of a table in this database.
     Maintenance(String),
     Variable(Variable),
+    Backup,
+    Verify(std::path::PathBuf),
+    Restore(std::path::PathBuf),
+    Schedule,
+    Unschedule,
     /// Search for the list on this page.
     Search(usize),
 }
@@ -184,7 +281,11 @@ impl Kind {
     }
     /// Bound to objects of the connected server (dropped on a server switch).
     fn server_bound(&self) -> bool {
-        self.account().is_some() || matches!(self, Self::Maintenance(_) | Self::Variable(_))
+        self.account().is_some()
+            || matches!(
+                self,
+                Self::Maintenance(_) | Self::Variable(_) | Self::Backup | Self::Restore(_)
+            )
     }
 }
 struct Dialog {
@@ -235,6 +336,10 @@ fn scope_text(scope: &GrantScope) -> String {
 enum Pending {
     Server(Change),
     DeleteProfile { id: String },
+    Restore(RestoreRequest),
+    DeleteBackup(std::path::PathBuf),
+    Schedule(schedule::Schedule),
+    Unschedule(String),
 }
 struct Confirmation {
     action: Pending,
@@ -253,8 +358,16 @@ impl Confirmation {
     fn required_name(&self) -> Option<&str> {
         match &self.action {
             Pending::Server(change) => change.destructive_name(),
-            Pending::DeleteProfile { .. } => None,
+            Pending::Restore(r) if r.replace => Some(&r.target),
+            _ => None,
         }
+    }
+    /// Server changes and restores return to their suspended form when cancelled.
+    fn returns_to_form(&self) -> bool {
+        !matches!(
+            self.action,
+            Pending::DeleteProfile { .. } | Pending::DeleteBackup(_) | Pending::Unschedule(_)
+        )
     }
 }
 pub struct App {
@@ -282,7 +395,7 @@ pub struct App {
     picker: Option<PrivilegePicker>,
     confirm: Option<Confirmation>,
     /// One search per page, like the desktop.
-    filters: [String; 8],
+    filters: [String; 9],
     system: bool,
     long: bool,
     key_only: bool,
@@ -294,6 +407,11 @@ pub struct App {
     scope_generation: u64,
     loaded_variables: Option<u64>,
     loaded_health: Option<u64>,
+    backups: Vec<BackupFile>,
+    backups_loaded: bool,
+    jobs_finished_seen: usize,
+    /// Installed timers; read with the backup list (asks systemctl), not per frame.
+    schedules: Vec<schedule::InstalledSchedule>,
     pub quit: bool,
 }
 #[derive(Clone, Copy)]
@@ -353,6 +471,10 @@ impl App {
             scope_generation: 0,
             loaded_variables: None,
             loaded_health: None,
+            backups: Vec::new(),
+            backups_loaded: false,
+            jobs_finished_seen: 0,
+            schedules: Vec::new(),
             quit: false,
         };
         if args.iter().any(|a| a == "--demo") {
@@ -378,6 +500,11 @@ impl App {
     /// The variables and health pages load their data the first time they are shown
     /// for a server; afterwards only on request.
     fn autoload(&mut self) {
+        let finished = self.session.jobs.iter().filter(|j| j.finished()).count();
+        if self.page == BACKUPS && (!self.backups_loaded || finished != self.jobs_finished_seen) {
+            self.jobs_finished_seen = finished;
+            self.reload_backups();
+        }
         if self.session.snapshot.is_none() {
             return;
         }
@@ -396,6 +523,20 @@ impl App {
             self.loaded_health = Some(generation);
             self.session.request(Operation::Health);
         }
+    }
+    fn reload_backups(&mut self) {
+        self.backups = list_backups(&self.settings.backup_dir());
+        self.schedules = schedule::list();
+        self.backups_loaded = true;
+    }
+    fn selected_backup(&mut self) -> Option<BackupFile> {
+        let file = (self.page == BACKUPS)
+            .then(|| self.backups.get(self.selected).cloned())
+            .flatten();
+        if file.is_none() {
+            self.say("Zálohu vyberte na obrazovce Zálohy (7).");
+        }
+        file
     }
     fn filter(&self) -> &str {
         &self.filters[self.page]
@@ -426,6 +567,11 @@ impl App {
                 .findings()
                 .iter()
                 .map(|f| RowKey::Finding(f.title.clone()))
+                .collect(),
+            BACKUPS => self
+                .backups
+                .iter()
+                .map(|b| RowKey::Backup(b.path.clone()))
                 .collect(),
             PROFILES => self
                 .settings
@@ -677,11 +823,11 @@ impl App {
                         if i == self.page {
                             format!("[{name}]")
                         } else {
-                            format!(" {name} ")
+                            name.to_string()
                         }
                     })
                     .collect::<Vec<_>>()
-                    .join(""),
+                    .join(" "),
             )
             .style(p.menu),
             rows[0],
@@ -731,7 +877,7 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(
-                " F1 Pomoc  F3 Profily  F5 Obnovit  F10/F9/Alt+M Menu  1–8 Obrazovky  Esc Zpět",
+                " F1 Pomoc  F3 Profily  F5 Obnovit  F10/F9/Alt+M Menu  1–9 Obrazovky  Esc Zpět",
             )
             .style(p.menu),
             rows[4],
@@ -748,19 +894,22 @@ impl App {
         if self.help {
             let area = centered(area, 76, 22);
             frame.render_widget(Clear, area);
-            frame.render_widget(Paragraph::new("F10, F9 nebo Alt+M: všechny akce v nabídce\n1–8: přímo na obrazovku (Server … Nastavení)\nŠipky / PageUp / PageDown: výběr a posuv\nEnter: otevřít detail, upravit profil nebo nastavení\nTab: přepnout na detail (Databáze: výběr tabulky, Enter = struktura)\nVlevo/vpravo: vodorovný posuv seznamu\nEsc: zavřít; formulář zůstane rozpracovaný\nF3: profily; F5: obnovit (na Doktorovi znovu zkontrolovat)\n\nOprávnění: mezerník zaškrtne, Enter na Zkontrolovat ukáže SQL.\nZápisy vyžadují potvrzení s náhledem SQL; výchozí je Zrušit.\nMazání vyžaduje opsat název objektu.\nSET GLOBAL platí jen do restartu serveru.\nDEMO je simulace bez skutečného serveru.\nTCP standardně vyžaduje ověřenou identitu TLS.\n\nEsc zavře nápovědu.").block(self.block(" Nápověda ", p)).style(p.base).wrap(Wrap { trim: false }), area);
+            frame.render_widget(Paragraph::new("F10, F9 nebo Alt+M: všechny akce v nabídce\n1–9: přímo na obrazovku (Server … Nastavení)\nZálohy: F10 → Záloha: vytvořit / ověřit / obnovit; průběh vidíte v detailu\nŠipky / PageUp / PageDown: výběr a posuv\nEnter: otevřít detail, upravit profil nebo nastavení\nTab: přepnout na detail (Databáze: výběr tabulky, Enter = struktura)\nVlevo/vpravo: vodorovný posuv seznamu\nEsc: zavřít; formulář zůstane rozpracovaný\nF3: profily; F5: obnovit (na Doktorovi znovu zkontrolovat)\n\nOprávnění: mezerník zaškrtne, Enter na Zkontrolovat ukáže SQL.\nZápisy vyžadují potvrzení s náhledem SQL; výchozí je Zrušit.\nMazání vyžaduje opsat název objektu.\nSET GLOBAL platí jen do restartu serveru.\nDEMO je simulace bez skutečného serveru.\nTCP standardně vyžaduje ověřenou identitu TLS.\n\nEsc zavře nápovědu.").block(self.block(" Nápověda ", p)).style(p.base).wrap(Wrap { trim: false }), area);
         }
         if let Some(index) = self.menu {
             let area = centered(area, 64, 26);
             frame.render_widget(Clear, area);
-            let items: Vec<_> = MENU
-                .iter()
-                .map(|(label, _)| ListItem::new(*label))
+            let items: Vec<_> = menu_items(self.page)
+                .into_iter()
+                .map(|(label, _)| ListItem::new(label))
                 .collect();
             let mut state = ListState::default().with_selected(Some(index));
             frame.render_stateful_widget(
                 List::new(items)
-                    .block(self.block(" Nabídka • Enter vybere / Esc zavře ", p))
+                    .block(self.block(
+                        format!(" Nabídka • {} nahoře • Enter / Esc ", PAGES[self.page]),
+                        p,
+                    ))
                     .highlight_style(p.selected)
                     .highlight_symbol("> "),
                 area,
@@ -805,6 +954,55 @@ impl App {
                         .unwrap_or_else(|| "(už neexistuje)".into())
                 ));
                 lines.push("Změní se jen konfigurace Harboru, server ne.".into());
+            }
+            Pending::Restore(r) => {
+                lines.push(format!("Server: {}", safe_text(profile)));
+                lines.push(safe_text(&JobSpec::Restore(r.clone()).title()));
+                lines.push(
+                    "Nejdřív se ověří kontrolní součet, pak se databáze vytvoří a naplní.".into(),
+                );
+                lines.push(if r.replace {
+                    "Stávající databáze se nejdřív SMAŽE.".into()
+                } else {
+                    "Cílová databáze nesmí existovat.".into()
+                });
+            }
+            Pending::DeleteBackup(path) => {
+                lines.push(format!(
+                    "Smazat soubor zálohy {}?",
+                    safe_text(&path.display().to_string())
+                ));
+            }
+            Pending::Schedule(plan) => {
+                lines.push(format!(
+                    "Naplánovat zálohu profilu {} ({}), uchovávat {}:",
+                    safe_text(&plan.profile_name),
+                    safe_text(&plan.calendar),
+                    plan.keep
+                ));
+                match schedule::current_binary()
+                    .and_then(|binary| schedule::render_units(plan, &binary))
+                {
+                    Ok((service, timer)) => {
+                        lines.extend(
+                            service
+                                .lines()
+                                .chain(timer.lines())
+                                .filter(|l| {
+                                    l.starts_with("ExecStart") || l.starts_with("OnCalendar")
+                                })
+                                .map(|l| format!("  {}", safe_text(l))),
+                        );
+                        lines.push(format!("Soubory: {}", schedule::unit_dir().display()));
+                    }
+                    Err(error) => lines.push(format!("NELZE: {error}")),
+                }
+            }
+            Pending::Unschedule(name) => {
+                lines.push(format!(
+                    "Odebrat plán {}? Časovač se zastaví, zálohy zůstanou.",
+                    safe_text(name)
+                ));
             }
         }
         if let Some(name) = confirm.required_name() {
@@ -1029,6 +1227,30 @@ impl App {
                 .iter()
                 .map(|f| format!("[{:<8}] {}", f.severity.label(), safe_text(&f.title)))
                 .collect(),
+            BACKUPS => self
+                .backups
+                .iter()
+                .map(|b| match &b.manifest {
+                    Ok(m) => format!(
+                        "{:<34} {} {:>10}  {}{}",
+                        safe_text(&b.name()),
+                        m.created_utc,
+                        human_bytes(b.bytes),
+                        safe_text(
+                            &m.databases
+                                .iter()
+                                .map(|d| d.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                        if m.encrypted { " [šifr.]" } else { "" }
+                    ),
+                    Err(_) => format!(
+                        "{:<34} nečitelná / není záloha Harboru",
+                        safe_text(&b.name())
+                    ),
+                })
+                .collect(),
             PROFILES => self
                 .settings
                 .profiles
@@ -1051,6 +1273,7 @@ impl App {
             VARIABLES if self.session.variables.is_none() => Some("Načítám proměnné…"),
             HEALTH if self.session.health.is_none() => Some("Probíhá kontrola…"),
             HEALTH if self.findings().is_empty() => Some("Bez nálezů."),
+            BACKUPS if self.backups.is_empty() => Some("Žádné zálohy. F10 → Záloha: vytvořit…"),
             _ => None,
         }
     }
@@ -1066,6 +1289,7 @@ impl App {
                 Some(v) => variable_text(v),
                 None => String::new(),
             },
+            BACKUPS => self.backups_text(),
             HEALTH => match self.findings().get(self.selected) {
                 Some(f) => format!(
                     "{} • {}\n{}\nDoporučení: {}",
@@ -1078,6 +1302,72 @@ impl App {
             },
             _ => self.detail.clone(),
         }
+    }
+    fn backups_text(&self) -> String {
+        let mut lines = Vec::new();
+        for job in self.session.jobs.iter().rev().take(4) {
+            let progress = job.progress();
+            lines.push(match &progress.result {
+                None => format!(
+                    "▶ {} • {} • {} %{}",
+                    safe_text(&job.title),
+                    safe_text(&progress.phase),
+                    (progress.fraction() * 100.0) as u32,
+                    if job.cancel_requested() {
+                        " • ruší se"
+                    } else {
+                        ""
+                    }
+                ),
+                Some(Ok(summary)) => format!("✓ {}", safe_text(summary)),
+                Some(Err(error)) => format!("✗ {}: {}", safe_text(&job.title), safe_text(error)),
+            });
+        }
+        if let Some(file) = self.backups.get(self.selected) {
+            match &file.manifest {
+                Ok(m) => {
+                    lines.push(format!(
+                        "{} • server {} • profil {} • {}{}",
+                        safe_text(&file.name()),
+                        safe_text(&m.server_version),
+                        safe_text(&m.profile),
+                        if m.consistent {
+                            "konzistentní snímek"
+                        } else {
+                            "netransakční tabulky mimo snímek"
+                        },
+                        if m.encrypted { " • šifrováno" } else { "" }
+                    ));
+                    for db in &m.databases {
+                        lines.push(format!(
+                            "  {} • {} tabulek • {} řádků • SQL {}",
+                            safe_text(&db.name),
+                            db.tables,
+                            db.rows,
+                            human_bytes(db.bytes)
+                        ));
+                    }
+                    lines.extend(m.warnings.iter().map(|w| format!("  ! {}", safe_text(w))));
+                }
+                Err(error) => {
+                    lines.push(format!("{}: {}", safe_text(&file.name()), safe_text(error)))
+                }
+            }
+        }
+        lines.push(format!("Adresář: {}", self.settings.backup_dir().display()));
+        for installed in &self.schedules {
+            lines.push(format!(
+                "Plán {} • {} • {}",
+                safe_text(&installed.name),
+                safe_text(&installed.calendar),
+                match installed.active {
+                    Some(true) => "aktivní",
+                    Some(false) => "neaktivní",
+                    None => "stav neznámý",
+                }
+            ));
+        }
+        lines.join("\n")
     }
     fn draw_list(&self, frame: &mut Frame, area: Rect, p: Palette) {
         let rows = Layout::vertical([
@@ -1391,27 +1681,22 @@ impl App {
             return;
         }
         if is_menu_key(&key) {
-            self.menu = if self.menu.is_some() {
-                None
-            } else {
-                Some(
-                    MENU.iter()
-                        .position(|(_, a)| *a == Action::Page(self.page))
-                        .unwrap_or(0),
-                )
-            };
+            self.menu = if self.menu.is_some() { None } else { Some(0) };
             return;
         }
         if let Some(index) = self.menu {
+            let items = menu_items(self.page);
             match key.code {
                 K::Esc => self.menu = None,
                 K::Up => self.menu = Some(index.saturating_sub(1)),
-                K::Down => self.menu = Some((index + 1).min(MENU.len() - 1)),
+                K::Down => self.menu = Some((index + 1).min(items.len() - 1)),
                 K::PageUp => self.menu = Some(index.saturating_sub(8)),
-                K::PageDown => self.menu = Some((index + 8).min(MENU.len() - 1)),
+                K::PageDown => self.menu = Some((index + 8).min(items.len() - 1)),
                 K::Enter => {
-                    self.menu = None;
-                    self.run(MENU[index].1);
+                    if let Some(action) = items[index].1 {
+                        self.menu = None;
+                        self.run(action);
+                    }
                 }
                 _ => (),
             }
@@ -1447,7 +1732,7 @@ impl App {
             return;
         }
         match key.code {
-            K::Char(c @ '1'..='8') if key.modifiers.is_empty() => {
+            K::Char(c @ '1'..='9') if key.modifiers.is_empty() => {
                 self.run(Action::Page(c as usize - '1' as usize));
             }
             K::F(3) => self.run(Action::Page(PROFILES)),
@@ -1883,6 +2168,123 @@ impl App {
                 self.session.request(Operation::Health);
                 self.page = HEALTH;
             }
+            Action::BackupStart => {
+                if self.session.snapshot.as_ref().is_none_or(|s| s.demo) {
+                    self.say("Zálohovat lze jen připojený skutečný server (ne demo).");
+                    return;
+                }
+                self.dialog = dialog(
+                    Kind::Backup,
+                    vec![
+                        Field::new(
+                            "Databáze oddělené čárkou (prázdné = všechny uživatelské)",
+                            self.session.tables_for.as_deref().unwrap_or(""),
+                        ),
+                        Field::new("Adresář", &self.settings.backup_dir().display().to_string()),
+                        Field::hidden("Heslo pro šifrování (prázdné = bez šifrování)"),
+                        Field::hidden("Heslo znovu"),
+                    ],
+                );
+            }
+            Action::BackupVerify => {
+                if let Some(file) = self.selected_backup() {
+                    if file.manifest.as_ref().is_ok_and(|m| m.encrypted) {
+                        self.dialog =
+                            dialog(Kind::Verify(file.path), vec![Field::hidden("Heslo zálohy")]);
+                    } else {
+                        self.session.start_job(JobSpec::Verify {
+                            path: file.path,
+                            encryption: None,
+                        });
+                    }
+                }
+            }
+            Action::BackupRestore => {
+                if let Some(file) = self.selected_backup() {
+                    if self.session.snapshot.as_ref().is_none_or(|s| s.demo) {
+                        self.say("Obnovit lze jen do připojeného skutečného serveru.");
+                        return;
+                    }
+                    match &file.manifest {
+                        Ok(m) => {
+                            let first = m
+                                .databases
+                                .first()
+                                .map(|d| d.name.clone())
+                                .unwrap_or_default();
+                            self.dialog = dialog(
+                                Kind::Restore(file.path.clone()),
+                                vec![
+                                    Field::new(
+                                        &format!(
+                                            "Databáze ze zálohy ({})",
+                                            m.databases
+                                                .iter()
+                                                .map(|d| d.name.as_str())
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        ),
+                                        &first,
+                                    ),
+                                    Field::new("Obnovit do databáze (nový název = kopie)", &first),
+                                    Field::new("Nahradit existující databázi: ANO / NE", "NE"),
+                                    Field::hidden("Heslo zálohy (jen u šifrované)"),
+                                ],
+                            );
+                        }
+                        Err(error) => self.say(format!("Zálohu nelze číst: {error}")),
+                    }
+                }
+            }
+            Action::BackupDelete => {
+                if let Some(file) = self.selected_backup() {
+                    self.confirm = Some(Confirmation::new(Pending::DeleteBackup(file.path)));
+                }
+            }
+            Action::JobCancel => match self.session.jobs.iter().rev().find(|j| !j.finished()) {
+                Some(job) => {
+                    job.cancel();
+                    self.say(format!("Ruším: {}", job.title));
+                }
+                None => self.say("Žádná úloha neběží."),
+            },
+            Action::ScheduleCreate => {
+                let Some(profile) = self.session.profile.clone() else {
+                    self.say("Nejprve se připojte k serveru, jehož zálohy chcete plánovat.");
+                    return;
+                };
+                if self.settings.profile(&profile.id).is_none() {
+                    self.say("Plán potřebuje uložený profil (F3).");
+                    return;
+                }
+                self.dialog = dialog(
+                    Kind::Schedule,
+                    vec![
+                        Field::new(
+                            "Kdy (systemd: daily, *-*-* 02:30, Mon..Fri 22:00)",
+                            "*-*-* 02:30",
+                        ),
+                        Field::new("Uchovávat záloh", "7"),
+                        Field::new("Databáze (prázdné = všechny uživatelské)", ""),
+                        Field::new("Adresář", &self.settings.backup_dir().display().to_string()),
+                        Field::new(
+                            "Soubor s heslem serveru (chmod 600; prázdné = bez hesla)",
+                            "",
+                        ),
+                        Field::new("Soubor s heslem šifrování (volitelné)", ""),
+                    ],
+                );
+            }
+            Action::ScheduleRemove => {
+                let first = self.schedules.first().map(|s| s.name.clone());
+                match first {
+                    Some(name) => {
+                        self.dialog =
+                            dialog(Kind::Unschedule, vec![Field::new("Název plánu", &name)])
+                    }
+                    None => self.say("Žádný plán zálohy není nastaven."),
+                }
+            }
             Action::Search => {
                 self.dialog = dialog(
                     Kind::Search(self.page),
@@ -2244,6 +2646,112 @@ impl App {
                 variable: variable.clone(),
                 value: v(0),
             },
+            Kind::Backup => {
+                let profile = self
+                    .session
+                    .profile
+                    .clone()
+                    .filter(|_| self.session.snapshot.as_ref().is_some_and(|s| !s.demo))
+                    .ok_or_else(|| Error::Validation("Připojte skutečný server.".into()))?;
+                let mut databases: Vec<String> = v(0)
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if databases.is_empty() {
+                    databases = self
+                        .session
+                        .snapshot
+                        .as_ref()
+                        .map(|s| {
+                            s.databases
+                                .iter()
+                                .filter(|d| !d.system())
+                                .map(|d| d.name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+                if databases.is_empty() {
+                    return Err(Error::Validation(
+                        "Server nemá žádnou uživatelskou databázi; zadejte názvy.".into(),
+                    ));
+                }
+                if d.fields[2].value != d.fields[3].value {
+                    return Err(Error::Validation(
+                        "Hesla pro šifrování se neshodují.".into(),
+                    ));
+                }
+                if v(1).is_empty() {
+                    return Err(Error::Validation("Zadejte adresář záloh.".into()));
+                }
+                let spec = JobSpec::Backup(BackupRequest {
+                    path: std::path::PathBuf::from(v(1)).join(backup_file_name(
+                        &profile.name,
+                        std::time::SystemTime::now(),
+                    )),
+                    profile: profile.name,
+                    databases,
+                    encryption: d.fields[2].optional_secret(),
+                });
+                if !self.session.start_job(spec) {
+                    return Err(Error::Validation(
+                        "Jiná operace právě běží; zkuste to za chvíli.".into(),
+                    ));
+                }
+                self.page = BACKUPS;
+                return Ok(Outcome::Close);
+            }
+            Kind::Verify(path) => {
+                self.session.start_job(JobSpec::Verify {
+                    path: path.clone(),
+                    encryption: d.fields[0].optional_secret(),
+                });
+                return Ok(Outcome::Close);
+            }
+            Kind::Restore(path) => {
+                identifier(&v(1))?;
+                let request = RestoreRequest {
+                    path: path.clone(),
+                    encryption: d.fields[3].optional_secret(),
+                    database: v(0),
+                    target: v(1),
+                    replace: yes_no(v(2), "Nahradit")?,
+                };
+                self.confirm = Some(Confirmation::new(Pending::Restore(request)));
+                return Ok(Outcome::Suspend);
+            }
+            Kind::Schedule => {
+                let profile =
+                    self.session.profile.clone().ok_or_else(|| {
+                        Error::Validation("Nejprve se připojte k serveru.".into())
+                    })?;
+                let file =
+                    |text: String| (!text.is_empty()).then(|| std::path::PathBuf::from(text));
+                let plan = schedule::Schedule {
+                    profile_id: profile.id,
+                    profile_name: profile.name,
+                    calendar: v(0),
+                    keep: v(1).parse().map_err(|_| {
+                        Error::Validation("Uchovávat: zadejte kladné číslo.".into())
+                    })?,
+                    databases: v(2)
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect(),
+                    dir: std::path::PathBuf::from(v(3)),
+                    password_file: file(v(4)),
+                    encryption_file: file(v(5)),
+                };
+                schedule::render_units(&plan, std::path::Path::new("/x"))?;
+                self.confirm = Some(Confirmation::new(Pending::Schedule(plan)));
+                return Ok(Outcome::Suspend);
+            }
+            Kind::Unschedule => {
+                self.confirm = Some(Confirmation::new(Pending::Unschedule(v(0))));
+                return Ok(Outcome::Close);
+            }
         };
         // Invalid input is reported in the form, not in an unusable confirmation.
         preview(&change)?;
@@ -2255,9 +2763,9 @@ impl App {
         let Some(mut confirm) = self.confirm.take() else {
             return;
         };
-        let profile_delete = matches!(confirm.action, Pending::DeleteProfile { .. });
+        let from_form = confirm.returns_to_form();
         let restore = |app: &mut Self| {
-            if !profile_delete {
+            if from_form {
                 app.dialog = app.suspended.take();
             }
         };
@@ -2302,6 +2810,44 @@ impl App {
                             }
                             Err(error) => self.say(error.to_string()),
                         }
+                        return;
+                    }
+                    Pending::Restore(request) => {
+                        if self.session.start_job(JobSpec::Restore(request.clone())) {
+                            self.suspended = None;
+                            return;
+                        }
+                        self.say("Jiná operace právě běží; potvrzení zůstává otevřené.");
+                        self.confirm = Some(confirm);
+                        return;
+                    }
+                    Pending::DeleteBackup(path) => {
+                        match std::fs::remove_file(path) {
+                            Ok(()) => self.say("Soubor zálohy smazán."),
+                            Err(error) => self.say(format!("Soubor nelze smazat: {error}")),
+                        }
+                        self.reload_backups();
+                        return;
+                    }
+                    Pending::Schedule(plan) => {
+                        match schedule::current_binary()
+                            .and_then(|binary| schedule::install(plan, &binary))
+                        {
+                            Ok(note) => {
+                                self.suspended = None;
+                                self.say(note);
+                            }
+                            Err(error) => self.say(error.to_string()),
+                        }
+                        self.reload_backups();
+                        return;
+                    }
+                    Pending::Unschedule(name) => {
+                        match schedule::remove(name) {
+                            Ok(()) => self.say("Plán odebrán."),
+                            Err(error) => self.say(error.to_string()),
+                        }
+                        self.reload_backups();
                         return;
                     }
                     Pending::Server(change) => change.clone(),

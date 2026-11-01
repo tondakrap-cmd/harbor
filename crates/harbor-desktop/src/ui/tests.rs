@@ -410,3 +410,117 @@ fn variables_and_health_pages_load_once_and_filter() {
     settle(&ctx, &mut app);
     assert_eq!(app.session.health.as_ref().unwrap().0, first);
 }
+/// JobSpec carries secrets and has no Debug, so no unwrap_err.
+fn refused(result: std::result::Result<JobSpec, String>) -> String {
+    match result {
+        Err(message) => message,
+        Ok(_) => panic!("request was accepted"),
+    }
+}
+#[test]
+fn backups_page_validates_forms_and_lists_archives() {
+    let (ctx, mut app) = demo();
+    let dir = std::env::temp_dir().join(format!("harbor-desktop-backups-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cizi.zip"), b"not a zip").unwrap();
+    app.settings.backup_dir = dir.display().to_string();
+    app.backup_dir_text = dir.display().to_string();
+    app.page = BACKUPS;
+    let all = texts(&frame(&ctx, &mut app).shapes).join("\n");
+    assert!(
+        all.contains("Nová záloha"),
+        "toolbar action shown (disabled in demo)"
+    );
+    assert!(
+        all.contains("cizi.zip"),
+        "foreign archive listed with an error"
+    );
+    assert!(app.backups[0].manifest.is_err());
+    // Demo is refused before anything starts.
+    app.backup_selection.insert("commerce".into());
+    assert!(refused(app.backup_request()).contains("demo"));
+    // Encryption password rules are checked in the form.
+    let mut snapshot = (**app.session.snapshot.as_ref().unwrap()).clone();
+    snapshot.demo = false;
+    app.session.snapshot = Some(std::sync::Arc::new(snapshot));
+    app.encrypt = true;
+    app.encryption = Zeroizing::new("kratke".into());
+    assert!(refused(app.backup_request()).contains("8 znaků"));
+    app.encryption = Zeroizing::new("dostatečně dlouhé".into());
+    app.encryption_again = Zeroizing::new("jiné".into());
+    assert!(refused(app.backup_request()).contains("neshodují"));
+    app.encryption_again = app.encryption.clone();
+    let Ok(JobSpec::Backup(request)) = app.backup_request() else {
+        panic!("valid request")
+    };
+    assert!(request.path.starts_with(&dir) && request.encryption.is_some());
+    assert_eq!(request.databases, ["commerce"]);
+    // A schedule needs a saved profile.
+    assert!(app.schedule_form().unwrap_err().contains("uložený profil"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+/// Screen position of the first painted text equal to `needle`.
+fn text_position(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<egui::Pos2> {
+    fn walk(shape: &egui::Shape, needle: &str) -> Option<egui::Pos2> {
+        match shape {
+            egui::Shape::Text(text) if text.galley.text() == needle => {
+                Some(text.pos + text.galley.rect.center().to_vec2())
+            }
+            egui::Shape::Vec(shapes) => shapes.iter().find_map(|s| walk(s, needle)),
+            _ => None,
+        }
+    }
+    shapes.iter().find_map(|s| walk(&s.shape, needle))
+}
+fn click_at(ctx: &egui::Context, app: &mut Harbor, pos: egui::Pos2) {
+    let screen = Some(egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        Vec2::new(1440.0, 960.0),
+    ));
+    let input = |events: Vec<egui::Event>| egui::RawInput {
+        screen_rect: screen,
+        events,
+        ..Default::default()
+    };
+    let button = |pressed| egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: Default::default(),
+    };
+    let _ = ctx.run(input(vec![egui::Event::PointerMoved(pos)]), |ctx| {
+        app.render(ctx)
+    });
+    let _ = ctx.run(input(vec![button(true)]), |ctx| app.render(ctx));
+    let _ = ctx.run(input(vec![button(false)]), |ctx| app.render(ctx));
+}
+#[test]
+fn clicking_on_the_text_of_a_row_selects_the_row() {
+    let (ctx, mut app) = demo();
+    app.page = DATABASES;
+    let screen = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(1440.0, 960.0),
+        )),
+        ..Default::default()
+    };
+    let _ = ctx.run(screen.clone(), |ctx| app.render(ctx));
+    let output = ctx.run(screen, |ctx| app.render(ctx));
+    // Both the name and a value in another column of the row must select it.
+    let pos = text_position(&output.shapes, "analytics").expect("row text painted");
+    click_at(&ctx, &mut app, pos);
+    assert_eq!(app.selected_db.as_deref(), Some("analytics"));
+    let screen = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(1440.0, 960.0),
+        )),
+        ..Default::default()
+    };
+    let output = ctx.run(screen, |ctx| app.render(ctx));
+    let pos = text_position(&output.shapes, "identity").expect("row text painted");
+    click_at(&ctx, &mut app, pos);
+    assert_eq!(app.selected_db.as_deref(), Some("identity"));
+}

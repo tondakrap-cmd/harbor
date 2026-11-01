@@ -25,12 +25,15 @@ fn restore() {
 }
 fn run() -> io::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = harbor_core::cli::run(&args) {
+        std::process::exit(code);
+    }
     if args.iter().any(|a| a == "--version") {
         println!("harbor-tui {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     if args.iter().any(|a| a == "--help") {
-        println!("harbor-tui [--demo] [--ascii] [--colors=16|mono|truecolor]\nF1 nápověda • F10, F9 nebo Alt+M nabídka • Ctrl+C konec\nBez --demo se aplikace nepřipojí automaticky k žádnému serveru.");
+        println!("harbor-tui [--demo] [--ascii] [--colors=16|mono|truecolor]\nF1 nápověda • F10, F9 nebo Alt+M nabídka • Ctrl+C konec\nBez --demo se aplikace nepřipojí automaticky k žádnému serveru.\n\n{}", harbor_core::cli::USAGE);
         return Ok(());
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {

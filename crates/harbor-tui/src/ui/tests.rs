@@ -30,7 +30,9 @@ fn input_menu_theme_keeps_form_and_confirmation_defaults_to_cancel() {
     app.store = None;
     app.profile_dialog(None);
     app.key(KeyEvent::new(K::F(10), M::NONE));
-    app.menu = MENU.iter().position(|(_, a)| *a == Action::NextTheme);
+    app.menu = menu_items(app.page)
+        .iter()
+        .position(|(_, a)| *a == Some(Action::NextTheme));
     app.key(KeyEvent::new(K::Enter, M::NONE));
     assert!(app.dialog.is_some());
     app.confirm = Some(Confirmation::new(Pending::Server(Change::CreateDatabase {
@@ -292,6 +294,11 @@ fn settle(app: &mut App) {
 fn demo() -> App {
     let mut app = App::new(&["--demo".to_string()]);
     app.store = None;
+    // Never list or touch the developer's real backups.
+    app.settings.backup_dir = std::env::temp_dir()
+        .join(format!("harbor-tui-test-backups-{}", std::process::id()))
+        .display()
+        .to_string();
     wait_idle(&mut app);
     app
 }
@@ -497,4 +504,91 @@ fn variables_load_on_first_visit_and_values_are_validated_in_the_form() {
         .findings()
         .iter()
         .any(|f| f.title == "Tabulky bez primárního klíče"));
+}
+#[test]
+fn backups_page_lists_archives_and_refuses_demo_and_bad_input() {
+    let mut app = demo();
+    let dir = std::path::PathBuf::from(&app.settings.backup_dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cizi.zip"), b"x").unwrap();
+    key(&mut app, K::Char('7'));
+    assert_eq!(app.page, BACKUPS);
+    assert_eq!(app.backups.len(), 1);
+    assert!(render(&app, 120, 35).contains("není záloha Harboru"));
+    app.run(Action::BackupStart);
+    assert!(app.dialog.is_none() && app.status_line().contains("demo"));
+    app.run(Action::BackupRestore);
+    assert!(app.status_line().contains("skutečného serveru"));
+    // Verifying a foreign archive runs as a job and reports an error.
+    app.run(Action::BackupVerify);
+    let start = std::time::Instant::now();
+    while app.session.jobs_running() && start.elapsed() < std::time::Duration::from_secs(3) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        app.tick();
+    }
+    app.tick();
+    assert!(
+        app.session
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("Ověření"),
+        "{:?}",
+        app.session.error
+    );
+    assert!(render(&app, 120, 35).contains("✗"));
+    // Deleting needs confirmation; the default is Cancel.
+    app.run(Action::BackupDelete);
+    key(&mut app, K::Enter);
+    assert!(dir.join("cizi.zip").exists());
+    app.run(Action::BackupDelete);
+    key(&mut app, K::Tab);
+    key(&mut app, K::Enter);
+    assert!(!dir.join("cizi.zip").exists());
+    app.tick();
+    assert!(app.backups.is_empty());
+    // A restore that replaces a database needs the typed name.
+    let mut confirmation = Confirmation::new(Pending::Restore(RestoreRequest {
+        path: dir.join("x.zip"),
+        encryption: None,
+        database: "shop".into(),
+        target: "shop".into(),
+        replace: true,
+    }));
+    assert_eq!(confirmation.required_name(), Some("shop"));
+    confirmation.typed = "shop".into();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn menu_lists_the_current_screens_actions_first() {
+    let mut app = demo();
+    for page in 0..PAGES.len() {
+        let items = menu_items(page);
+        assert_eq!(
+            items.len(),
+            MENU.len() + 1,
+            "every action once plus the separator"
+        );
+        for (i, action) in page_actions(page).iter().enumerate() {
+            assert_eq!(items[i].1, Some(*action));
+        }
+    }
+    app.run(Action::Page(VARIABLES));
+    key(&mut app, K::F(10));
+    assert_eq!(app.menu, Some(0));
+    key(&mut app, K::Enter);
+    assert!(app.menu.is_none());
+    // The first action on Proměnné is the value change; it needs a selected variable.
+    settle(&mut app);
+    assert!(app.dialog.is_some() || app.status_line().contains("Proměnn"));
+    // Enter on the separator does nothing.
+    let separator = menu_items(BACKUPS)
+        .iter()
+        .position(|(_, a)| a.is_none())
+        .unwrap();
+    app.run(Action::Page(BACKUPS));
+    app.menu = Some(separator);
+    key(&mut app, K::Enter);
+    assert_eq!(app.menu, Some(separator));
 }

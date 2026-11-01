@@ -30,6 +30,8 @@ pub enum Operation {
     Variables,
     Health,
     Apply(Change),
+    /// Backup or restore in the background with its own connection.
+    StartJob(JobSpec),
 }
 /// Which request a response answers; decides whether a failure means lost connectivity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +46,7 @@ pub enum OperationKind {
     Variables,
     Health,
     Apply,
+    StartJob,
 }
 impl Operation {
     pub fn kind(&self) -> OperationKind {
@@ -58,6 +61,7 @@ impl Operation {
             Self::Variables => OperationKind::Variables,
             Self::Health => OperationKind::Health,
             Self::Apply(_) => OperationKind::Apply,
+            Self::StartJob(_) => OperationKind::StartJob,
         }
     }
 }
@@ -71,6 +75,7 @@ pub enum Response {
     Health(Vec<Finding>),
     /// Server messages of the change (maintenance output); usually empty.
     Changed(Vec<String>),
+    JobStarted(Job),
     Disconnected,
 }
 /// Reads must finish quickly; table maintenance (OPTIMIZE of a large table) may not.
@@ -248,6 +253,17 @@ async fn execute(backend: &mut Option<Backend>, operation: Operation) -> Result<
                 Operation::Variables => Ok(Response::Variables(backend.variables().await?)),
                 Operation::Health => Ok(Response::Health(backend.health().await?)),
                 Operation::Apply(change) => Ok(Response::Changed(backend.apply(change).await?)),
+                Operation::StartJob(spec) => {
+                    if spec.needs_server() && backend.job_options().is_none() {
+                        return Err(Error::Unsupported(
+                            "Zálohy a obnova vyžadují skutečný server; demo nemá data.".into(),
+                        ));
+                    }
+                    Ok(Response::JobStarted(crate::backup::spawn(
+                        spec,
+                        backend.job_options(),
+                    )))
+                }
                 _ => unreachable!(),
             }
         }
@@ -274,6 +290,9 @@ pub struct Session {
     pub health: Option<(Instant, Vec<Finding>)>,
     /// Output of the last change (e.g. CHECK TABLE messages).
     pub change_output: Vec<String>,
+    /// Background jobs (backups, restores, verifications), newest last. They keep
+    /// running across server switches; each has its own connection.
+    pub jobs: Vec<Job>,
     /// Read-only for UIs; set through the session so `error_at` stays in sync.
     pub error: Option<String>,
     pub error_at: Instant,
@@ -307,6 +326,7 @@ impl Default for Session {
             variables: None,
             health: None,
             change_output: Vec::new(),
+            jobs: Vec::new(),
             error: None,
             error_at: Instant::now(),
             test_result: None,
@@ -335,6 +355,21 @@ impl Session {
         self.health = None;
         self.change_output.clear();
     }
+    /// Starts a background job: a verification runs locally at once, backup and
+    /// restore go through the worker (they need the connected server's settings).
+    pub fn start_job(&mut self, spec: JobSpec) -> bool {
+        if spec.needs_server() {
+            return self.request(Operation::StartJob(spec));
+        }
+        let job = crate::backup::spawn(spec, None);
+        self.status = format!("Spuštěno: {}", job.title);
+        self.jobs.push(job);
+        true
+    }
+    /// True while any background job is still running.
+    pub fn jobs_running(&self) -> bool {
+        self.jobs.iter().any(|j| !j.finished())
+    }
     /// Tables of the open database (empty when none is loaded).
     pub fn tables(&self) -> &[TableInfo] {
         self.database.as_ref().map_or(&[], |d| &d.tables)
@@ -348,6 +383,9 @@ impl Session {
     pub fn next_wakeup(&self, refresh_seconds: u64) -> Duration {
         if self.worker.busy || !self.pending.is_empty() {
             return Duration::from_millis(100);
+        }
+        if self.jobs_running() {
+            return Duration::from_millis(250);
         }
         if self.snapshot.is_none() {
             return Duration::from_secs(1);
@@ -401,7 +439,10 @@ impl Session {
         }
         let queueable = !matches!(
             kind,
-            OperationKind::Apply | OperationKind::Connect | OperationKind::Disconnect
+            OperationKind::Apply
+                | OperationKind::StartJob
+                | OperationKind::Connect
+                | OperationKind::Disconnect
         );
         match self.worker.try_send(operation) {
             Ok(()) => true,
@@ -480,6 +521,7 @@ impl Session {
         }
         let message = match kind {
             OperationKind::Apply => format!("Změna nebyla potvrzena: {error}"),
+            OperationKind::StartJob => format!("Úlohu nelze spustit: {error}"),
             _ => error.to_string(),
         };
         self.set_error(message, connectivity);
@@ -566,8 +608,32 @@ impl Session {
                         self.enqueue(reload);
                     }
                 }
+                Ok(Response::JobStarted(job)) => {
+                    self.status = format!("Spuštěno: {}", job.title);
+                    self.jobs.push(job);
+                }
                 Ok(Response::Disconnected) => self.status = "Odpojeno".into(),
                 Err(error) => self.failed(kind, error),
+            }
+        }
+        for job in &self.jobs {
+            if job.take_finished_report() {
+                match job.progress().result {
+                    Some(Ok(summary)) => {
+                        self.status = summary;
+                        if job.restore && self.snapshot.is_some() {
+                            // A restored database must appear in the lists.
+                            self.pending
+                                .push_back((self.worker.generation(), Operation::Refresh));
+                        }
+                    }
+                    Some(Err(error)) => {
+                        self.error = Some(format!("{}: {error}", job.title));
+                        self.error_at = Instant::now();
+                        self.error_is_connectivity = false;
+                    }
+                    None => (),
+                }
             }
         }
         if !self.worker.busy {
