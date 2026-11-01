@@ -201,7 +201,7 @@ fn reads_requested_while_busy_are_queued_not_dropped() {
     assert!(!session.has_pending());
     assert!(session.snapshot.is_some());
     assert!(
-        !session.tables.is_empty(),
+        !session.tables().is_empty(),
         "queued Tables request was executed"
     );
 }
@@ -221,7 +221,7 @@ fn writes_are_never_queued_and_queued_reads_die_with_the_server_switch() {
     wait_idle(&mut session);
     session.tick(300);
     assert!(!session.worker.busy);
-    assert!(session.tables.is_empty());
+    assert!(session.tables().is_empty());
 }
 #[test]
 fn messages_carry_the_time_they_were_produced() {
@@ -442,7 +442,11 @@ fn open_details_reload_after_a_change_and_clear_on_disconnect() {
     assert!(session.request(Operation::Grants(account.clone())));
     wait_idle(&mut session);
     assert_eq!(session.grants_for.as_ref(), Some(&account));
-    session.grants = vec!["stav před změnou".into()];
+    session.account = Some(AccountDetail {
+        account: Some(account.clone()),
+        grants: vec!["stav před změnou".into()],
+        ..Default::default()
+    });
     assert!(session.request(Operation::Apply(Change::CreateAccount {
         user: "novy".into(),
         host: "localhost".into(),
@@ -454,11 +458,11 @@ fn open_details_reload_after_a_change_and_clear_on_disconnect() {
         std::thread::sleep(Duration::from_millis(5));
         session.tick(300);
     }
-    assert_ne!(session.grants, vec!["stav před změnou".to_string()]);
-    assert!(session.grants[0].contains(&account.label()));
+    assert_ne!(session.grants(), ["stav před změnou".to_string()]);
+    assert!(session.grants()[0].contains(&account.label()));
     session.disconnect();
-    assert!(session.grants.is_empty() && session.grants_for.is_none());
-    assert!(session.tables.is_empty() && session.tables_for.is_none());
+    assert!(session.grants().is_empty() && session.grants_for.is_none());
+    assert!(session.tables().is_empty() && session.tables_for.is_none());
 }
 #[test]
 fn wakeup_is_fast_only_while_work_is_in_flight() {
@@ -469,4 +473,76 @@ fn wakeup_is_fast_only_while_work_is_in_flight() {
     wait_idle(&mut session);
     let idle = session.next_wakeup(5);
     assert!(idle >= Duration::from_millis(100) && idle <= Duration::from_secs(1));
+}
+fn wait_all(session: &mut Session) {
+    let start = Instant::now();
+    session.tick(300);
+    while (session.worker.busy || session.has_pending()) && start.elapsed() < Duration::from_secs(3)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+        session.tick(300);
+    }
+}
+#[test]
+fn a_late_detail_for_a_database_the_user_left_is_not_shown() {
+    let mut session = Session::default();
+    session.connect(Profile::default(), Secret::default(), true);
+    wait_all(&mut session);
+    assert!(session.request(Operation::Tables("commerce".into())));
+    // The user moves on before the first answer arrives; only the newer one is shown.
+    assert!(session.request(Operation::Tables("analytics".into())));
+    wait_all(&mut session);
+    assert_eq!(session.database.as_ref().unwrap().name, "analytics");
+    assert!(session.request(Operation::Table {
+        database: "analytics".into(),
+        table: "orders (demo)".into(),
+    }));
+    wait_all(&mut session);
+    assert!(session.table.is_some());
+    // Opening another database closes the table detail of the previous one.
+    assert!(session.request(Operation::Tables("commerce".into())));
+    assert!(session.table.is_none() && session.table_for.is_none());
+    wait_all(&mut session);
+}
+#[test]
+fn reads_of_different_kinds_queue_together_and_a_change_reloads_open_details() {
+    let mut session = Session::default();
+    session.connect(Profile::default(), Secret::default(), true);
+    assert!(session.request(Operation::Variables));
+    assert!(session.request(Operation::Health));
+    assert!(session.request(Operation::Tables("commerce".into())));
+    wait_all(&mut session);
+    assert!(session.variables.is_some() && session.health.is_some() && session.database.is_some());
+    let variable = session
+        .variables
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|v| v.name == "max_connections")
+        .unwrap()
+        .clone();
+    assert!(session.request(Operation::Apply(Change::SetGlobal {
+        variable,
+        value: "250".into(),
+    })));
+    wait_all(&mut session);
+    assert_eq!(session.snapshot.as_ref().unwrap().max_connections, 250);
+    let reloaded = session
+        .variables
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|v| v.name == "max_connections")
+        .unwrap();
+    assert_eq!(reloaded.value, "250", "variables reloaded after the change");
+    // Maintenance output is kept for the UI.
+    assert!(session.request(Operation::Apply(Change::Maintenance {
+        database: "commerce".into(),
+        table: "orders".into(),
+        action: Maintenance::Analyze,
+    })));
+    wait_all(&mut session);
+    assert!(session.change_output[0].contains("ANALYZE"));
+    session.disconnect();
+    assert!(session.variables.is_none() && session.health.is_none());
 }

@@ -1,16 +1,80 @@
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
 use harbor_core::*;
 use harbor_themes::{desktop, rgb, ThemeId};
+use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 6] = [
+const PAGES: [&str; 8] = [
     "Přehled serveru",
     "Databáze",
     "Uživatelé a oprávnění",
     "Aktivní spojení",
+    "Proměnné",
+    "Doktor",
     "Připojení",
     "Nastavení",
 ];
+const OVERVIEW: usize = 0;
+const DATABASES: usize = 1;
+const ACCOUNTS: usize = 2;
+const PROCESSES: usize = 3;
+const VARIABLES: usize = 4;
+const HEALTH: usize = 5;
+const CONNECTION: usize = 6;
+const SETTINGS: usize = 7;
+
+/// Forms that prepare one change; the change itself is confirmed in a modal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Draft {
+    CreateDatabase,
+    CreateAccount,
+    ChangePassword,
+    CreateRole,
+    RoleMembership,
+    DefaultRole,
+    SetVariable,
+}
+impl Draft {
+    /// Drafts that target the selected account (dropped when it disappears).
+    fn account_bound(self) -> bool {
+        matches!(
+            self,
+            Self::ChangePassword | Self::RoleMembership | Self::DefaultRole
+        )
+    }
+}
+/// Checkbox editor of an account's privileges at one scope.
+struct PrivilegeEditor {
+    account: Account,
+    /// Scope picked from the existing grants (keeps wildcard patterns verbatim).
+    fixed: Option<GrantScope>,
+    scope_text: String,
+    /// Scope the checkboxes were initialised for.
+    loaded_for: Option<GrantScope>,
+    wanted: BTreeSet<String>,
+}
+impl PrivilegeEditor {
+    fn scope(&self) -> Result<GrantScope> {
+        match &self.fixed {
+            Some(scope) => Ok(scope.clone()),
+            None => GrantScope::parse(&self.scope_text),
+        }
+    }
+}
+struct PropertiesEditor {
+    account: Account,
+    locked: bool,
+    expire: bool,
+    tls: TlsRequirement,
+    limits: Limits,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TableSort {
+    Name,
+    Rows,
+    Size,
+    Free,
+}
 pub struct Harbor {
     session: Session,
     store: Option<ConfigStore>,
@@ -19,12 +83,17 @@ pub struct Harbor {
     page: usize,
     /// One search per list page (index = page), so typing on one page does not
     /// filter another.
-    filters: [String; 4],
+    filters: [String; 8],
     system: bool,
     long_only: bool,
+    key_only: bool,
+    changed_only: bool,
     selected_db: Option<String>,
+    selected_table: Option<String>,
+    table_sort: TableSort,
     selected_account: Option<Account>,
     selected_process: Option<Process>,
+    selected_variable: Option<String>,
     profile: Profile,
     /// Saved-profile id waiting for delete confirmation.
     delete_profile: Option<String>,
@@ -35,22 +104,29 @@ pub struct Harbor {
     socket: String,
     unix: bool,
     password: Zeroizing<String>,
-    change_kind: Option<usize>,
+    draft: Option<Draft>,
     change_db_name: String,
     change_user: String,
     change_host: String,
-    change_db: String,
     change_password: Zeroizing<String>,
+    collation: String,
+    role_name: String,
+    role_grant: bool,
+    variable_value: String,
+    privilege_editor: Option<PrivilegeEditor>,
+    properties_editor: Option<PropertiesEditor>,
     /// Slider value while it is being dragged; persisted only on release.
     refresh_draft: Option<u64>,
     /// Theme whose egui style is currently installed (style is set only on change).
     styled: Option<ThemeId>,
-    collation: String,
-    privilege: usize,
-    grant: bool,
     confirmation: Option<Change>,
     confirmation_focus: bool,
+    /// Typed name that unlocks a destructive change.
+    confirm_text: String,
     message: String,
+    /// Generation for which the variables / health pages already loaded their data.
+    loaded_variables: Option<u64>,
+    loaded_health: Option<u64>,
 }
 #[derive(Clone, Copy)]
 struct Palette {
@@ -62,6 +138,7 @@ struct Palette {
     border: Color32,
     accent: Color32,
     tint: Color32,
+    warn: Color32,
     radius: u8,
     terra: bool,
     clarity: bool,
@@ -82,9 +159,24 @@ impl Palette {
             border: c("border"),
             accent: c("accent"),
             tint: c("tint"),
+            warn: d
+                .colors
+                .get("warn")
+                .map(|w| {
+                    let [r, g, b] = rgb(w);
+                    Color32::from_rgb(r, g, b)
+                })
+                .unwrap_or(Color32::from_rgb(0xB0, 0x5A, 0x00)),
             radius: d.shape.card_radius,
             terra: theme == ThemeId::Terra,
             clarity: theme == ThemeId::Clarity,
+        }
+    }
+    fn severity(&self, severity: Severity) -> Color32 {
+        match severity {
+            Severity::Critical => Color32::from_rgb(0xC0, 0x23, 0x23),
+            Severity::Warning => self.warn,
+            Severity::Info => self.muted,
         }
     }
 }
@@ -179,13 +271,18 @@ impl Harbor {
             store,
             settings,
             theme,
-            page: if demo { 0 } else { 4 },
+            page: if demo { OVERVIEW } else { CONNECTION },
             filters: Default::default(),
             system: false,
             long_only: false,
+            key_only: true,
+            changed_only: false,
             selected_db: None,
+            selected_table: None,
+            table_sort: TableSort::Size,
             selected_account: None,
             selected_process: None,
+            selected_variable: None,
             profile: Profile::default(),
             delete_profile: None,
             scope_generation: 0,
@@ -194,20 +291,25 @@ impl Harbor {
             socket: "/run/mysqld/mysqld.sock".into(),
             unix: false,
             password: Zeroizing::new(String::new()),
-            change_kind: None,
+            draft: None,
             change_db_name: String::new(),
             change_user: String::new(),
             change_host: "localhost".into(),
-            change_db: String::new(),
             change_password: Zeroizing::new(String::new()),
+            collation: "utf8mb4_unicode_ci".into(),
+            role_name: String::new(),
+            role_grant: true,
+            variable_value: String::new(),
+            privilege_editor: None,
+            properties_editor: None,
             refresh_draft: None,
             styled: None,
-            collation: "utf8mb4_unicode_ci".into(),
-            privilege: 0,
-            grant: true,
             confirmation: None,
             confirmation_focus: false,
+            confirm_text: String::new(),
             message,
+            loaded_variables: None,
+            loaded_health: None,
         };
         if demo {
             app.session.connect(
@@ -222,22 +324,45 @@ impl Harbor {
         app.scope_generation = app.session.worker.generation();
         app
     }
+    fn drop_account_drafts(&mut self) {
+        self.change_password.clear();
+        if self.draft.is_some_and(Draft::account_bound) {
+            self.draft = None;
+        }
+        self.privilege_editor = None;
+        self.properties_editor = None;
+        if matches!(
+            self.confirmation,
+            Some(
+                Change::ChangePassword { .. }
+                    | Change::Privileges { .. }
+                    | Change::RoleMembership { .. }
+                    | Change::DefaultRole { .. }
+                    | Change::AlterAccount { .. }
+                    | Change::DropAccount { .. }
+            )
+        ) {
+            self.confirmation = None;
+        }
+    }
     /// Selections and account-bound drafts belong to one server. After connect/demo/
-    /// disconnect they would silently target an account on a different server.
+    /// disconnect they would silently target an object on a different server.
     fn sync_server_scope(&mut self) {
         let generation = self.session.worker.generation();
         if generation != self.scope_generation {
             self.scope_generation = generation;
             self.selected_db = None;
+            self.selected_table = None;
             self.selected_account = None;
             self.selected_process = None;
+            self.selected_variable = None;
             self.confirmation = None;
-            self.change_password.clear();
-            if matches!(self.change_kind, Some(2 | 3)) {
-                self.change_kind = None;
+            self.drop_account_drafts();
+            if self.draft == Some(Draft::SetVariable) {
+                self.draft = None;
             }
         }
-        let Some(snapshot) = &self.session.snapshot else {
+        let Some(snapshot) = self.session.snapshot.clone() else {
             return;
         };
         if self
@@ -246,16 +371,8 @@ impl Harbor {
             .is_some_and(|a| !snapshot.accounts.contains(a))
         {
             self.selected_account = None;
-            self.session.grants.clear();
-            if matches!(self.change_kind, Some(2 | 3)) {
-                self.change_kind = None;
-            }
-            if matches!(
-                self.confirmation,
-                Some(Change::ChangePassword { .. } | Change::DatabaseGrant { .. })
-            ) {
-                self.confirmation = None;
-            }
+            self.session.account = None;
+            self.drop_account_drafts();
         }
         if self
             .selected_db
@@ -263,7 +380,37 @@ impl Harbor {
             .is_some_and(|name| !snapshot.databases.iter().any(|d| &d.name == name))
         {
             self.selected_db = None;
-            self.session.tables.clear();
+            self.selected_table = None;
+            self.session.database = None;
+            self.session.table = None;
+            if matches!(
+                self.confirmation,
+                Some(Change::Maintenance { .. } | Change::DropDatabase { .. })
+            ) {
+                self.confirmation = None;
+            }
+        }
+    }
+    /// The variables and health pages load their data the first time they are shown
+    /// for a server; afterwards only on request.
+    fn autoload(&mut self) {
+        if self.session.snapshot.is_none() {
+            return;
+        }
+        let generation = self.session.worker.generation();
+        if self.page == VARIABLES
+            && self.session.variables.is_none()
+            && self.loaded_variables != Some(generation)
+        {
+            self.loaded_variables = Some(generation);
+            self.session.request(Operation::Variables);
+        }
+        if self.page == HEALTH
+            && self.session.health.is_none()
+            && self.loaded_health != Some(generation)
+        {
+            self.loaded_health = Some(generation);
+            self.session.request(Operation::Health);
         }
     }
     fn try_save<T>(&mut self, change: impl FnOnce(&mut Settings) -> Result<T>) -> Option<T> {
@@ -315,6 +462,12 @@ impl Harbor {
             Ok(())
         });
     }
+    /// Opens the confirmation modal for a change (with its SQL preview).
+    fn confirm(&mut self, change: Change) {
+        self.confirm_text.clear();
+        self.confirmation = Some(change);
+        self.confirmation_focus = true;
+    }
     fn style(&self, ctx: &egui::Context, p: Palette) {
         let mut v = if self.theme == ThemeId::Nocturne {
             egui::Visuals::dark()
@@ -339,8 +492,8 @@ impl Harbor {
         v.widgets.active.bg_fill = p.tint;
         ctx.set_visuals(v);
         let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = Vec2::new(12.0, 12.0);
-        style.spacing.button_padding = Vec2::new(14.0, 10.0);
+        style.spacing.item_spacing = Vec2::new(12.0, 10.0);
+        style.spacing.button_padding = Vec2::new(14.0, 8.0);
         style
             .text_styles
             .insert(egui::TextStyle::Body, FontId::proportional(16.0));
@@ -432,12 +585,12 @@ impl Harbor {
                         Secret(std::mem::take(&mut self.password)),
                         false,
                     );
-                    self.page = 0;
+                    self.page = OVERVIEW;
                 }
                 if ui.button("Otevřít DEMO").clicked() {
                     self.session
                         .connect(self.profile.clone(), Secret::default(), true);
-                    self.page = 0;
+                    self.page = OVERVIEW;
                 }
                 if ui.button("Odpojit").clicked() {
                     self.session.disconnect();
@@ -538,83 +691,306 @@ impl Harbor {
                 s.databases.len(),
                 s.long_queries()
             ));
-            if ui.button("Zobrazit aktivní spojení →").clicked() {
-                self.page = 3;
-            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Zobrazit aktivní spojení →").clicked() {
+                    self.page = PROCESSES;
+                }
+                if ui.button("Spustit Doktora →").clicked() {
+                    self.page = HEALTH;
+                }
+            });
         });
     }
     fn databases(&mut self, ui: &mut egui::Ui, p: Palette) {
         ui.horizontal_wrapped(|ui| {
-            ui.text_edit_singleline(&mut self.filters[1]);
+            ui.text_edit_singleline(&mut self.filters[DATABASES]);
             ui.checkbox(&mut self.system, "Systémové databáze");
             if ui.button("+ Vytvořit databázi").clicked() {
-                self.change_kind = Some(0);
+                self.draft = Some(Draft::CreateDatabase);
+            }
+            let selected = self
+                .selected_db
+                .clone()
+                .filter(|name| !Database::system_name(name));
+            if ui
+                .add_enabled(
+                    selected.is_some(),
+                    egui::Button::new("Smazat vybranou databázi…"),
+                )
+                .clicked()
+            {
+                if let Some(name) = selected {
+                    self.confirm(Change::DropDatabase { name });
+                }
             }
         });
         // Arc clone: the frame keeps the rows without copying them.
         let snapshot = self.session.snapshot.clone();
         let databases = snapshot.as_deref().map_or(&[][..], |s| &s.databases);
         card(ui, p, |ui| {
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                egui::Grid::new("databases")
-                    .striped(true)
-                    .min_row_height(42.0)
-                    .show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("databases")
+                .show(ui, |ui| {
+                    egui::Grid::new("databases")
+                        .striped(true)
+                        .min_row_height(34.0)
+                        .show(ui, |ui| {
+                            for h in [
+                                "NÁZEV",
+                                "TABULKY",
+                                "VELIKOST (ODHAD)",
+                                "ZNAKOVÁ SADA",
+                                "KOLACE",
+                            ] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            let visible: Vec<&Database> = databases
+                                .iter()
+                                .filter(|d| self.database_visible(d))
+                                .collect();
+                            for db in visible {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_db.as_ref() == Some(&db.name),
+                                        safe_text(&db.name),
+                                    )
+                                    .clicked()
+                                    && self.session.request(Operation::Tables(db.name.clone()))
+                                {
+                                    self.selected_db = Some(db.name.clone());
+                                    self.selected_table = None;
+                                }
+                                ui.label(db.tables.to_string());
+                                ui.label(bytes_label(db.bytes));
+                                ui.label(safe_text(&db.charset));
+                                ui.label(safe_text(&db.collation));
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+        let Some(name) = self.selected_db.clone() else {
+            return;
+        };
+        let Some(detail) = self.session.database.clone().filter(|d| d.name == name) else {
+            card(ui, p, |ui| {
+                ui.heading(format!("Databáze {}", safe_text(&name)));
+                ui.label("Načítám podrobnosti…");
+            });
+            return;
+        };
+        card(ui, p, |ui| {
+            ui.heading(format!("Databáze {}", safe_text(&detail.name)));
+            ui.label(format!(
+                "Kolace {} • {} tabulek • {} pohledů • {} procedur/funkcí • {} triggerů • {} událostí",
+                safe_text(&detail.collation),
+                detail.base_tables().count(),
+                detail.views,
+                detail.routines,
+                detail.triggers,
+                detail.events
+            ));
+            ui.label(format!(
+                "Data {} • indexy {} • nevyužité místo {} • údaje jsou odhady InnoDB",
+                human_bytes(detail.data_bytes()),
+                human_bytes(detail.index_bytes()),
+                human_bytes(detail.free_bytes())
+            ));
+            for warning in detail.warnings() {
+                ui.label(RichText::new(format!("⚠ {}", safe_text(&warning))).color(p.warn));
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Řadit:");
+                for (sort, label) in [
+                    (TableSort::Size, "velikost"),
+                    (TableSort::Rows, "řádky"),
+                    (TableSort::Free, "nevyužité místo"),
+                    (TableSort::Name, "název"),
+                ] {
+                    ui.radio_value(&mut self.table_sort, sort, label);
+                }
+            });
+            let mut tables: Vec<&TableInfo> = detail.tables.iter().collect();
+            sort_tables(&mut tables, self.table_sort);
+            egui::ScrollArea::horizontal()
+                .id_salt("tables")
+                .show(ui, |ui| {
+                    egui::Grid::new("tables")
+                        .striped(true)
+                        .min_row_height(30.0)
+                        .show(ui, |ui| {
+                            for h in [
+                                "TABULKA",
+                                "ENGINE",
+                                "ŘÁDKY",
+                                "DATA",
+                                "INDEXY",
+                                "NEVYUŽITO",
+                                "KOLACE",
+                                "UPOZORNĚNÍ",
+                            ] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for table in tables {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_table.as_ref() == Some(&table.name),
+                                        safe_text(&table.name),
+                                    )
+                                    .clicked()
+                                    && self.session.request(Operation::Table {
+                                        database: detail.name.clone(),
+                                        table: table.name.clone(),
+                                    })
+                                {
+                                    self.selected_table = Some(table.name.clone());
+                                }
+                                if table.view() {
+                                    ui.label("pohled");
+                                    for _ in 0..5 {
+                                        ui.label("");
+                                    }
+                                } else {
+                                    ui.label(safe_text(&table.engine));
+                                    ui.label(format!("≈ {}", table.rows));
+                                    ui.label(human_bytes(table.data_bytes));
+                                    ui.label(human_bytes(table.index_bytes));
+                                    ui.label(human_bytes(table.free_bytes));
+                                    ui.label(safe_text(&table.collation));
+                                }
+                                ui.label(RichText::new(table.warnings().join(", ")).color(p.warn));
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+        if let Some(table) = self.selected_table.clone() {
+            self.table_card(ui, p, &detail.name, &table);
+        }
+    }
+    fn table_card(&mut self, ui: &mut egui::Ui, p: Palette, database: &str, table: &str) {
+        let detail = self
+            .session
+            .table
+            .clone()
+            .filter(|t| t.database == database && t.table == table);
+        let view = self
+            .session
+            .tables()
+            .iter()
+            .any(|t| t.name == table && t.view());
+        card(ui, p, |ui| {
+            ui.heading(format!(
+                "Tabulka {}.{}",
+                safe_text(database),
+                safe_text(table)
+            ));
+            let Some(detail) = detail else {
+                ui.label("Načítám strukturu…");
+                return;
+            };
+            ui.strong("Sloupce");
+            egui::ScrollArea::horizontal()
+                .id_salt("columns")
+                .show(ui, |ui| {
+                    egui::Grid::new("columns").striped(true).show(ui, |ui| {
                         for h in [
-                            "NÁZEV",
-                            "TABULKY",
-                            "VELIKOST (ODHAD)",
-                            "ZNAKOVÁ SADA",
-                            "KOLACE",
+                            "SLOUPEC",
+                            "TYP",
+                            "NULL",
+                            "VÝCHOZÍ",
+                            "KLÍČ",
+                            "EXTRA",
+                            "KOMENTÁŘ",
                         ] {
                             ui.strong(h);
                         }
                         ui.end_row();
-                        let visible: Vec<&Database> = databases
-                            .iter()
-                            .filter(|d| self.database_visible(d))
-                            .collect();
-                        for db in visible {
-                            if ui
-                                .selectable_label(
-                                    self.selected_db.as_ref() == Some(&db.name),
-                                    safe_text(&db.name),
-                                )
-                                .clicked()
-                                && self.session.request(Operation::Tables(db.name.clone()))
-                            {
-                                self.selected_db = Some(db.name.clone());
-                                self.session.tables.clear();
-                            }
-                            ui.label(db.tables.to_string());
-                            ui.label(bytes_label(db.bytes));
-                            ui.label(safe_text(&db.charset));
-                            ui.label(safe_text(&db.collation));
+                        for c in &detail.columns {
+                            ui.label(safe_text(&c.name));
+                            ui.monospace(safe_text(&c.column_type));
+                            ui.label(if c.nullable { "ano" } else { "ne" });
+                            ui.label(
+                                c.default
+                                    .as_deref()
+                                    .map(safe_text)
+                                    .unwrap_or_else(|| "—".into()),
+                            );
+                            ui.label(safe_text(&c.key));
+                            ui.label(safe_text(&c.extra));
+                            ui.label(safe_text(&c.comment));
                             ui.end_row();
                         }
                     });
-            });
-        });
-        if let Some(name) = &self.selected_db {
-            card(ui, p, |ui| {
-                ui.heading(format!("Tabulky • {}", safe_text(name)));
-                for t in &self.session.tables {
+                });
+            if !detail.indexes.is_empty() {
+                ui.strong("Indexy");
+                for index in &detail.indexes {
                     ui.label(format!(
-                        "{} • {} • ≈ {} řádků • {}",
-                        safe_text(&t.name),
-                        safe_text(&t.engine),
-                        t.rows,
-                        bytes_label(t.bytes)
+                        "{}{} ({}) • {} • kardinalita ≈ {}",
+                        safe_text(&index.name),
+                        if index.unique { " UNIQUE" } else { "" },
+                        safe_text(&index.columns.join(", ")),
+                        safe_text(&index.index_type),
+                        index.cardinality
                     ));
                 }
-            });
-        }
+            }
+            if !detail.foreign_keys.is_empty() {
+                ui.strong("Cizí klíče");
+                for fk in &detail.foreign_keys {
+                    ui.label(format!(
+                        "{} ({}) → {} ({}) • ON UPDATE {} • ON DELETE {}",
+                        safe_text(&fk.name),
+                        safe_text(&fk.columns.join(", ")),
+                        safe_text(&fk.referenced_table),
+                        safe_text(&fk.referenced_columns.join(", ")),
+                        safe_text(&fk.on_update),
+                        safe_text(&fk.on_delete)
+                    ));
+                }
+            }
+            egui::CollapsingHeader::new("Definice (SHOW CREATE)")
+                .id_salt("ddl")
+                .show(ui, |ui| {
+                    ui.monospace(safe_text(&detail.create_sql));
+                });
+            if !view {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Údržba:");
+                    for action in Maintenance::ALL {
+                        if ui
+                            .button(action.keyword())
+                            .on_hover_text(action.description())
+                            .clicked()
+                        {
+                            self.confirm(Change::Maintenance {
+                                database: database.into(),
+                                table: table.into(),
+                                action,
+                            });
+                        }
+                    }
+                });
+            }
+            if !self.session.change_output.is_empty() {
+                ui.strong("Výsledek poslední operace");
+                for line in &self.session.change_output {
+                    ui.monospace(safe_text(line));
+                }
+            }
+        });
     }
     fn accounts(&mut self, ui: &mut egui::Ui, p: Palette) {
         ui.horizontal_wrapped(|ui| {
-            ui.text_edit_singleline(&mut self.filters[2]);
+            ui.text_edit_singleline(&mut self.filters[ACCOUNTS]);
             if ui.button("+ Vytvořit účet").clicked() {
-                self.change_kind = Some(1);
+                self.draft = Some(Draft::CreateAccount);
+            }
+            if ui.button("+ Vytvořit roli").clicked() {
+                self.draft = Some(Draft::CreateRole);
             }
         });
         let snapshot = self.session.snapshot.clone();
@@ -622,9 +998,9 @@ impl Harbor {
         card(ui, p, |ui| {
             egui::Grid::new("accounts")
                 .striped(true)
-                .min_row_height(42.0)
+                .min_row_height(34.0)
                 .show(ui, |ui| {
-                    ui.strong("ÚČET");
+                    ui.strong("ÚČET / ROLE");
                     ui.strong("HOSTITEL");
                     ui.strong("AUTENTIZACE");
                     ui.end_row();
@@ -641,35 +1017,178 @@ impl Harbor {
                             .clicked()
                             && self.session.request(Operation::Grants(account.clone()))
                         {
+                            if self.selected_account.as_ref() != Some(account) {
+                                self.drop_account_drafts();
+                            }
                             self.selected_account = Some(account.clone());
-                            self.session.grants.clear();
                         }
-                        ui.label(safe_text(&account.host));
+                        ui.label(if account.is_role() {
+                            "role".into()
+                        } else {
+                            safe_text(&account.host)
+                        });
                         ui.label(safe_text(&account.plugin));
                         ui.end_row();
                     }
                 });
         });
-        if let Some(account) = &self.selected_account {
-            card(ui, p, |ui| {
-                ui.heading(safe_text(&account.label()));
-                for grant in &self.session.grants {
-                    ui.monospace(safe_text(grant));
-                }
-                ui.horizontal(|ui| {
+        let Some(account) = self.selected_account.clone() else {
+            return;
+        };
+        let detail = self
+            .session
+            .account
+            .clone()
+            .filter(|d| d.account.as_ref() == Some(&account));
+        card(ui, p, |ui| {
+            ui.heading(safe_text(&account.label()));
+            let Some(detail) = detail else {
+                ui.label("Načítám oprávnění…");
+                return;
+            };
+            if let Some(props) = &detail.properties {
+                ui.label(format!(
+                    "Autentizace {} • {} • heslo {} • TLS {}",
+                    safe_text(&props.plugin),
+                    if props.locked { "ZAMČEN" } else { "odemčen" },
+                    if props.password_expired {
+                        "VYPRŠELO"
+                    } else {
+                        "platné"
+                    },
+                    props.tls.label()
+                ));
+                let l = props.limits;
+                ui.label(format!(
+                    "Limity (0 = bez limitu): dotazy/h {} • změny/h {} • připojení/h {} • souběžná spojení {}",
+                    l.queries_per_hour, l.updates_per_hour, l.connections_per_hour, l.user_connections
+                ));
+            } else if !account.is_role() {
+                ui.label(
+                    RichText::new("Vlastnosti účtu nejsou dostupné (chybí právo čtení mysql.*).")
+                        .color(p.muted),
+                );
+            }
+            ui.label(format!(
+                "Role: {} • výchozí role: {}",
+                if detail.roles.is_empty() {
+                    "žádné".into()
+                } else {
+                    safe_text(&detail.roles.join(", "))
+                },
+                detail
+                    .default_role
+                    .as_deref()
+                    .map(safe_text)
+                    .unwrap_or_else(|| "žádná".into())
+            ));
+            ui.horizontal_wrapped(|ui| {
+                if !account.is_role() {
                     if ui.button("Změnit heslo…").clicked() {
-                        self.change_kind = Some(2);
+                        self.draft = Some(Draft::ChangePassword);
                     }
-                    if ui.button("Databázové oprávnění…").clicked() {
-                        self.change_kind = Some(3);
+                    if ui
+                        .add_enabled(
+                            detail.properties.is_some(),
+                            egui::Button::new("Vlastnosti a limity…"),
+                        )
+                        .clicked()
+                    {
+                        if let Some(props) = &detail.properties {
+                            self.properties_editor = Some(PropertiesEditor {
+                                account: account.clone(),
+                                locked: props.locked,
+                                expire: false,
+                                tls: props.tls,
+                                limits: props.limits,
+                            });
+                        }
+                    }
+                    if ui.button("Výchozí role…").clicked() {
+                        self.role_name = detail.default_role.clone().unwrap_or_default();
+                        self.draft = Some(Draft::DefaultRole);
+                    }
+                }
+                if ui.button("Přidělit / odebrat roli…").clicked() {
+                    self.draft = Some(Draft::RoleMembership);
+                }
+                if ui.button("Smazat…").clicked() {
+                    self.confirm(Change::DropAccount {
+                        account: account.clone(),
+                    });
+                }
+            });
+            ui.separator();
+            ui.strong("Oprávnění");
+            egui::Grid::new("privileges")
+                .striped(true)
+                .min_row_height(30.0)
+                .show(ui, |ui| {
+                    ui.strong("ROZSAH");
+                    ui.strong("OPRÁVNĚNÍ");
+                    ui.strong("GRANT OPTION");
+                    ui.strong("");
+                    ui.end_row();
+                    for set in &detail.privileges {
+                        ui.label(safe_text(&set.scope.label()));
+                        ui.label(if set.privileges.is_empty() {
+                            "USAGE".into()
+                        } else {
+                            safe_text(
+                                &set.privileges
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            )
+                        });
+                        ui.label(if set.grantable { "ano" } else { "" });
+                        if ui.button("Upravit…").clicked() {
+                            self.privilege_editor = Some(PrivilegeEditor {
+                                account: account.clone(),
+                                fixed: Some(set.scope.clone()),
+                                scope_text: String::new(),
+                                loaded_for: None,
+                                wanted: BTreeSet::new(),
+                            });
+                        }
+                        ui.end_row();
                     }
                 });
-            });
-        }
+            if detail.privileges.is_empty() {
+                ui.label("Žádná přímá oprávnění (jen přes role, pokud nějaké má).");
+            }
+            for line in &detail.columns {
+                ui.label(format!("Sloupec: {}", safe_text(line)));
+            }
+            if ui
+                .button("+ Oprávnění na další rozsah / šablona…")
+                .clicked()
+            {
+                self.privilege_editor = Some(PrivilegeEditor {
+                    account: account.clone(),
+                    fixed: None,
+                    scope_text: self
+                        .selected_db
+                        .as_ref()
+                        .map(|db| format!("{db}.*"))
+                        .unwrap_or_else(|| "*.*".into()),
+                    loaded_for: None,
+                    wanted: BTreeSet::new(),
+                });
+            }
+            egui::CollapsingHeader::new("SHOW GRANTS")
+                .id_salt("show_grants")
+                .show(ui, |ui| {
+                    for grant in &detail.grants {
+                        ui.monospace(safe_text(grant));
+                    }
+                });
+        });
     }
     fn processes(&mut self, ui: &mut egui::Ui, p: Palette) {
         ui.horizontal_wrapped(|ui| {
-            ui.text_edit_singleline(&mut self.filters[3]);
+            ui.text_edit_singleline(&mut self.filters[PROCESSES]);
             ui.checkbox(
                 &mut self.long_only,
                 "Jen běžící dotazy nad 30 sekund (Sleep se nepočítá)",
@@ -678,38 +1197,40 @@ impl Harbor {
         let snapshot = self.session.snapshot.clone();
         let processes = snapshot.as_deref().map_or(&[][..], |s| &s.processes);
         card(ui, p, |ui| {
-            egui::ScrollArea::horizontal().show(ui, |ui| {
-                egui::Grid::new("processes")
-                    .striped(true)
-                    .min_row_height(42.0)
-                    .show(ui, |ui| {
-                        for h in ["ID / UŽIVATEL", "DATABÁZE", "ČAS", "PŘÍKAZ", "STAV"] {
-                            ui.strong(h);
-                        }
-                        ui.end_row();
-                        let visible: Vec<&Process> = processes
-                            .iter()
-                            .filter(|p| self.process_visible(p))
-                            .collect();
-                        for process in visible {
-                            if ui
-                                .selectable_label(
-                                    self.selected_process.as_ref().map(|p| p.id)
-                                        == Some(process.id),
-                                    format!("{} • {}", process.id, safe_text(&process.user)),
-                                )
-                                .clicked()
-                            {
-                                self.selected_process = Some(process.clone());
+            egui::ScrollArea::horizontal()
+                .id_salt("processes")
+                .show(ui, |ui| {
+                    egui::Grid::new("processes")
+                        .striped(true)
+                        .min_row_height(34.0)
+                        .show(ui, |ui| {
+                            for h in ["ID / UŽIVATEL", "DATABÁZE", "ČAS", "PŘÍKAZ", "STAV"] {
+                                ui.strong(h);
                             }
-                            ui.label(safe_text(&process.database));
-                            ui.label(format!("{} s", process.seconds));
-                            ui.label(safe_text(&process.command));
-                            ui.label(safe_text(&process.state));
                             ui.end_row();
-                        }
-                    });
-            });
+                            let visible: Vec<&Process> = processes
+                                .iter()
+                                .filter(|p| self.process_visible(p))
+                                .collect();
+                            for process in visible {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_process.as_ref().map(|p| p.id)
+                                            == Some(process.id),
+                                        format!("{} • {}", process.id, safe_text(&process.user)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_process = Some(process.clone());
+                                }
+                                ui.label(safe_text(&process.database));
+                                ui.label(format!("{} s", process.seconds));
+                                ui.label(safe_text(&process.command));
+                                ui.label(safe_text(&process.state));
+                                ui.end_row();
+                            }
+                        });
+                });
         });
         if let Some(process) = self.selected_process.clone() {
             card(ui, p, |ui| {
@@ -719,9 +1240,181 @@ impl Harbor {
                     .add_enabled(process.running_query(), egui::Button::new("Ukončit dotaz…"))
                     .clicked()
                 {
-                    self.confirmation = Some(Change::KillQuery { target: process });
-                    self.confirmation_focus = true;
+                    self.confirm(Change::KillQuery { target: process });
                 }
+            });
+        }
+    }
+    fn variables(&mut self, ui: &mut egui::Ui, p: Palette) {
+        ui.horizontal_wrapped(|ui| {
+            ui.text_edit_singleline(&mut self.filters[VARIABLES]);
+            ui.checkbox(&mut self.key_only, "Jen klíčové parametry");
+            ui.checkbox(&mut self.changed_only, "Jen odlišné od výchozích");
+            if ui.button("Načíst znovu").clicked() {
+                self.session.request(Operation::Variables);
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Změna přes SET GLOBAL platí okamžitě, ale jen do restartu serveru. Trvalé uložení do konfigurace přinese verze 0.4.",
+            )
+            .color(p.muted),
+        );
+        let Some(variables) = self.session.variables.clone() else {
+            ui.label(if self.session.snapshot.is_some() {
+                "Načítám proměnné…"
+            } else {
+                "Nejprve se připojte k serveru."
+            });
+            return;
+        };
+        let visible: Vec<&Variable> = variables
+            .iter()
+            .filter(|v| self.variable_visible(v))
+            .collect();
+        card(ui, p, |ui| {
+            ui.label(format!(
+                "{} z {} proměnných",
+                visible.len(),
+                variables.len()
+            ));
+            egui::ScrollArea::horizontal()
+                .id_salt("variables")
+                .show(ui, |ui| {
+                    egui::Grid::new("variables")
+                        .striped(true)
+                        .min_row_height(30.0)
+                        .show(ui, |ui| {
+                            for h in ["PROMĚNNÁ", "HODNOTA", "PŮVOD", "ZMĚNA ZA BĚHU"] {
+                                ui.strong(h);
+                            }
+                            ui.end_row();
+                            for variable in &visible {
+                                if ui
+                                    .selectable_label(
+                                        self.selected_variable.as_ref() == Some(&variable.name),
+                                        safe_text(&variable.name),
+                                    )
+                                    .clicked()
+                                {
+                                    self.selected_variable = Some(variable.name.clone());
+                                }
+                                ui.monospace(clip(&variable_value(variable), 60));
+                                let origin = origin_label(variable);
+                                if variable.runtime_only() {
+                                    ui.label(RichText::new(origin).color(p.warn));
+                                } else {
+                                    ui.label(origin);
+                                }
+                                ui.label(if variable.settable() { "ano" } else { "ne" });
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
+        let Some(variable) = self
+            .selected_variable
+            .as_ref()
+            .and_then(|name| variables.iter().find(|v| &v.name == name))
+            .cloned()
+        else {
+            return;
+        };
+        card(ui, p, |ui| {
+            ui.heading(safe_text(&variable.name));
+            if let Some(description) = variable.key_description() {
+                ui.label(description);
+            }
+            if !variable.comment.is_empty() {
+                ui.label(RichText::new(safe_text(&variable.comment)).color(p.muted));
+            }
+            ui.monospace(format!(
+                "Hodnota: {}",
+                safe_text(&variable_value(&variable))
+            ));
+            ui.label(format!(
+                "Výchozí: {} • původ: {} • typ: {}",
+                variable
+                    .default
+                    .as_deref()
+                    .map(safe_text)
+                    .unwrap_or_else(|| "—".into()),
+                origin_label(&variable),
+                safe_text(&variable.var_type)
+            ));
+            if variable.min.is_some() || variable.max.is_some() {
+                ui.label(format!(
+                    "Rozsah: {} až {}",
+                    variable.min.as_deref().unwrap_or("?"),
+                    variable.max.as_deref().unwrap_or("?")
+                ));
+            }
+            if !variable.allowed.is_empty() {
+                ui.label(format!(
+                    "Povolené hodnoty: {}",
+                    safe_text(&variable.allowed.join(", "))
+                ));
+            }
+            if variable.settable() {
+                if ui.button("Změnit hodnotu (SET GLOBAL)…").clicked() {
+                    self.variable_value = variable.value.clone();
+                    self.draft = Some(Draft::SetVariable);
+                }
+            } else {
+                ui.label("Tuto proměnnou nelze měnit za běhu; patří do konfiguračního souboru.");
+            }
+        });
+    }
+    fn health(&mut self, ui: &mut egui::Ui, p: Palette) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Spustit kontrolu").clicked() {
+                self.session.request(Operation::Health);
+            }
+            if let Some((at, _)) = &self.session.health {
+                ui.label(format!(
+                    "Poslední kontrola před {} s",
+                    at.elapsed().as_secs()
+                ));
+            }
+        });
+        ui.label(
+            RichText::new(
+                "Kontrola čte stav serveru (účty, statistiky, tabulky); nic nemění. Rozsah závisí na oprávněních účtu.",
+            )
+            .color(p.muted),
+        );
+        let Some((_, findings)) = self.session.health.clone() else {
+            ui.label(if self.session.snapshot.is_some() {
+                "Probíhá kontrola…"
+            } else {
+                "Nejprve se připojte k serveru."
+            });
+            return;
+        };
+        if findings.is_empty() {
+            card(ui, p, |ui| {
+                ui.heading("Bez nálezů");
+                ui.label("Žádné kontrolované pravidlo nehlásí problém.");
+            });
+        }
+        for finding in &findings {
+            card(ui, p, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(finding.severity.label())
+                            .strong()
+                            .color(p.severity(finding.severity)),
+                    );
+                    ui.heading(safe_text(&finding.title));
+                });
+                ui.label(safe_text(&finding.detail));
+                ui.label(
+                    RichText::new(format!(
+                        "Doporučení: {}",
+                        safe_text(&finding.recommendation)
+                    ))
+                    .color(p.muted),
+                );
             });
         }
     }
@@ -746,17 +1439,25 @@ impl Harbor {
     }
     fn database_visible(&self, d: &Database) -> bool {
         (self.system || !d.system())
-            && matches_filter(&self.filters[1], &[&d.name, &d.charset, &d.collation])
+            && matches_filter(
+                &self.filters[DATABASES],
+                &[&d.name, &d.charset, &d.collation],
+            )
     }
     fn account_visible(&self, a: &Account) -> bool {
-        matches_filter(&self.filters[2], &[&a.user, &a.host, &a.plugin])
+        matches_filter(&self.filters[ACCOUNTS], &[&a.user, &a.host, &a.plugin])
     }
     fn process_visible(&self, p: &Process) -> bool {
         (!self.long_only || p.long_query())
             && matches_filter(
-                &self.filters[3],
+                &self.filters[PROCESSES],
                 &[&p.user, &p.host, &p.database, &p.command, &p.query],
             )
+    }
+    fn variable_visible(&self, v: &Variable) -> bool {
+        (!self.key_only || v.key_description().is_some())
+            && (!self.changed_only || v.changed())
+            && matches_filter(&self.filters[VARIABLES], &[&v.name, &v.value, &v.comment])
     }
     /// Dragging only updates the draft; the config file (with fsync) is written once,
     /// on release or on a keyboard change, not for every pixel of a drag.
@@ -772,66 +1473,368 @@ impl Harbor {
             }
         }
     }
-    fn dialogs(&mut self, ctx: &egui::Context) {
-        if let Some(kind) = self.change_kind {
-            egui::Window::new("Připravit změnu")
-                .collapsible(false)
-                .resizable(true)
-                .show(ctx, |ui| {
-                    if kind == 0 {
+    /// Role names on the connected server.
+    fn roles(&self) -> Vec<String> {
+        self.session
+            .snapshot
+            .as_ref()
+            .map(|s| {
+                s.accounts
+                    .iter()
+                    .filter(|a| a.is_role())
+                    .map(|a| a.user.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// The change a draft form describes (None when it lacks its target).
+    fn draft_change(&self, draft: Draft) -> Option<Change> {
+        Some(match draft {
+            Draft::CreateDatabase => Change::CreateDatabase {
+                name: self.change_db_name.clone(),
+                collation: self.collation.clone(),
+            },
+            Draft::CreateAccount => Change::CreateAccount {
+                user: self.change_user.clone(),
+                host: self.change_host.clone(),
+                password: Secret(self.change_password.clone()),
+            },
+            Draft::ChangePassword => Change::ChangePassword {
+                account: self.selected_account.clone()?,
+                password: Secret(self.change_password.clone()),
+            },
+            Draft::CreateRole => Change::CreateRole {
+                name: self.role_name.clone(),
+            },
+            Draft::RoleMembership => Change::RoleMembership {
+                role: self.role_name.clone(),
+                account: self.selected_account.clone()?,
+                grant: self.role_grant,
+            },
+            Draft::DefaultRole => Change::DefaultRole {
+                account: self.selected_account.clone()?,
+                role: (!self.role_name.is_empty()).then(|| self.role_name.clone()),
+            },
+            Draft::SetVariable => {
+                let name = self.selected_variable.as_ref()?;
+                let variable = self
+                    .session
+                    .variables
+                    .as_ref()?
+                    .iter()
+                    .find(|v| &v.name == name)?
+                    .clone();
+                Change::SetGlobal {
+                    variable,
+                    value: self.variable_value.clone(),
+                }
+            }
+        })
+    }
+    fn draft_window(&mut self, ctx: &egui::Context, draft: Draft) {
+        let title = match draft {
+            Draft::CreateDatabase => "Vytvořit databázi",
+            Draft::CreateAccount => "Vytvořit účet",
+            Draft::ChangePassword => "Změnit heslo",
+            Draft::CreateRole => "Vytvořit roli",
+            Draft::RoleMembership => "Přidělit nebo odebrat roli",
+            Draft::DefaultRole => "Výchozí role",
+            Draft::SetVariable => "Změnit proměnnou",
+        };
+        let roles = self.roles();
+        egui::Window::new(title)
+            .id(egui::Id::new("draft"))
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                match draft {
+                    Draft::CreateDatabase => {
                         field(ui, "Název databáze", &mut self.change_db_name, false);
                         field(ui, "Kolace (ověří server)", &mut self.collation, false);
                     }
-                    if kind == 1 {
+                    Draft::CreateAccount => {
                         field(ui, "Uživatel", &mut self.change_user, false);
-                        field(ui, "Hostitel účtu", &mut self.change_host, false);
+                        field(
+                            ui,
+                            "Hostitel účtu (% = odkudkoli)",
+                            &mut self.change_host,
+                            false,
+                        );
+                        field(ui, "Heslo", &mut self.change_password, true);
                     }
-                    if kind == 1 || kind == 2 {
+                    Draft::ChangePassword => {
+                        ui.label(
+                            self.selected_account
+                                .as_ref()
+                                .map(|a| safe_text(&a.label()))
+                                .unwrap_or_default(),
+                        );
                         field(ui, "Nové heslo", &mut self.change_password, true);
                     }
-                    if kind == 3 {
-                        field(ui, "Databáze", &mut self.change_db, false);
-                        for (index, privilege) in Privilege::ALL.iter().enumerate() {
-                            ui.radio_value(&mut self.privilege, index, privilege.sql());
+                    Draft::CreateRole => field(ui, "Název role", &mut self.role_name, false),
+                    Draft::RoleMembership | Draft::DefaultRole => {
+                        ui.label(
+                            self.selected_account
+                                .as_ref()
+                                .map(|a| safe_text(&a.label()))
+                                .unwrap_or_default(),
+                        );
+                        if roles.is_empty() {
+                            ui.label("Na serveru není žádná role (nebo ji účet nevidí).");
                         }
-                        ui.checkbox(&mut self.grant, "Přidat (vypnuto = odebrat)");
+                        ui.horizontal_wrapped(|ui| {
+                            if draft == Draft::DefaultRole {
+                                ui.radio_value(&mut self.role_name, String::new(), "žádná");
+                            }
+                            for role in &roles {
+                                ui.radio_value(&mut self.role_name, role.clone(), safe_text(role));
+                            }
+                        });
+                        if draft == Draft::RoleMembership {
+                            ui.horizontal(|ui| {
+                                ui.radio_value(&mut self.role_grant, true, "Přidělit");
+                                ui.radio_value(&mut self.role_grant, false, "Odebrat");
+                            });
+                        }
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Ponechat rozpracované a zavřít").clicked() {
-                            self.change_kind = None;
+                    Draft::SetVariable => {
+                        ui.label(self.selected_variable.clone().unwrap_or_default());
+                        field(
+                            ui,
+                            "Nová hodnota (velikosti lze s příponou K/M/G)",
+                            &mut self.variable_value,
+                            false,
+                        );
+                    }
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Ponechat rozpracované a zavřít").clicked() {
+                        self.draft = None;
+                    }
+                    if ui.button("Zkontrolovat změnu…").clicked() {
+                        match self.draft_change(draft) {
+                            Some(change) => self.confirm(change),
+                            None => self.message = "Formulář nemá vybraný cíl.".into(),
                         }
-                        if ui.button("Zkontrolovat změnu…").clicked() {
-                            self.confirmation = match kind {
-                                0 => Some(Change::CreateDatabase {
-                                    name: self.change_db_name.clone(),
-                                    collation: self.collation.clone(),
-                                }),
-                                1 => Some(Change::CreateAccount {
-                                    user: self.change_user.clone(),
-                                    host: self.change_host.clone(),
-                                    password: Secret(self.change_password.clone()),
-                                }),
-                                2 => self.selected_account.clone().map(|account| {
-                                    Change::ChangePassword {
-                                        account,
-                                        password: Secret(self.change_password.clone()),
-                                    }
-                                }),
-                                3 => self.selected_account.clone().map(|account| {
-                                    Change::DatabaseGrant {
-                                        account,
-                                        database: self.change_db.clone(),
-                                        privilege: Privilege::ALL[self.privilege],
-                                        grant: self.grant,
-                                    }
-                                }),
-                                _ => None,
-                            };
-                            self.confirmation_focus = self.confirmation.is_some();
-                        }
-                    });
+                    }
                 });
+            });
+    }
+    fn privilege_window(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.privilege_editor.take() else {
+            return;
+        };
+        let detail = self
+            .session
+            .account
+            .clone()
+            .filter(|d| d.account.as_ref() == Some(&editor.account));
+        let scope = editor.scope();
+        let current = |scope: &GrantScope| -> BTreeSet<String> {
+            detail
+                .as_ref()
+                .and_then(|d| d.privileges_at(scope))
+                .map(|set| {
+                    let mut all = set.privileges.clone();
+                    if set.grantable {
+                        all.insert(GRANT_OPTION.into());
+                    }
+                    all
+                })
+                .unwrap_or_default()
+        };
+        if let Ok(scope) = &scope {
+            if editor.loaded_for.as_ref() != Some(scope) {
+                editor.wanted = current(scope);
+                editor.loaded_for = Some(scope.clone());
+            }
         }
+        let mut open = true;
+        let mut review = None;
+        egui::Window::new(format!("Oprávnění • {}", safe_text(&editor.account.label())))
+            .id(egui::Id::new("privileges_editor"))
+            .collapsible(false)
+            .resizable(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                match &editor.fixed {
+                    Some(fixed) => {
+                        ui.label(format!("Rozsah: {}", safe_text(&fixed.label())));
+                    }
+                    None => {
+                        field(
+                            ui,
+                            "Rozsah: *.* (server), databáze.* nebo databáze.tabulka",
+                            &mut editor.scope_text,
+                            false,
+                        );
+                    }
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Šablona:");
+                    for template in Template::ALL {
+                        if ui.button(template.label()).clicked() {
+                            let target = if template.needs_database() {
+                                match &scope {
+                                    Ok(GrantScope::Database(db)) => {
+                                        Some(GrantScope::Database(db.clone()))
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                Some(GrantScope::Global)
+                            };
+                            match target {
+                                Some(target) => {
+                                    editor.fixed = None;
+                                    editor.scope_text = match &target {
+                                        GrantScope::Database(db) => format!("{db}.*"),
+                                        _ => "*.*".into(),
+                                    };
+                                    let mut wanted = current(&target);
+                                    wanted.extend(template.privileges().iter().map(|p| p.to_string()));
+                                    editor.wanted = wanted;
+                                    editor.loaded_for = Some(target);
+                                }
+                                None => {
+                                    self.message = "Šablona pro databázi potřebuje rozsah databáze.* (zadejte ho nahoře).".into()
+                                }
+                            }
+                        }
+                    }
+                });
+                match &scope {
+                    Err(error) => {
+                        ui.label(RichText::new(error.to_string()).color(Color32::RED));
+                    }
+                    Ok(scope) => {
+                        let options: Vec<&str> = scope
+                            .privileges()
+                            .iter()
+                            .copied()
+                            .chain([GRANT_OPTION])
+                            .collect();
+                        egui::Grid::new("privilege_checkboxes")
+                            .num_columns(3)
+                            .show(ui, |ui| {
+                                for (i, privilege) in options.iter().enumerate() {
+                                    let mut on = editor.wanted.contains(*privilege);
+                                    if ui.checkbox(&mut on, *privilege).changed() {
+                                        if on {
+                                            editor.wanted.insert(privilege.to_string());
+                                        } else {
+                                            editor.wanted.remove(*privilege);
+                                        }
+                                    }
+                                    if i % 3 == 2 {
+                                        ui.end_row();
+                                    }
+                                }
+                            });
+                        ui.horizontal(|ui| {
+                            if ui.button("Vše").clicked() {
+                                editor.wanted =
+                                    options.iter().map(|p| p.to_string()).collect();
+                            }
+                            if ui.button("Nic").clicked() {
+                                editor.wanted.clear();
+                            }
+                            if ui.button("Zkontrolovat změnu…").clicked() {
+                                let (grant, revoke) =
+                                    privilege_diff(&current(scope), &editor.wanted);
+                                review = Some(Change::Privileges {
+                                    account: editor.account.clone(),
+                                    scope: scope.clone(),
+                                    grant,
+                                    revoke,
+                                });
+                            }
+                        });
+                    }
+                }
+            });
+        if let Some(change) = review {
+            match preview(&change) {
+                Ok(_) => self.confirm(change),
+                Err(error) => self.message = error.to_string(),
+            }
+        }
+        if open {
+            self.privilege_editor = Some(editor);
+        }
+    }
+    fn properties_window(&mut self, ctx: &egui::Context) {
+        let Some(mut editor) = self.properties_editor.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut review = None;
+        egui::Window::new(format!(
+            "Vlastnosti účtu • {}",
+            safe_text(&editor.account.label())
+        ))
+        .id(egui::Id::new("properties_editor"))
+        .collapsible(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.checkbox(&mut editor.locked, "Účet zamčen (nelze se přihlásit)");
+            ui.checkbox(
+                &mut editor.expire,
+                "Nechat heslo vypršet (uživatel ho musí změnit při přihlášení)",
+            );
+            ui.label("Vyžadovat TLS:");
+            if editor.tls == TlsRequirement::Specified {
+                ui.label("Účet má konkrétní požadavek (vydavatel/subjekt); Harbor ho nemění.");
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    for tls in [
+                        TlsRequirement::None,
+                        TlsRequirement::Ssl,
+                        TlsRequirement::X509,
+                    ] {
+                        ui.radio_value(&mut editor.tls, tls, tls.label());
+                    }
+                });
+            }
+            ui.label("Limity (0 = bez limitu):");
+            egui::Grid::new("limits").show(ui, |ui| {
+                for (label, value) in [
+                    ("Dotazy za hodinu", &mut editor.limits.queries_per_hour),
+                    ("Změny za hodinu", &mut editor.limits.updates_per_hour),
+                    (
+                        "Připojení za hodinu",
+                        &mut editor.limits.connections_per_hour,
+                    ),
+                    ("Souběžná spojení", &mut editor.limits.user_connections),
+                ] {
+                    ui.label(label);
+                    ui.add(egui::DragValue::new(value).range(0..=4_294_967_295u64));
+                    ui.end_row();
+                }
+            });
+            if ui.button("Zkontrolovat změnu…").clicked() {
+                review = Some(Change::AlterAccount {
+                    account: editor.account.clone(),
+                    locked: editor.locked,
+                    expire_password: editor.expire,
+                    tls: (editor.tls != TlsRequirement::Specified).then_some(editor.tls),
+                    limits: editor.limits,
+                });
+            }
+        });
+        if let Some(change) = review {
+            self.confirm(change);
+        }
+        if open {
+            self.properties_editor = Some(editor);
+        }
+    }
+    fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(draft) = self.draft {
+            self.draft_window(ctx, draft);
+        }
+        self.privilege_window(ctx);
+        self.properties_window(ctx);
         if let Some(id) = self.delete_profile.clone() {
             let name = self
                 .settings
@@ -859,7 +1862,9 @@ impl Harbor {
             });
         }
         if let Some(change) = self.confirmation.clone() {
+            let sql = preview(&change);
             egui::Modal::new(egui::Id::new("confirm_change")).show(ctx, |ui| {
+                ui.set_max_width(720.0);
                 ui.heading("Potvrdit změnu na serveru");
                 ui.strong(
                     self.session
@@ -875,6 +1880,31 @@ impl Harbor {
                 if let Change::KillQuery { target } = &change {
                     ui.monospace(safe_text(&target.query));
                 }
+                let valid = match &sql {
+                    Ok(sql) => {
+                        ui.label("Provede se:");
+                        ui.monospace(safe_text(sql));
+                        true
+                    }
+                    Err(error) => {
+                        ui.label(RichText::new(error.to_string()).color(Color32::RED));
+                        false
+                    }
+                };
+                if matches!(change, Change::Maintenance { action: Maintenance::Optimize | Maintenance::Repair, .. }) {
+                    ui.label("Během údržby se data v Harboru neobnovují; velká tabulka může být po dobu operace zamčená.");
+                }
+                if let Some(name) = change.destructive_name() {
+                    ui.label(
+                        RichText::new(format!(
+                            "Nevratná operace. Pro potvrzení napište název: {}",
+                            safe_text(name)
+                        ))
+                        .strong(),
+                    );
+                    ui.text_edit_singleline(&mut self.confirm_text);
+                }
+                let unlocked = unlocked(&change, &self.confirm_text);
                 ui.horizontal(|ui| {
                     let cancel = ui.button("Zrušit");
                     if self.confirmation_focus {
@@ -886,14 +1916,20 @@ impl Harbor {
                     }
                     if ui
                         .add_enabled(
-                            !self.session.worker.busy && self.session.snapshot.is_some(),
+                            valid
+                                && unlocked
+                                && !self.session.worker.busy
+                                && self.session.snapshot.is_some(),
                             egui::Button::new("Provést změnu"),
                         )
                         .clicked()
                         && self.session.request(Operation::Apply(change))
                     {
                         self.confirmation = None;
-                        self.change_kind = None;
+                        self.confirm_text.clear();
+                        self.draft = None;
+                        self.privilege_editor = None;
+                        self.properties_editor = None;
                         self.change_password.clear();
                     }
                 });
@@ -910,6 +1946,7 @@ impl Harbor {
     fn render(&mut self, ctx: &egui::Context) {
         self.session.tick(self.settings.refresh_seconds);
         self.sync_server_scope();
+        self.autoload();
         // Results arrive over a channel egui cannot see: poll quickly only while work is
         // in flight, otherwise wake for the next refresh.
         ctx.request_repaint_after(self.session.next_wakeup(self.settings.refresh_seconds));
@@ -925,10 +1962,10 @@ impl Harbor {
                 if self.theme == ThemeId::Original {
                     dark_sidebar(ui.visuals_mut(), p);
                 }
-                ui.add_space(12.0);
+                ui.add_space(8.0);
                 ui.heading(RichText::new("h  harbor").size(28.0));
                 ui.small("MARIADB WORKSPACE");
-                ui.add_space(30.0);
+                ui.add_space(16.0);
                 ui.label(
                     self.session
                         .profile
@@ -937,11 +1974,11 @@ impl Harbor {
                         .unwrap_or_else(|| "Žádné spojení".into()),
                 );
                 ui.label(safe_text(&self.session.status));
-                ui.add_space(30.0);
+                ui.add_space(16.0);
                 for (index, label) in PAGES.iter().enumerate() {
                     if ui
                         .add_sized(
-                            [180.0, 44.0],
+                            [180.0, 36.0],
                             egui::Button::new(*label).selected(self.page == index),
                         )
                         .clicked()
@@ -949,7 +1986,7 @@ impl Harbor {
                         self.page = index;
                     }
                 }
-                ui.add_space(30.0);
+                ui.add_space(16.0);
                 ui.label("Ubuntu / AlmaLinux");
                 ui.small(format!("Harbor {}", env!("CARGO_PKG_VERSION")));
             });
@@ -988,11 +2025,13 @@ impl Harbor {
                             FontFamily::Proportional
                         };
                         ui.label(
-                            RichText::new(if self.page == 0 && self.theme == ThemeId::Original {
-                                "Server pod kontrolou."
-                            } else {
-                                PAGES[self.page]
-                            })
+                            RichText::new(
+                                if self.page == OVERVIEW && self.theme == ThemeId::Original {
+                                    "Server pod kontrolou."
+                                } else {
+                                    PAGES[self.page]
+                                },
+                            )
                             .font(FontId::new(desktop(self.theme).typography.title_size, font)),
                         );
                         ui.label(
@@ -1003,20 +2042,22 @@ impl Harbor {
                             })
                             .color(p.muted),
                         );
-                        ui.add_space(18.0);
+                        ui.add_space(14.0);
                         if !self.message.is_empty() {
-                            ui.label(format!("Nastavení: {}", self.message));
+                            ui.label(format!("Upozornění: {}", self.message));
                         }
                         if let Some(error) = &self.session.error {
                             ui.strong(format!("CHYBA: {error}"));
                         }
                         match self.page {
-                            0 => self.overview(ui, p),
-                            1 => self.databases(ui, p),
-                            2 => self.accounts(ui, p),
-                            3 => self.processes(ui, p),
-                            4 => self.connection(ui, p),
-                            _ => self.settings(ui, p),
+                            SETTINGS => self.settings(ui, p),
+                            DATABASES => self.databases(ui, p),
+                            ACCOUNTS => self.accounts(ui, p),
+                            PROCESSES => self.processes(ui, p),
+                            VARIABLES => self.variables(ui, p),
+                            HEALTH => self.health(ui, p),
+                            CONNECTION => self.connection(ui, p),
+                            _ => self.overview(ui, p),
                         }
                         if let Some(snapshot) = &self.session.snapshot {
                             for notice in &snapshot.notices {
@@ -1029,6 +2070,46 @@ impl Harbor {
             self.session.request(Operation::Refresh);
         }
         self.dialogs(ctx);
+    }
+}
+/// Destructive changes need the object's name typed exactly.
+fn unlocked(change: &Change, typed: &str) -> bool {
+    change.destructive_name().is_none_or(|name| typed == name)
+}
+fn sort_tables(tables: &mut [&TableInfo], sort: TableSort) {
+    match sort {
+        TableSort::Name => tables.sort_by(|a, b| a.name.cmp(&b.name)),
+        TableSort::Rows => tables.sort_by(|a, b| b.rows.cmp(&a.rows)),
+        TableSort::Size => tables.sort_by_key(|t| std::cmp::Reverse(t.bytes())),
+        TableSort::Free => tables.sort_by_key(|t| std::cmp::Reverse(t.free_bytes)),
+    }
+}
+/// Value with a readable size for large byte counts.
+fn variable_value(v: &Variable) -> String {
+    match v.value.parse::<u64>() {
+        Ok(n) if v.var_type.contains("INT") && n >= 1_048_576 => {
+            format!("{} ({})", v.value, human_bytes(n))
+        }
+        _ => v.value.clone(),
+    }
+}
+fn origin_label(v: &Variable) -> &'static str {
+    match v.origin.as_str() {
+        "COMPILE-TIME" => "výchozí",
+        "CONFIG" => "konfigurace",
+        "COMMAND-LINE" => "příkazová řádka",
+        "SQL" => "změněno za běhu",
+        "AUTO" => "automaticky",
+        "ENVIRONMENT" => "prostředí",
+        _ => "—",
+    }
+}
+fn clip(value: &str, max: usize) -> String {
+    let text = safe_text(value);
+    if text.chars().count() > max {
+        format!("{}…", text.chars().take(max).collect::<String>())
+    } else {
+        text
     }
 }
 fn field(ui: &mut egui::Ui, label: &str, value: &mut String, password: bool) {
@@ -1094,277 +2175,4 @@ fn chart(ui: &mut egui::Ui, values: &[f64], p: Palette) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::time::Duration;
-
-    fn contrast(a: Color32, b: Color32) -> f32 {
-        let lum = |c: Color32| {
-            let ch = |v: u8| {
-                let v = v as f32 / 255.0;
-                if v <= 0.03928 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * ch(c.r()) + 0.7152 * ch(c.g()) + 0.0722 * ch(c.b())
-        };
-        let (x, y) = (lum(a), lum(b));
-        (x.max(y) + 0.05) / (x.min(y) + 0.05)
-    }
-
-    #[test]
-    fn original_sidebar_buttons_are_readable() {
-        let p = Palette::new(ThemeId::Original);
-        let mut v = egui::Visuals::light();
-        dark_sidebar(&mut v, p);
-        let text = v.override_text_color.unwrap();
-        for fill in [
-            v.widgets.inactive.weak_bg_fill,
-            v.widgets.hovered.weak_bg_fill,
-            v.widgets.active.weak_bg_fill,
-            v.selection.bg_fill,
-            p.side,
-        ] {
-            assert!(
-                contrast(text, fill) >= 4.5,
-                "{fill:?}: {}",
-                contrast(text, fill)
-            );
-        }
-    }
-    #[test]
-    fn themes_preserve_drafts_selection_and_render_at_both_sizes() {
-        let ctx = egui::Context::default();
-        let mut app = Harbor::new(&ctx, false);
-        app.store = None;
-        app.change_db_name = "rozpracovaná_db".into();
-        app.selected_db = Some("commerce".into());
-        for theme in ThemeId::DESKTOP {
-            app.theme = theme;
-            for size in [[1024.0, 720.0], [1440.0, 960.0]] {
-                for page in 0..6 {
-                    app.page = page;
-                    let output = ctx.run(
-                        egui::RawInput {
-                            screen_rect: Some(egui::Rect::from_min_size(
-                                egui::Pos2::ZERO,
-                                Vec2::from(size),
-                            )),
-                            ..Default::default()
-                        },
-                        |ctx| app.render(ctx),
-                    );
-                    assert!(!output.shapes.is_empty());
-                }
-            }
-        }
-        assert_eq!(app.change_db_name, "rozpracovaná_db");
-        assert_eq!(app.selected_db.as_deref(), Some("commerce"));
-    }
-    fn frame(ctx: &egui::Context, app: &mut Harbor) -> egui::FullOutput {
-        ctx.run(egui::RawInput::default(), |ctx| app.render(ctx))
-    }
-    fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
-        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
-            match shape {
-                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
-                _ => (),
-            }
-        }
-        let mut out = Vec::new();
-        shapes.iter().for_each(|s| walk(&s.shape, &mut out));
-        out
-    }
-    #[test]
-    fn server_text_with_control_or_bidi_characters_is_neutralized() {
-        let ctx = egui::Context::default();
-        let mut app = Harbor::new(&ctx, true);
-        app.store = None;
-        wait_for_snapshot(&ctx, &mut app);
-        let mut snapshot = (**app.session.snapshot.as_ref().unwrap()).clone();
-        snapshot.databases[0].name = "faktury\u{202e}gpj.exe\nDROP".into();
-        snapshot.accounts[0].host = "evil\u{2066}host".into();
-        app.session.snapshot = Some(std::sync::Arc::new(snapshot));
-        app.selected_account = None;
-        for page in [1, 2] {
-            app.page = page;
-            let all = texts(&frame(&ctx, &mut app).shapes).join("");
-            assert!(
-                !all.contains('\u{202e}') && !all.contains('\u{2066}'),
-                "page {page}"
-            );
-            assert!(all.contains("faktury") || page == 2);
-        }
-    }
-    #[test]
-    fn dragging_the_refresh_slider_writes_the_config_once() {
-        let directory =
-            std::env::temp_dir().join(format!("harbor-desktop-slider-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        let ctx = egui::Context::default();
-        let mut app = Harbor::new(&ctx, false);
-        app.store = Some(ConfigStore::at(directory.clone()));
-        app.settings = Settings::default();
-        for value in 6..40 {
-            app.refresh_slider(value, true, false, true);
-        }
-        assert!(
-            !directory.join("settings.json").exists(),
-            "no write while dragging"
-        );
-        assert_eq!(app.refresh_draft, Some(39));
-        app.refresh_slider(39, false, true, false);
-        assert_eq!(app.settings.refresh_seconds, 39);
-        assert_eq!(app.refresh_draft, None);
-        assert_eq!(
-            ConfigStore::at(directory.clone())
-                .load()
-                .unwrap()
-                .refresh_seconds,
-            39
-        );
-        // Keyboard change (no drag) is saved right away.
-        app.refresh_slider(40, false, false, true);
-        assert_eq!(app.settings.refresh_seconds, 40);
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-    #[test]
-    fn filters_are_per_page_case_insensitive_and_forms_do_not_share_drafts() {
-        let ctx = egui::Context::default();
-        let mut app = Harbor::new(&ctx, true);
-        app.store = None;
-        wait_for_snapshot(&ctx, &mut app);
-        let snapshot = app.session.snapshot.clone().unwrap();
-        app.filters[2] = "ANALYTICS".into();
-        assert_eq!(
-            snapshot
-                .accounts
-                .iter()
-                .filter(|a| app.account_visible(a))
-                .count(),
-            1
-        );
-        assert!(snapshot.databases.iter().any(|d| app.database_visible(d)));
-        app.filters[3] = "select date".into();
-        assert_eq!(
-            snapshot
-                .processes
-                .iter()
-                .filter(|p| app.process_visible(p))
-                .count(),
-            1
-        );
-        app.change_db_name = "nova_db".into();
-        assert!(app.change_user.is_empty());
-    }
-    #[test]
-    fn idle_window_does_not_repaint_ten_times_a_second() {
-        let ctx = egui::Context::default();
-        let mut app = Harbor::new(&ctx, false);
-        app.store = None;
-        // The first frames repaint at once (fonts, style install); then it settles.
-        for _ in 0..3 {
-            frame(&ctx, &mut app);
-        }
-        let output = frame(&ctx, &mut app);
-        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
-        assert!(delay >= Duration::from_millis(900), "{delay:?}");
-    }
-    fn wait_for_snapshot(ctx: &egui::Context, app: &mut Harbor) {
-        let start = std::time::Instant::now();
-        frame(ctx, app);
-        while app.session.worker.busy && start.elapsed() < std::time::Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(5));
-            frame(ctx, app);
-        }
-        assert!(app.session.snapshot.is_some());
-    }
-    #[test]
-    fn switching_server_drops_selection_and_account_bound_drafts() {
-        let ctx = egui::Context::default();
-        let mut app = Harbor::new(&ctx, true);
-        app.store = None;
-        wait_for_snapshot(&ctx, &mut app);
-        let account = app.session.snapshot.as_ref().unwrap().accounts[0].clone();
-        app.selected_account = Some(account.clone());
-        app.selected_db = Some("commerce".into());
-        app.change_kind = Some(2);
-        app.change_password = Zeroizing::new("tajne".into());
-        app.confirmation = Some(Change::ChangePassword {
-            account,
-            password: Secret::new("tajne".into()),
-        });
-        frame(&ctx, &mut app);
-        assert!(
-            app.selected_account.is_some(),
-            "same server keeps the selection"
-        );
-        // Another server (here a fresh demo session) must not inherit the target account.
-        app.session
-            .connect(Profile::default(), Secret::default(), true);
-        frame(&ctx, &mut app);
-        assert!(app.selected_account.is_none());
-        assert!(app.selected_db.is_none());
-        assert!(app.confirmation.is_none());
-        assert!(app.change_kind.is_none());
-        assert!(app.change_password.is_empty());
-    }
-    #[test]
-    fn selection_missing_from_new_snapshot_is_dropped() {
-        let ctx = egui::Context::default();
-        let mut app = Harbor::new(&ctx, true);
-        app.store = None;
-        wait_for_snapshot(&ctx, &mut app);
-        app.selected_account = Some(Account {
-            user: "neexistuje".into(),
-            host: "%".into(),
-            plugin: "mysql_native_password".into(),
-        });
-        app.change_kind = Some(3);
-        frame(&ctx, &mut app);
-        assert!(app.selected_account.is_none());
-        assert!(app.change_kind.is_none());
-    }
-    #[test]
-    fn profiles_are_saved_and_deleted_by_id_with_confirmation() {
-        let directory =
-            std::env::temp_dir().join(format!("harbor-desktop-profiles-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        let ctx = egui::Context::default();
-        let mut app = Harbor::new(&ctx, false);
-        app.store = Some(ConfigStore::at(directory.clone()));
-        app.settings = Settings::default();
-        for name in ["A", "B"] {
-            app.load_profile(Profile::default());
-            app.profile.name = name.into();
-            app.save_profile();
-            assert!(!app.profile.id.is_empty());
-        }
-        // Saving the same form twice updates it instead of duplicating it.
-        app.save_profile();
-        assert_eq!(app.settings.profiles.len(), 2);
-        let a = app.settings.profiles[0].clone();
-        app.load_profile(a.clone());
-        // Renaming A onto B is refused; B is not silently replaced.
-        app.profile.name = "B".into();
-        app.save_profile();
-        assert!(app.message.contains("už existuje"));
-        assert_eq!(app.settings.profiles.len(), 2);
-        // Delete targets the loaded profile id even though the form now says "B".
-        app.request_delete_profile();
-        assert_eq!(
-            app.settings.profiles.len(),
-            2,
-            "nothing deleted before confirmation"
-        );
-        assert_eq!(app.delete_profile.as_deref(), Some(a.id.as_str()));
-        app.confirm_delete_profile();
-        assert_eq!(app.settings.profiles.len(), 1);
-        assert_eq!(app.settings.profiles[0].name, "B");
-        assert!(app.profile.id.is_empty());
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-}
+mod tests;

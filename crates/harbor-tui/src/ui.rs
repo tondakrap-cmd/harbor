@@ -10,40 +10,107 @@ use ratatui::{
     },
     Frame,
 };
+use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 6] = [
+const PAGES: [&str; 8] = [
     "Server",
     "Databáze",
     "Uživatelé",
     "Spojení",
+    "Proměnné",
+    "Doktor",
     "Profily",
     "Nastavení",
 ];
-const MENU: [&str; 23] = [
-    "Server",
-    "Databáze",
-    "Uživatelé",
-    "Spojení",
-    "Profily",
-    "Nastavení",
-    "Nápověda",
-    "Obnovit",
-    "Nový profil",
-    "Otevřít DEMO",
-    "Odpojit / zrušit připojování",
-    "Vytvořit databázi",
-    "Vytvořit účet",
-    "Změnit heslo vybraného účtu",
-    "Oprávnění vybraného účtu",
-    "Ukončit vybraný dotaz",
-    "Hledat",
-    "Systémové databáze ano/ne",
-    "Jen dlouhé dotazy ano/ne",
-    "Další motiv (zachová formulář)",
-    "Rozpracovaný formulář",
-    "Odstranit vybraný uložený profil",
-    "Konec",
+const SERVER: usize = 0;
+const DATABASES: usize = 1;
+const ACCOUNTS: usize = 2;
+const PROCESSES: usize = 3;
+const VARIABLES: usize = 4;
+const HEALTH: usize = 5;
+const PROFILES: usize = 6;
+const SETTINGS: usize = 7;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Action {
+    Page(usize),
+    Help,
+    Refresh,
+    NewProfile,
+    Demo,
+    Disconnect,
+    CreateDatabase,
+    DropDatabase,
+    TableDetail,
+    Maintenance,
+    CreateAccount,
+    CreateRole,
+    ChangePassword,
+    EditPrivileges,
+    Template,
+    AccountProperties,
+    RoleMembership,
+    DefaultRole,
+    DropAccount,
+    KillQuery,
+    SetVariable,
+    RunHealth,
+    Search,
+    ToggleSystem,
+    ToggleLong,
+    ToggleKeyVariables,
+    ToggleChangedVariables,
+    NextTheme,
+    ResumeDraft,
+    DeleteProfile,
+    Quit,
+}
+const MENU: &[(&str, Action)] = &[
+    ("Server (1)", Action::Page(SERVER)),
+    ("Databáze (2)", Action::Page(DATABASES)),
+    ("Uživatelé (3)", Action::Page(ACCOUNTS)),
+    ("Spojení (4)", Action::Page(PROCESSES)),
+    ("Proměnné (5)", Action::Page(VARIABLES)),
+    ("Doktor (6)", Action::Page(HEALTH)),
+    ("Profily (7, F3)", Action::Page(PROFILES)),
+    ("Nastavení (8)", Action::Page(SETTINGS)),
+    ("Nápověda", Action::Help),
+    ("Obnovit", Action::Refresh),
+    ("Nový profil", Action::NewProfile),
+    ("Otevřít DEMO", Action::Demo),
+    ("Odpojit / zrušit připojování", Action::Disconnect),
+    ("Databáze: vytvořit", Action::CreateDatabase),
+    ("Databáze: smazat vybranou…", Action::DropDatabase),
+    ("Tabulka: struktura a DDL", Action::TableDetail),
+    (
+        "Tabulka: údržba (ANALYZE/CHECK/OPTIMIZE/REPAIR)",
+        Action::Maintenance,
+    ),
+    ("Účet: vytvořit", Action::CreateAccount),
+    ("Role: vytvořit", Action::CreateRole),
+    ("Účet: změnit heslo", Action::ChangePassword),
+    ("Účet: upravit oprávnění…", Action::EditPrivileges),
+    ("Účet: šablona oprávnění…", Action::Template),
+    ("Účet: zámek, TLS a limity…", Action::AccountProperties),
+    ("Účet: přidělit / odebrat roli…", Action::RoleMembership),
+    ("Účet: výchozí role…", Action::DefaultRole),
+    ("Účet / role: smazat…", Action::DropAccount),
+    ("Spojení: ukončit vybraný dotaz", Action::KillQuery),
+    ("Proměnná: změnit hodnotu (SET GLOBAL)", Action::SetVariable),
+    ("Doktor: spustit kontrolu", Action::RunHealth),
+    ("Hledat", Action::Search),
+    ("Systémové databáze ano/ne", Action::ToggleSystem),
+    ("Jen dlouhé dotazy ano/ne", Action::ToggleLong),
+    ("Jen klíčové proměnné ano/ne", Action::ToggleKeyVariables),
+    (
+        "Jen změněné proměnné ano/ne",
+        Action::ToggleChangedVariables,
+    ),
+    ("Další motiv (zachová formulář)", Action::NextTheme),
+    ("Rozpracovaný formulář", Action::ResumeDraft),
+    ("Odstranit vybraný uložený profil", Action::DeleteProfile),
+    ("Konec", Action::Quit),
 ];
 /// Values are wiped on drop; dialogs are moved (suspended/restored), never cloned, so a
 /// typed password exists in one buffer only.
@@ -77,6 +144,8 @@ enum RowKey {
     Database(String),
     Account(Account),
     Process(u64),
+    Variable(String),
+    Finding(String),
     Profile(String),
 }
 enum Outcome {
@@ -91,15 +160,78 @@ enum Kind {
     Database,
     Account,
     Password(Account),
-    Grant(Account),
+    Role,
+    RoleMembership(Account),
+    DefaultRole(Account),
+    Template(Account),
+    Properties(Account),
+    /// Maintenance of a table in this database.
+    Maintenance(String),
+    Variable(Variable),
     /// Search for the list on this page.
     Search(usize),
+}
+impl Kind {
+    fn account(&self) -> Option<&Account> {
+        match self {
+            Self::Password(a)
+            | Self::RoleMembership(a)
+            | Self::DefaultRole(a)
+            | Self::Template(a)
+            | Self::Properties(a) => Some(a),
+            _ => None,
+        }
+    }
+    /// Bound to objects of the connected server (dropped on a server switch).
+    fn server_bound(&self) -> bool {
+        self.account().is_some() || matches!(self, Self::Maintenance(_) | Self::Variable(_))
+    }
 }
 struct Dialog {
     kind: Kind,
     fields: Vec<Field>,
     focus: usize,
 }
+/// Checkbox list of an account's privileges at one scope.
+struct PrivilegePicker {
+    account: Account,
+    /// Scope picked from the existing grants (keeps wildcard patterns verbatim).
+    fixed: Option<GrantScope>,
+    scope_text: String,
+    loaded_for: Option<GrantScope>,
+    wanted: BTreeSet<String>,
+    /// 0 = scope line, 1..=n privileges, then the two buttons.
+    cursor: usize,
+}
+impl PrivilegePicker {
+    fn scope(&self) -> Result<GrantScope> {
+        match &self.fixed {
+            Some(scope) => Ok(scope.clone()),
+            None => GrantScope::parse(&self.scope_text),
+        }
+    }
+    fn options(&self) -> Vec<&'static str> {
+        match self.scope() {
+            Ok(scope) => scope
+                .privileges()
+                .iter()
+                .copied()
+                .chain([GRANT_OPTION])
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+fn scope_text(scope: &GrantScope) -> String {
+    match scope {
+        GrantScope::Global => "*.*".into(),
+        GrantScope::Database(db) => format!("{db}.*"),
+        GrantScope::DatabasePattern(p) => format!("{p}.*"),
+        GrantScope::Table(db, t) => format!("{db}.{t}"),
+    }
+}
+// At most one confirmation exists at a time; boxing would only add indirection.
+#[allow(clippy::large_enum_variant)]
 enum Pending {
     Server(Change),
     DeleteProfile { id: String },
@@ -107,6 +239,23 @@ enum Pending {
 struct Confirmation {
     action: Pending,
     yes: bool,
+    /// Name typed to unlock a destructive change.
+    typed: String,
+}
+impl Confirmation {
+    fn new(action: Pending) -> Self {
+        Self {
+            action,
+            yes: false,
+            typed: String::new(),
+        }
+    }
+    fn required_name(&self) -> Option<&str> {
+        match &self.action {
+            Pending::Server(change) => change.destructive_name(),
+            Pending::DeleteProfile { .. } => None,
+        }
+    }
 }
 pub struct App {
     session: Session,
@@ -121,20 +270,30 @@ pub struct App {
     horizontal: usize,
     detail_scroll: u16,
     detail_focus: bool,
+    /// Table under the cursor in the database detail (detail focus on Databáze).
+    table_cursor: usize,
+    /// Table structure overlay is open.
+    table_overlay: bool,
+    overlay_scroll: u16,
     menu: Option<usize>,
     help: bool,
     dialog: Option<Dialog>,
     suspended: Option<Dialog>,
+    picker: Option<PrivilegePicker>,
     confirm: Option<Confirmation>,
     /// One search per page, like the desktop.
-    filters: [String; 6],
+    filters: [String; 8],
     system: bool,
     long: bool,
+    key_only: bool,
+    changed_only: bool,
     detail: String,
     status: String,
     status_at: std::time::Instant,
     /// Worker generation the selection and account-bound drafts belong to.
     scope_generation: u64,
+    loaded_variables: Option<u64>,
+    loaded_health: Option<u64>,
     pub quit: bool,
 }
 #[derive(Clone, Copy)]
@@ -168,24 +327,32 @@ impl App {
             session: Session::default(),
             settings,
             store,
-            page: 4,
+            page: PROFILES,
             selected: 0,
             selected_key: None,
             horizontal: 0,
             detail_scroll: 0,
             detail_focus: false,
+            table_cursor: 0,
+            table_overlay: false,
+            overlay_scroll: 0,
             menu: None,
             help: false,
             dialog: None,
             suspended: None,
+            picker: None,
             confirm: None,
             filters: Default::default(),
             system: false,
             long: false,
+            key_only: true,
+            changed_only: false,
             detail: String::new(),
             status,
             status_at: std::time::Instant::now(),
             scope_generation: 0,
+            loaded_variables: None,
+            loaded_health: None,
             quit: false,
         };
         if args.iter().any(|a| a == "--demo") {
@@ -197,7 +364,7 @@ impl App {
                 Secret::default(),
                 true,
             );
-            app.page = 0;
+            app.page = SERVER;
         }
         app.scope_generation = app.session.worker.generation();
         app
@@ -206,28 +373,61 @@ impl App {
         self.session.tick(self.settings.refresh_seconds);
         self.sync_server_scope();
         self.reconcile_selection();
+        self.autoload();
+    }
+    /// The variables and health pages load their data the first time they are shown
+    /// for a server; afterwards only on request.
+    fn autoload(&mut self) {
+        if self.session.snapshot.is_none() {
+            return;
+        }
+        let generation = self.session.worker.generation();
+        if self.page == VARIABLES
+            && self.session.variables.is_none()
+            && self.loaded_variables != Some(generation)
+        {
+            self.loaded_variables = Some(generation);
+            self.session.request(Operation::Variables);
+        }
+        if self.page == HEALTH
+            && self.session.health.is_none()
+            && self.loaded_health != Some(generation)
+        {
+            self.loaded_health = Some(generation);
+            self.session.request(Operation::Health);
+        }
     }
     fn filter(&self) -> &str {
         &self.filters[self.page]
     }
     fn row_keys(&self) -> Vec<RowKey> {
         match self.page {
-            1 => self
+            DATABASES => self
                 .databases()
                 .iter()
                 .map(|d| RowKey::Database(d.name.clone()))
                 .collect(),
-            2 => self
+            ACCOUNTS => self
                 .accounts()
                 .iter()
                 .map(|a| RowKey::Account((*a).clone()))
                 .collect(),
-            3 => self
+            PROCESSES => self
                 .processes()
                 .iter()
                 .map(|p| RowKey::Process(p.id))
                 .collect(),
-            4 => self
+            VARIABLES => self
+                .variables()
+                .iter()
+                .map(|v| RowKey::Variable(v.name.clone()))
+                .collect(),
+            HEALTH => self
+                .findings()
+                .iter()
+                .map(|f| RowKey::Finding(f.title.clone()))
+                .collect(),
+            PROFILES => self
                 .settings
                 .profiles
                 .iter()
@@ -254,7 +454,7 @@ impl App {
             self.selected = index;
             return;
         }
-        if self.page != 4 {
+        if self.page != PROFILES {
             self.selected = self.selected.min(keys.len() - 1);
         }
         self.selected_key = keys.get(self.selected).cloned();
@@ -271,6 +471,8 @@ impl App {
             self.horizontal = 0;
             self.detail.clear();
             self.detail_scroll = 0;
+            self.table_cursor = 0;
+            self.table_overlay = false;
             if matches!(
                 self.confirm.as_ref().map(|c| &c.action),
                 Some(Pending::Server(_))
@@ -278,13 +480,10 @@ impl App {
                 self.confirm = None;
             }
         }
-        let accounts = self.session.snapshot.as_ref().map(|s| &s.accounts);
-        let stale = |kind: &Kind| match kind {
-            Kind::Password(a) | Kind::Grant(a) => {
-                switched || accounts.is_some_and(|list| !list.contains(a))
-            }
-            _ => false,
-        };
+        let accounts = self.session.snapshot.as_ref().map(|s| s.accounts.clone());
+        let missing = |a: &Account| accounts.as_ref().is_some_and(|list| !list.contains(a));
+        let stale =
+            |kind: &Kind| (switched && kind.server_bound()) || kind.account().is_some_and(missing);
         let mut dropped = false;
         for slot in [&mut self.dialog, &mut self.suspended] {
             if slot.as_ref().is_some_and(|d| stale(&d.kind)) {
@@ -292,17 +491,33 @@ impl App {
                 dropped = true;
             }
         }
-        if let Some(Pending::Server(
-            Change::ChangePassword { account, .. } | Change::DatabaseGrant { account, .. },
-        )) = self.confirm.as_ref().map(|c| &c.action)
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|p| switched || missing(&p.account))
         {
-            if accounts.is_some_and(|list| !list.contains(account)) {
+            self.picker = None;
+            dropped = true;
+        }
+        if let Some(Pending::Server(change)) = self.confirm.as_ref().map(|c| &c.action) {
+            let account = match change {
+                Change::ChangePassword { account, .. }
+                | Change::Privileges { account, .. }
+                | Change::RoleMembership { account, .. }
+                | Change::DefaultRole { account, .. }
+                | Change::AlterAccount { account, .. }
+                | Change::DropAccount { account } => Some(account),
+                _ => None,
+            };
+            if account.is_some_and(missing) {
                 self.confirm = None;
                 dropped = true;
             }
         }
         if dropped {
-            self.say("Rozpracovaná změna účtu byla zahozena: účet patří jinému serveru nebo už neexistuje.");
+            self.say(
+                "Rozpracovaná změna byla zahozena: patří jinému serveru nebo cíl už neexistuje.",
+            );
         }
     }
     fn say(&mut self, message: impl Into<String>) {
@@ -353,7 +568,7 @@ impl App {
             .iter()
             .position(|t| *t == self.theme)
             .unwrap_or(0);
-        self.theme = ThemeId::TERMINAL[(i + 1) % 5];
+        self.theme = ThemeId::TERMINAL[(i + 1) % ThemeId::TERMINAL.len()];
         let key = self.theme.key();
         self.save(|s| s.tui_theme = key.into());
     }
@@ -466,7 +681,7 @@ impl App {
                         }
                     })
                     .collect::<Vec<_>>()
-                    .join(" "),
+                    .join(""),
             )
             .style(p.menu),
             rows[0],
@@ -503,8 +718,8 @@ impl App {
             rows[1],
         );
         match self.page {
-            0 => self.overview(frame, rows[2], p),
-            5 => self.draw_settings(frame, rows[2], p),
+            SERVER => self.overview(frame, rows[2], p),
+            SETTINGS => self.draw_settings(frame, rows[2], p),
             _ => self.draw_list(frame, rows[2], p),
         }
         let status = self.status_line();
@@ -516,23 +731,32 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(
-                " F1 Pomoc  F3 Profily  F5 Obnovit  F10/F9/Alt+M Menu  Esc Zpět  Ctrl+C Konec",
+                " F1 Pomoc  F3 Profily  F5 Obnovit  F10/F9/Alt+M Menu  1–8 Obrazovky  Esc Zpět",
             )
             .style(p.menu),
             rows[4],
         );
+        if self.table_overlay {
+            self.draw_table_overlay(frame, p);
+        }
         if let Some(dialog) = &self.dialog {
             self.draw_dialog(frame, dialog, p);
         }
+        if let Some(picker) = &self.picker {
+            self.draw_picker(frame, picker, p);
+        }
         if self.help {
-            let area = centered(area, 74, 19);
+            let area = centered(area, 76, 22);
             frame.render_widget(Clear, area);
-            frame.render_widget(Paragraph::new("F10, F9 nebo Alt+M: všechny akce v nabídce\nŠipky / PageUp / PageDown: výběr a posuv\nEnter: otevřít detail, upravit profil nebo nastavení\nTab / Shift+Tab: další/předchozí pole nebo obrazovka\nVlevo/vpravo: vodorovný posuv seznamu\nEsc: zavřít; formulář zůstane rozpracovaný\nF3: profily, Enter: upravit uložený profil\nF5: obnovit data; Ctrl+C: ukončit\n\nZápisy vyžadují potvrzení; výchozí je Zrušit.\nDEMO je simulace bez skutečného serveru.\nTCP standardně vyžaduje ověřenou identitu TLS.\nBarvy 16 / truecolor / mono a ASCII: Nastavení.\nPři chybě zůstávají data označena jako neaktuální.\n\nEsc zavře nápovědu.").block(self.block(" Nápověda ", p)).style(p.base).wrap(Wrap { trim: false }), area);
+            frame.render_widget(Paragraph::new("F10, F9 nebo Alt+M: všechny akce v nabídce\n1–8: přímo na obrazovku (Server … Nastavení)\nŠipky / PageUp / PageDown: výběr a posuv\nEnter: otevřít detail, upravit profil nebo nastavení\nTab: přepnout na detail (Databáze: výběr tabulky, Enter = struktura)\nVlevo/vpravo: vodorovný posuv seznamu\nEsc: zavřít; formulář zůstane rozpracovaný\nF3: profily; F5: obnovit (na Doktorovi znovu zkontrolovat)\n\nOprávnění: mezerník zaškrtne, Enter na Zkontrolovat ukáže SQL.\nZápisy vyžadují potvrzení s náhledem SQL; výchozí je Zrušit.\nMazání vyžaduje opsat název objektu.\nSET GLOBAL platí jen do restartu serveru.\nDEMO je simulace bez skutečného serveru.\nTCP standardně vyžaduje ověřenou identitu TLS.\n\nEsc zavře nápovědu.").block(self.block(" Nápověda ", p)).style(p.base).wrap(Wrap { trim: false }), area);
         }
         if let Some(index) = self.menu {
-            let area = centered(area, 64, 24);
+            let area = centered(area, 64, 26);
             frame.render_widget(Clear, area);
-            let items: Vec<_> = MENU.iter().map(|s| ListItem::new(*s)).collect();
+            let items: Vec<_> = MENU
+                .iter()
+                .map(|(label, _)| ListItem::new(*label))
+                .collect();
             let mut state = ListState::default().with_selected(Some(index));
             frame.render_stateful_widget(
                 List::new(items)
@@ -544,52 +768,72 @@ impl App {
             );
         }
         if let Some(confirm) = &self.confirm {
-            let area = centered(area, 74, 12);
-            frame.render_widget(Clear, area);
-            let body = match &confirm.action {
-                Pending::Server(change) => {
-                    let query = match change {
-                        Change::KillQuery { target } => {
-                            format!("\n#{} {}", target.id, safe_text(&target.query))
-                        }
-                        _ => String::new(),
-                    };
-                    format!(
-                        "Server: {}\n{}{}\n\n{}",
-                        safe_text(profile),
-                        safe_text(&change.summary()),
-                        query,
-                        if self.session.snapshot.as_ref().is_some_and(|s| s.demo) {
-                            "DEMO • pouze paměť"
-                        } else {
-                            "Změna na připojeném serveru"
-                        }
-                    )
+            self.draw_confirm(frame, confirm, profile, p);
+        }
+    }
+    fn draw_confirm(&self, frame: &mut Frame, confirm: &Confirmation, profile: &str, p: Palette) {
+        let mut lines: Vec<String> = Vec::new();
+        match &confirm.action {
+            Pending::Server(change) => {
+                lines.push(format!("Server: {}", safe_text(profile)));
+                lines.push(safe_text(&change.summary()));
+                if let Change::KillQuery { target } = change {
+                    lines.push(format!("#{} {}", target.id, safe_text(&target.query)));
                 }
-                Pending::DeleteProfile { id } => format!(
-                    "Odstranit uložený profil „{}“?\n\nZmění se jen konfigurace Harboru, server ne.",
+                match preview(change) {
+                    Ok(sql) => {
+                        lines.push("Provede se:".into());
+                        lines.extend(sql.lines().map(|l| format!("  {}", safe_text(l))));
+                    }
+                    Err(error) => lines.push(format!("NELZE PROVÉST: {error}")),
+                }
+                lines.push(
+                    if self.session.snapshot.as_ref().is_some_and(|s| s.demo) {
+                        "DEMO • pouze paměť"
+                    } else {
+                        "Změna na připojeném serveru"
+                    }
+                    .into(),
+                );
+            }
+            Pending::DeleteProfile { id } => {
+                lines.push(format!(
+                    "Odstranit uložený profil „{}“?",
                     self.settings
                         .profile(id)
                         .map(|p| safe_text(&p.name))
                         .unwrap_or_else(|| "(už neexistuje)".into())
-                ),
-            };
-            let text = format!(
-                "{body}\n\n{}\nTab / šipky změní volbu, Enter potvrdí, Esc zruší",
-                if confirm.yes {
-                    "  Zrušit       [ PROVÉST ZMĚNU ]"
-                } else {
-                    "[ ZRUŠIT ]      Provést změnu"
-                }
-            );
-            frame.render_widget(
-                Paragraph::new(text)
-                    .wrap(Wrap { trim: false })
-                    .block(self.block(" Potvrzení změny ", p))
-                    .style(p.base),
-                area,
-            );
+                ));
+                lines.push("Změní se jen konfigurace Harboru, server ne.".into());
+            }
         }
+        if let Some(name) = confirm.required_name() {
+            lines.push(String::new());
+            lines.push(format!(
+                "NEVRATNÉ. Pro potvrzení napište název: {}",
+                safe_text(name)
+            ));
+            lines.push(format!("> {}_", safe_text(&confirm.typed)));
+        }
+        lines.push(String::new());
+        lines.push(
+            if confirm.yes {
+                "  Zrušit       [ PROVÉST ZMĚNU ]"
+            } else {
+                "[ ZRUŠIT ]      Provést změnu"
+            }
+            .into(),
+        );
+        lines.push("Tab / šipky změní volbu, Enter potvrdí, Esc zruší".into());
+        let area = centered(frame.area(), 78, (lines.len() + 4) as u16);
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines.join("\n"))
+                .wrap(Wrap { trim: false })
+                .block(self.block(" Potvrzení změny ", p))
+                .style(p.base),
+            area,
+        );
     }
     fn overview(&self, frame: &mut Frame, area: Rect, p: Palette) {
         let Some(s) = &self.session.snapshot else {
@@ -686,9 +930,38 @@ impl App {
             })
             .unwrap_or_default()
     }
+    fn variables(&self) -> Vec<&Variable> {
+        self.session
+            .variables
+            .as_ref()
+            .map(|list| {
+                list.iter()
+                    .filter(|v| {
+                        (!self.key_only || v.key_description().is_some())
+                            && (!self.changed_only || v.changed())
+                            && matches_filter(
+                                &self.filters[VARIABLES],
+                                &[&v.name, &v.value, &v.comment],
+                            )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn findings(&self) -> Vec<&Finding> {
+        self.session
+            .health
+            .as_ref()
+            .map(|(_, list)| {
+                list.iter()
+                    .filter(|f| matches_filter(&self.filters[HEALTH], &[&f.title, &f.detail]))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     fn list_rows(&self) -> Vec<String> {
         match self.page {
-            1 => self
+            DATABASES => self
                 .databases()
                 .iter()
                 .map(|d| {
@@ -702,19 +975,23 @@ impl App {
                     )
                 })
                 .collect(),
-            2 => self
+            ACCOUNTS => self
                 .accounts()
                 .iter()
                 .map(|a| {
                     format!(
                         "{:<24} {:<24} {}",
                         safe_text(&a.user),
-                        safe_text(&a.host),
+                        if a.is_role() {
+                            "(role)".into()
+                        } else {
+                            safe_text(&a.host)
+                        },
                         safe_text(&a.plugin)
                     )
                 })
                 .collect(),
-            3 => self
+            PROCESSES => self
                 .processes()
                 .iter()
                 .map(|p| {
@@ -729,7 +1006,30 @@ impl App {
                     )
                 })
                 .collect(),
-            4 => self
+            VARIABLES => self
+                .variables()
+                .iter()
+                .map(|v| {
+                    format!(
+                        "{:<34} {:<26} {}",
+                        safe_text(&v.name),
+                        safe_text(&v.value),
+                        if v.runtime_only() {
+                            "ZMĚNĚNO ZA BĚHU"
+                        } else if v.changed() {
+                            "nastaveno"
+                        } else {
+                            ""
+                        }
+                    )
+                })
+                .collect(),
+            HEALTH => self
+                .findings()
+                .iter()
+                .map(|f| format!("[{:<8}] {}", f.severity.label(), safe_text(&f.title)))
+                .collect(),
+            PROFILES => self
                 .settings
                 .profiles
                 .iter()
@@ -746,23 +1046,69 @@ impl App {
             _ => Vec::new(),
         }
     }
+    fn empty_hint(&self) -> Option<&'static str> {
+        match self.page {
+            VARIABLES if self.session.variables.is_none() => Some("Načítám proměnné…"),
+            HEALTH if self.session.health.is_none() => Some("Probíhá kontrola…"),
+            HEALTH if self.findings().is_empty() => Some("Bez nálezů."),
+            _ => None,
+        }
+    }
+    /// Text of the detail pane for the current page.
+    fn detail_text(&self) -> String {
+        match self.page {
+            ACCOUNTS => match &self.session.account {
+                Some(detail) => account_text(detail),
+                None if self.session.grants_for.is_some() => "Načítám…".into(),
+                None => "Enter: načíst oprávnění vybraného účtu.".into(),
+            },
+            VARIABLES => match self.variables().get(self.selected).copied() {
+                Some(v) => variable_text(v),
+                None => String::new(),
+            },
+            HEALTH => match self.findings().get(self.selected) {
+                Some(f) => format!(
+                    "{} • {}\n{}\nDoporučení: {}",
+                    f.severity.label(),
+                    safe_text(&f.title),
+                    safe_text(&f.detail),
+                    safe_text(&f.recommendation)
+                ),
+                None => String::new(),
+            },
+            _ => self.detail.clone(),
+        }
+    }
     fn draw_list(&self, frame: &mut Frame, area: Rect, p: Palette) {
         let rows = Layout::vertical([
             Constraint::Min(5),
-            Constraint::Length(if area.height > 23 { 9 } else { 6 }),
+            Constraint::Length(if area.height > 23 { 11 } else { 7 }),
         ])
         .split(area);
-        let list: Vec<_> = self
-            .list_rows()
+        let mut rows_text = self.list_rows();
+        if rows_text.is_empty() {
+            if let Some(hint) = self.empty_hint() {
+                rows_text.push(hint.into());
+            }
+        }
+        let list: Vec<_> = rows_text
             .iter()
             .map(|r| ListItem::new(r.chars().skip(self.horizontal).collect::<String>()))
             .collect();
         let mut state = ListState::default().with_selected(Some(self.selected));
+        let extra = match self.page {
+            VARIABLES => format!(
+                " • klíčové: {} • změněné: {}",
+                if self.key_only { "ano" } else { "ne" },
+                if self.changed_only { "ano" } else { "ne" }
+            ),
+            _ => String::new(),
+        };
         frame.render_stateful_widget(
             List::new(list)
                 .block(self.block(
                     format!(
-                        " {} • filtr: {} • Enter detail ",
+                        " {} • filtr: {}{extra} • Enter detail ",
                         PAGES[self.page],
                         safe_text(self.filter())
                     ),
@@ -773,46 +1119,24 @@ impl App {
             rows[0],
             &mut state,
         );
-        let details = if self.page == 1 {
-            self.session
-                .tables
-                .iter()
-                .map(|t| {
-                    format!(
-                        "{} • {} • ≈ {} řádků • {}",
-                        safe_text(&t.name),
-                        safe_text(&t.engine),
-                        t.rows,
-                        bytes_label(t.bytes)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else if self.page == 2 {
-            self.session
-                .grants
-                .iter()
-                .map(|g| safe_text(g))
-                .collect::<Vec<_>>()
-                .join("\n")
+        let focus = if self.detail_focus {
+            "> Detail • šipky • Tab zpět"
         } else {
-            self.detail.clone()
+            "Detail • Tab aktivuje • F10 akce"
         };
+        if self.page == DATABASES {
+            self.draw_database_detail(frame, rows[1], p, focus);
+            return;
+        }
         frame.render_widget(
-            Paragraph::new(details)
+            Paragraph::new(self.detail_text())
                 .wrap(Wrap { trim: false })
                 .scroll((self.detail_scroll, 0))
                 .block(self.block(
                     format!(
                         " {}{} ",
                         match self.page {
-                            1 => self
-                                .session
-                                .tables_for
-                                .as_deref()
-                                .map(|db| format!("Tabulky {} • ", safe_text(db)))
-                                .unwrap_or_default(),
-                            2 => self
+                            ACCOUNTS => self
                                 .session
                                 .grants_for
                                 .as_ref()
@@ -820,16 +1144,127 @@ impl App {
                                 .unwrap_or_default(),
                             _ => String::new(),
                         },
-                        if self.detail_focus {
-                            "> Detail • šipky posouvají • Tab zpět"
-                        } else {
-                            "Detail • Tab aktivuje posuv • F10 akce"
-                        }
+                        focus
                     ),
                     p,
                 ))
                 .style(p.base),
             rows[1],
+        );
+    }
+    fn draw_database_detail(&self, frame: &mut Frame, area: Rect, p: Palette, focus: &str) {
+        let title = format!(
+            " {}{} ",
+            self.session
+                .tables_for
+                .as_deref()
+                .map(|db| format!("Databáze {} • ", safe_text(db)))
+                .unwrap_or_default(),
+            if self.detail_focus {
+                "> Tabulky • šipky • Enter struktura • Tab zpět"
+            } else {
+                focus
+            }
+        );
+        let block = self.block(title, p);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let Some(detail) = &self.session.database else {
+            frame.render_widget(
+                Paragraph::new(if self.session.tables_for.is_some() {
+                    "Načítám…"
+                } else {
+                    "Enter: načíst tabulky a velikosti vybrané databáze."
+                })
+                .style(p.base),
+                inner,
+            );
+            return;
+        };
+        let mut summary = vec![format!(
+            "{} tab. • {} pohl. • {} proc. • {} trig. • data {} • indexy {} • nevyužito {}",
+            detail.base_tables().count(),
+            detail.views,
+            detail.routines,
+            detail.triggers,
+            human_bytes(detail.data_bytes()),
+            human_bytes(detail.index_bytes()),
+            human_bytes(detail.free_bytes())
+        )];
+        summary.extend(
+            detail
+                .warnings()
+                .iter()
+                .map(|w| format!("! {}", safe_text(w))),
+        );
+        let parts = Layout::vertical([
+            Constraint::Length(summary.len().min(3) as u16),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+        frame.render_widget(Paragraph::new(summary.join("\n")).style(p.base), parts[0]);
+        let items: Vec<_> = detail
+            .tables
+            .iter()
+            .map(|t| {
+                ListItem::new(if t.view() {
+                    format!("{:<28} pohled", safe_text(&t.name))
+                } else {
+                    format!(
+                        "{:<28} {:<7} ≈{:>10} ř. {:>10} {}",
+                        safe_text(&t.name),
+                        safe_text(&t.engine),
+                        t.rows,
+                        human_bytes(t.bytes()),
+                        t.warnings().join(", ")
+                    )
+                })
+            })
+            .collect();
+        let mut state = ListState::default().with_selected(
+            self.detail_focus
+                .then_some(self.table_cursor.min(detail.tables.len().saturating_sub(1))),
+        );
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_style(p.selected)
+                .highlight_symbol("> ")
+                .style(p.base),
+            parts[1],
+            &mut state,
+        );
+    }
+    fn draw_table_overlay(&self, frame: &mut Frame, p: Palette) {
+        let area = centered(
+            frame.area(),
+            frame.area().width.saturating_sub(4),
+            frame.area().height.saturating_sub(4),
+        );
+        frame.render_widget(Clear, area);
+        let (title, text) = match (&self.session.table, &self.session.table_for) {
+            (Some(detail), _) => (
+                format!(
+                    " {}.{} ",
+                    safe_text(&detail.database),
+                    safe_text(&detail.table)
+                ),
+                table_text(detail),
+            ),
+            (None, Some((db, t))) => (
+                format!(" {}.{} ", safe_text(db), safe_text(t)),
+                "Načítám…".into(),
+            ),
+            _ => (" Tabulka ".into(), "Vyberte tabulku.".into()),
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .scroll((self.overlay_scroll, 0))
+                .block(self.block(
+                    format!("{title}• šipky posouvají • F10 údržba • Esc zavře "),
+                    p,
+                ))
+                .style(p.base),
+            area,
         );
     }
     fn draw_settings(&self, frame: &mut Frame, area: Rect, p: Palette) {
@@ -894,6 +1329,51 @@ impl App {
         ));
         frame.render_widget(Paragraph::new(lines).style(p.base), inner);
     }
+    fn draw_picker(&self, frame: &mut Frame, picker: &PrivilegePicker, p: Palette) {
+        let area = centered(frame.area(), 76, frame.area().height.saturating_sub(2));
+        frame.render_widget(Clear, area);
+        let block = self.block(
+            format!(
+                " Oprávnění {} • mezerník přepíná • Esc zavře ",
+                safe_text(&picker.account.label())
+            ),
+            p,
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let mut items = vec![ListItem::new(match (&picker.fixed, picker.scope()) {
+            (Some(scope), _) => format!(
+                "Rozsah: {}  (←/→ jiný existující, psaním nový)",
+                safe_text(&scope.label())
+            ),
+            (None, Ok(_)) => format!(
+                "Rozsah: {}_  (*.*, db.*, db.tabulka)",
+                safe_text(&picker.scope_text)
+            ),
+            (None, Err(error)) => format!("Rozsah: {}_  ! {error}", safe_text(&picker.scope_text)),
+        })];
+        for privilege in picker.options() {
+            items.push(ListItem::new(format!(
+                "[{}] {privilege}",
+                if picker.wanted.contains(privilege) {
+                    "x"
+                } else {
+                    " "
+                }
+            )));
+        }
+        items.push(ListItem::new("  Zrušit"));
+        items.push(ListItem::new("  Zkontrolovat změnu…"));
+        let mut state = ListState::default().with_selected(Some(picker.cursor));
+        frame.render_stateful_widget(
+            List::new(items)
+                .highlight_style(p.selected)
+                .highlight_symbol("> ")
+                .style(p.base),
+            inner,
+            &mut state,
+        );
+    }
     pub fn key(&mut self, key: KeyEvent) {
         if key.kind == KeyEventKind::Release {
             return;
@@ -914,7 +1394,11 @@ impl App {
             self.menu = if self.menu.is_some() {
                 None
             } else {
-                Some(self.page)
+                Some(
+                    MENU.iter()
+                        .position(|(_, a)| *a == Action::Page(self.page))
+                        .unwrap_or(0),
+                )
             };
             return;
         }
@@ -927,7 +1411,7 @@ impl App {
                 K::PageDown => self.menu = Some((index + 8).min(MENU.len() - 1)),
                 K::Enter => {
                     self.menu = None;
-                    self.action(index);
+                    self.run(MENU[index].1);
                 }
                 _ => (),
             }
@@ -947,19 +1431,51 @@ impl App {
             self.dialog_key(key);
             return;
         }
-        match key.code {
-            K::F(3) => {
-                self.page = 4;
-                self.selected = 0;
+        if self.picker.is_some() {
+            self.picker_key(key);
+            return;
+        }
+        if self.table_overlay {
+            match key.code {
+                K::Esc | K::Enter => self.table_overlay = false,
+                K::Down => self.overlay_scroll = self.overlay_scroll.saturating_add(1),
+                K::Up => self.overlay_scroll = self.overlay_scroll.saturating_sub(1),
+                K::PageDown => self.overlay_scroll = self.overlay_scroll.saturating_add(10),
+                K::PageUp => self.overlay_scroll = self.overlay_scroll.saturating_sub(10),
+                _ => (),
             }
+            return;
+        }
+        match key.code {
+            K::Char(c @ '1'..='8') if key.modifiers.is_empty() => {
+                self.run(Action::Page(c as usize - '1' as usize));
+            }
+            K::F(3) => self.run(Action::Page(PROFILES)),
             K::F(5) => {
                 self.session.request(Operation::Refresh);
+                if self.page == HEALTH {
+                    self.session.request(Operation::Health);
+                }
             }
-            K::Tab => {
+            K::Tab | K::BackTab => {
                 self.detail_focus = !self.detail_focus;
             }
-            K::BackTab => {
-                self.detail_focus = !self.detail_focus;
+            K::Down if self.detail_focus && self.page == DATABASES => {
+                let count = self.session.tables().len();
+                self.table_cursor = (self.table_cursor + 1).min(count.saturating_sub(1));
+            }
+            K::Up if self.detail_focus && self.page == DATABASES => {
+                self.table_cursor = self.table_cursor.saturating_sub(1)
+            }
+            K::PageDown if self.detail_focus && self.page == DATABASES => {
+                let count = self.session.tables().len();
+                self.table_cursor = (self.table_cursor + 8).min(count.saturating_sub(1));
+            }
+            K::PageUp if self.detail_focus && self.page == DATABASES => {
+                self.table_cursor = self.table_cursor.saturating_sub(8)
+            }
+            K::Enter if self.detail_focus && self.page == DATABASES => {
+                self.run(Action::TableDetail)
             }
             K::Down if self.detail_focus => {
                 self.detail_scroll = self.detail_scroll.saturating_add(1)
@@ -981,38 +1497,38 @@ impl App {
             K::Left => self.horizontal = self.horizontal.saturating_sub(8),
             K::Enter => self.enter(),
             K::Esc => {
-                self.page = 0;
+                self.page = SERVER;
                 self.detail.clear();
             }
             _ => (),
         }
     }
     fn row_count(&self) -> usize {
-        if self.page == 5 {
+        if self.page == SETTINGS {
             4
         } else {
             self.list_rows().len()
         }
     }
     fn enter(&mut self) {
+        self.detail_scroll = 0;
         match self.page {
-            1 => {
+            DATABASES => {
                 if let Some(db) = self.databases().get(self.selected) {
                     let name = db.name.clone();
-                    if self.session.request(Operation::Tables(name)) {
-                        self.session.tables.clear();
+                    if self.session.tables_for.as_ref() != Some(&name) {
+                        self.table_cursor = 0;
                     }
+                    self.session.request(Operation::Tables(name));
                 }
             }
-            2 => {
+            ACCOUNTS => {
                 if let Some(account) = self.accounts().get(self.selected) {
                     let account = (*account).clone();
-                    if self.session.request(Operation::Grants(account)) {
-                        self.session.grants.clear();
-                    }
+                    self.session.request(Operation::Grants(account));
                 }
             }
-            3 => {
+            PROCESSES => {
                 if let Some(process) = self.processes().get(self.selected) {
                     self.detail = format!(
                         "#{} {}@{}\n{}",
@@ -1023,8 +1539,9 @@ impl App {
                     );
                 }
             }
-            4 => self.profile_dialog(self.settings.profiles.get(self.selected).cloned()),
-            5 => match self.selected.min(3) {
+            VARIABLES | HEALTH => self.detail_focus = true,
+            PROFILES => self.profile_dialog(self.settings.profiles.get(self.selected).cloned()),
+            SETTINGS => match self.selected.min(3) {
                 0 => self.next_theme(),
                 1 => {
                     let choices = ["auto", "truecolor", "16", "mono"];
@@ -1051,26 +1568,78 @@ impl App {
             _ => (),
         }
     }
-    fn action(&mut self, index: usize) {
-        if index == 19 {
-            self.next_theme();
+    /// Account loaded in the detail pane, if it is the selected one on Uživatelé.
+    fn selected_account(&mut self) -> Option<Account> {
+        if self.page != ACCOUNTS {
+            self.say("Nejprve vyberte účet na obrazovce Uživatelé (3).");
+            return None;
+        }
+        let account = self.accounts().get(self.selected).map(|a| (*a).clone());
+        if account.is_none() {
+            self.say("Nejprve vyberte účet na obrazovce Uživatelé (3).");
+        }
+        account
+    }
+    /// Detail of `account` if it is loaded (Enter on the account).
+    fn loaded_detail(&mut self, account: &Account) -> Option<AccountDetail> {
+        let detail = self
+            .session
+            .account
+            .clone()
+            .filter(|d| d.account.as_ref() == Some(account));
+        if detail.is_none() {
+            self.session.request(Operation::Grants(account.clone()));
+            self.say("Načítám detail účtu; akci zopakujte, až se zobrazí.");
+        }
+        detail
+    }
+    fn selected_table(&mut self) -> Option<(String, TableInfo)> {
+        let found = self
+            .session
+            .database
+            .as_ref()
+            .filter(|_| self.page == DATABASES)
+            .and_then(|d| {
+                d.tables
+                    .get(self.table_cursor)
+                    .map(|t| (d.name.clone(), t.clone()))
+            });
+        if found.is_none() {
+            self.say("Vyberte databázi (Enter), pak Tab a tabulku šipkami.");
+        }
+        found
+    }
+    fn run(&mut self, action: Action) {
+        if let Action::Page(page) = action {
+            self.page = page;
+            self.selected = 0;
+            self.detail_focus = false;
+            self.detail_scroll = 0;
+            self.table_overlay = false;
+            self.autoload();
             return;
         }
-        if index < 6 {
-            self.page = index;
-            self.selected = 0;
+        if action == Action::NextTheme {
+            self.next_theme();
             return;
         }
         if let Some(d) = self.dialog.take() {
             self.suspended = Some(d);
         }
-        match index {
-            6 => self.help = true,
-            7 => {
+        let dialog = |kind: Kind, fields: Vec<Field>| {
+            Some(Dialog {
+                kind,
+                fields,
+                focus: 0,
+            })
+        };
+        match action {
+            Action::Help => self.help = true,
+            Action::Refresh => {
                 self.session.request(Operation::Refresh);
             }
-            8 => self.profile_dialog(None),
-            9 => {
+            Action::NewProfile => self.profile_dialog(None),
+            Action::Demo => {
                 self.session.connect(
                     Profile {
                         name: "Ukázkový server".into(),
@@ -1079,103 +1648,271 @@ impl App {
                     Secret::default(),
                     true,
                 );
-                self.page = 0;
+                self.page = SERVER;
             }
-            10 => self.session.disconnect(),
-            11 => {
-                self.dialog = Some(Dialog {
-                    kind: Kind::Database,
-                    fields: vec![
+            Action::Disconnect => self.session.disconnect(),
+            Action::CreateDatabase => {
+                self.dialog = dialog(
+                    Kind::Database,
+                    vec![
                         Field::new("Název databáze", ""),
                         Field::new("Kolace (ověří server)", "utf8mb4_unicode_ci"),
                     ],
-                    focus: 0,
-                })
+                )
             }
-            12 => {
-                self.dialog = Some(Dialog {
-                    kind: Kind::Account,
-                    fields: vec![
+            Action::DropDatabase => {
+                let name = (self.page == DATABASES)
+                    .then(|| self.databases().get(self.selected).map(|d| d.name.clone()))
+                    .flatten();
+                match name {
+                    Some(name) if !Database::system_name(&name) => {
+                        self.confirm =
+                            Some(Confirmation::new(Pending::Server(Change::DropDatabase {
+                                name,
+                            })))
+                    }
+                    Some(_) => self.say("Systémovou databázi Harbor nesmaže."),
+                    None => self.say("Databázi ke smazání vyberte na obrazovce Databáze (2)."),
+                }
+            }
+            Action::TableDetail => {
+                if let Some((database, table)) = self.selected_table() {
+                    self.session.request(Operation::Table {
+                        database,
+                        table: table.name,
+                    });
+                    self.overlay_scroll = 0;
+                    self.table_overlay = true;
+                }
+            }
+            Action::Maintenance => {
+                let target = if self.table_overlay {
+                    self.session.table_for.clone()
+                } else {
+                    self.selected_table().map(|(db, t)| (db, t.name))
+                };
+                if let Some((database, table)) = target {
+                    self.table_overlay = false;
+                    self.dialog = dialog(
+                        Kind::Maintenance(database),
+                        vec![
+                            Field::new("Tabulka", &table),
+                            Field::new("Akce: ANALYZE / CHECK / OPTIMIZE / REPAIR", "ANALYZE"),
+                        ],
+                    );
+                }
+            }
+            Action::CreateAccount => {
+                self.dialog = dialog(
+                    Kind::Account,
+                    vec![
                         Field::new("Uživatel", ""),
-                        Field::new("Hostitel účtu", "localhost"),
+                        Field::new("Hostitel účtu (% = odkudkoli)", "localhost"),
                         Field::password(),
                     ],
-                    focus: 0,
-                })
+                )
             }
-            13 | 14 => {
-                if self.page != 2 {
-                    self.say("Nejprve vyberte účet na obrazovce Uživatelé.");
-                    return;
-                }
-                let account = self.accounts().get(self.selected).map(|a| (*a).clone());
-                if let Some(account) = account {
-                    self.dialog = Some(if index == 13 {
-                        Dialog {
-                            kind: Kind::Password(account),
-                            fields: vec![Field::password()],
-                            focus: 0,
-                        }
+            Action::CreateRole => {
+                self.dialog = dialog(Kind::Role, vec![Field::new("Název role", "")])
+            }
+            Action::ChangePassword => {
+                if let Some(account) = self.selected_account() {
+                    if account.is_role() {
+                        self.say("Role nemá heslo.");
                     } else {
-                        Dialog {
-                            kind: Kind::Grant(account),
-                            fields: vec![
-                                Field::new("Databáze", ""),
-                                Field::new(
-                                    "Oprávnění: SELECT / INSERT / UPDATE / DELETE",
-                                    "SELECT",
-                                ),
-                                Field::new("Akce: GRANT / REVOKE", "GRANT"),
-                            ],
-                            focus: 0,
-                        }
-                    });
-                } else {
-                    self.say("Nejprve vyberte účet na obrazovce Uživatelé.");
+                        self.dialog = dialog(Kind::Password(account), vec![Field::password()]);
+                    }
                 }
             }
-            15 => {
-                if self.page != 3 {
-                    self.say("Nejprve vyberte běžící dotaz na obrazovce Spojení.");
+            Action::EditPrivileges => {
+                if let Some(account) = self.selected_account() {
+                    if let Some(detail) = self.loaded_detail(&account) {
+                        let fixed = detail.privileges.first().map(|s| s.scope.clone());
+                        self.picker = Some(PrivilegePicker {
+                            account,
+                            scope_text: if fixed.is_none() {
+                                "*.*".into()
+                            } else {
+                                String::new()
+                            },
+                            fixed,
+                            loaded_for: None,
+                            wanted: BTreeSet::new(),
+                            cursor: 0,
+                        });
+                        self.load_picker();
+                    }
+                }
+            }
+            Action::Template => {
+                if let Some(account) = self.selected_account() {
+                    self.dialog = dialog(
+                        Kind::Template(account),
+                        vec![
+                            Field::new("Šablona: READONLY / APP / BACKUP / MONITOR", "READONLY"),
+                            Field::new(
+                                "Databáze (pro READONLY a APP)",
+                                self.session.tables_for.as_deref().unwrap_or(""),
+                            ),
+                        ],
+                    );
+                }
+            }
+            Action::AccountProperties => {
+                if let Some(account) = self.selected_account() {
+                    if account.is_role() {
+                        self.say("Role nemá vlastnosti přihlášení.");
+                    } else if let Some(detail) = self.loaded_detail(&account) {
+                        match detail.properties {
+                            Some(props) => {
+                                let yes = |b: bool| if b { "ANO" } else { "NE" };
+                                self.dialog = dialog(
+                                    Kind::Properties(account),
+                                    vec![
+                                        Field::new("Zamčen: ANO / NE", yes(props.locked)),
+                                        Field::new("Nechat heslo vypršet: ANO / NE", "NE"),
+                                        Field::new(
+                                            "TLS: NONE / SSL / X509 (KEEP = neměnit)",
+                                            match props.tls {
+                                                TlsRequirement::None => "NONE",
+                                                TlsRequirement::Ssl => "SSL",
+                                                TlsRequirement::X509 => "X509",
+                                                TlsRequirement::Specified => "KEEP",
+                                            },
+                                        ),
+                                        Field::new(
+                                            "Dotazy za hodinu (0 = bez limitu)",
+                                            &props.limits.queries_per_hour.to_string(),
+                                        ),
+                                        Field::new(
+                                            "Změny za hodinu",
+                                            &props.limits.updates_per_hour.to_string(),
+                                        ),
+                                        Field::new(
+                                            "Připojení za hodinu",
+                                            &props.limits.connections_per_hour.to_string(),
+                                        ),
+                                        Field::new(
+                                            "Souběžná spojení",
+                                            &props.limits.user_connections.to_string(),
+                                        ),
+                                    ],
+                                );
+                            }
+                            None => self.say(
+                                "Vlastnosti účtu nejsou dostupné (chybí právo čtení mysql.*).",
+                            ),
+                        }
+                    }
+                }
+            }
+            Action::RoleMembership => {
+                if let Some(account) = self.selected_account() {
+                    self.dialog = dialog(
+                        Kind::RoleMembership(account),
+                        vec![
+                            Field::new("Role", ""),
+                            Field::new("Akce: GRANT / REVOKE", "GRANT"),
+                        ],
+                    );
+                }
+            }
+            Action::DefaultRole => {
+                if let Some(account) = self.selected_account() {
+                    if account.is_role() {
+                        self.say("Výchozí roli lze nastavit jen účtu.");
+                    } else {
+                        let current = self
+                            .session
+                            .account
+                            .as_ref()
+                            .filter(|d| d.account.as_ref() == Some(&account))
+                            .and_then(|d| d.default_role.clone())
+                            .unwrap_or_default();
+                        self.dialog = dialog(
+                            Kind::DefaultRole(account),
+                            vec![Field::new("Výchozí role (prázdné = žádná)", &current)],
+                        );
+                    }
+                }
+            }
+            Action::DropAccount => {
+                if let Some(account) = self.selected_account() {
+                    self.confirm = Some(Confirmation::new(Pending::Server(Change::DropAccount {
+                        account,
+                    })));
+                }
+            }
+            Action::KillQuery => {
+                if self.page != PROCESSES {
+                    self.say("Nejprve vyberte běžící dotaz na obrazovce Spojení (4).");
                     return;
                 }
                 let target = self.processes().get(self.selected).map(|p| (*p).clone());
                 if let Some(target) = target.filter(|p| p.running_query()) {
-                    self.confirm = Some(Confirmation {
-                        action: Pending::Server(Change::KillQuery { target }),
-                        yes: false,
-                    });
+                    self.confirm = Some(Confirmation::new(Pending::Server(Change::KillQuery {
+                        target,
+                    })));
                 } else {
-                    self.say("Vyberte běžící dotaz na obrazovce Spojení.");
+                    self.say("Vyberte běžící dotaz na obrazovce Spojení (4).");
                 }
             }
-            16 => {
-                self.dialog = Some(Dialog {
-                    kind: Kind::Search(self.page),
-                    fields: vec![Field::new("Hledat", self.filter())],
-                    focus: 0,
-                })
+            Action::SetVariable => {
+                let variable = (self.page == VARIABLES)
+                    .then(|| self.variables().get(self.selected).map(|v| (*v).clone()))
+                    .flatten();
+                match variable {
+                    Some(v) if v.settable() => {
+                        let value = v.value.clone();
+                        self.dialog = dialog(
+                            Kind::Variable(v),
+                            vec![Field::new(
+                                "Nová hodnota (velikosti lze s příponou K/M/G)",
+                                &value,
+                            )],
+                        );
+                    }
+                    Some(v) => self.say(format!(
+                        "{} nelze měnit za běhu; patří do konfiguračního souboru.",
+                        v.name
+                    )),
+                    None => self.say("Proměnnou vyberte na obrazovce Proměnné (5)."),
+                }
             }
-            17 => self.system = !self.system,
-            18 => self.long = !self.long,
-            19 => self.next_theme(),
-            20 => self.dialog = self.suspended.take(),
-            21 => {
-                if self.page != 4 {
+            Action::RunHealth => {
+                self.session.request(Operation::Health);
+                self.page = HEALTH;
+            }
+            Action::Search => {
+                self.dialog = dialog(
+                    Kind::Search(self.page),
+                    vec![Field::new("Hledat", self.filter())],
+                )
+            }
+            Action::ToggleSystem => self.system = !self.system,
+            Action::ToggleLong => self.long = !self.long,
+            Action::ToggleKeyVariables => {
+                self.key_only = !self.key_only;
+                self.selected = 0;
+            }
+            Action::ToggleChangedVariables => {
+                self.changed_only = !self.changed_only;
+                self.selected = 0;
+            }
+            Action::ResumeDraft => self.dialog = self.suspended.take(),
+            Action::DeleteProfile => {
+                if self.page != PROFILES {
                     self.say("Profil k odstranění vyberte na obrazovce Profily.");
                     return;
                 }
                 if let Some(profile) = self.settings.profiles.get(self.selected) {
-                    self.confirm = Some(Confirmation {
-                        action: Pending::DeleteProfile {
-                            id: profile.id.clone(),
-                        },
-                        yes: false,
-                    });
+                    self.confirm = Some(Confirmation::new(Pending::DeleteProfile {
+                        id: profile.id.clone(),
+                    }));
                 }
             }
-            22 => self.quit = true,
-            _ => (),
+            Action::Quit => self.quit = true,
+            Action::Page(_) | Action::NextTheme => unreachable!(),
         }
     }
     fn profile_dialog(&mut self, profile: Option<Profile>) {
@@ -1206,6 +1943,119 @@ impl App {
             ],
             focus: 0,
         });
+    }
+    /// Current privileges of the picker's account at `scope` (GRANT OPTION included).
+    fn current_privileges(&self, account: &Account, scope: &GrantScope) -> BTreeSet<String> {
+        self.session
+            .account
+            .as_ref()
+            .filter(|d| d.account.as_ref() == Some(account))
+            .and_then(|d| d.privileges_at(scope))
+            .map(|set| {
+                let mut all = set.privileges.clone();
+                if set.grantable {
+                    all.insert(GRANT_OPTION.into());
+                }
+                all
+            })
+            .unwrap_or_default()
+    }
+    /// Initialise the checkboxes whenever the picker's scope changes.
+    fn load_picker(&mut self) {
+        let Some(picker) = &self.picker else {
+            return;
+        };
+        let Ok(scope) = picker.scope() else {
+            return;
+        };
+        if picker.loaded_for.as_ref() == Some(&scope) {
+            return;
+        }
+        let wanted = self.current_privileges(&picker.account, &scope);
+        let picker = self.picker.as_mut().expect("checked above");
+        picker.wanted = wanted;
+        picker.loaded_for = Some(scope);
+    }
+    fn picker_key(&mut self, key: KeyEvent) {
+        let Some(mut picker) = self.picker.take() else {
+            return;
+        };
+        let options = picker.options();
+        let total = options.len() + 3;
+        match key.code {
+            K::Esc => return,
+            K::Down | K::Tab => picker.cursor = (picker.cursor + 1) % total,
+            K::Up | K::BackTab => picker.cursor = (picker.cursor + total - 1) % total,
+            K::PageDown => picker.cursor = (picker.cursor + 8).min(total - 1),
+            K::PageUp => picker.cursor = picker.cursor.saturating_sub(8),
+            K::Left | K::Right if picker.cursor == 0 => {
+                let scopes: Vec<GrantScope> = self
+                    .session
+                    .account
+                    .as_ref()
+                    .filter(|d| d.account.as_ref() == Some(&picker.account))
+                    .map(|d| d.privileges.iter().map(|s| s.scope.clone()).collect())
+                    .unwrap_or_default();
+                if !scopes.is_empty() {
+                    let at = picker
+                        .fixed
+                        .as_ref()
+                        .and_then(|f| scopes.iter().position(|s| s == f));
+                    let next = match (at, key.code) {
+                        (Some(i), K::Right) => (i + 1) % scopes.len(),
+                        (Some(i), _) => (i + scopes.len() - 1) % scopes.len(),
+                        (None, _) => 0,
+                    };
+                    picker.fixed = Some(scopes[next].clone());
+                }
+            }
+            K::Char(c) if picker.cursor == 0 && !key.modifiers.intersects(M::CONTROL | M::ALT) => {
+                if let Some(fixed) = picker.fixed.take() {
+                    picker.scope_text = scope_text(&fixed);
+                }
+                picker.scope_text.push(c);
+            }
+            K::Backspace if picker.cursor == 0 => {
+                if let Some(fixed) = picker.fixed.take() {
+                    picker.scope_text = scope_text(&fixed);
+                }
+                picker.scope_text.pop();
+            }
+            K::Char(' ') | K::Enter if (1..=options.len()).contains(&picker.cursor) => {
+                let privilege = options[picker.cursor - 1].to_string();
+                if !picker.wanted.remove(&privilege) {
+                    picker.wanted.insert(privilege);
+                }
+            }
+            K::Enter if picker.cursor == options.len() + 1 => return,
+            K::Enter if picker.cursor == options.len() + 2 => match picker.scope() {
+                Ok(scope) => {
+                    let current = self.current_privileges(&picker.account, &scope);
+                    let (grant, revoke) = privilege_diff(&current, &picker.wanted);
+                    let change = Change::Privileges {
+                        account: picker.account.clone(),
+                        scope,
+                        grant,
+                        revoke,
+                    };
+                    match preview(&change) {
+                        Ok(_) => {
+                            self.confirm = Some(Confirmation::new(Pending::Server(change)));
+                            self.picker = Some(picker);
+                            return;
+                        }
+                        Err(error) => self.say(error.to_string()),
+                    }
+                }
+                Err(error) => self.say(error.to_string()),
+            },
+            _ => (),
+        }
+        self.picker = Some(picker);
+        self.load_picker();
+        if let Some(picker) = &mut self.picker {
+            picker.cursor = picker.cursor.min(picker.options().len() + 2);
+        }
     }
     fn dialog_key(&mut self, key: KeyEvent) {
         let Some(mut d) = self.dialog.take() else {
@@ -1258,10 +2108,20 @@ impl App {
         self.dialog = Some(d);
     }
     fn submit(&mut self, d: &mut Dialog, button: usize) -> Result<Outcome> {
-        let v = |i: usize| d.fields[i].value.to_string();
+        let v = |i: usize| d.fields[i].value.trim().to_string();
+        let yes_no = |value: String, what: &str| match value.to_ascii_uppercase().as_str() {
+            "ANO" | "A" | "YES" => Ok(true),
+            "NE" | "N" | "NO" => Ok(false),
+            _ => Err(Error::Validation(format!("{what}: zadejte ANO nebo NE."))),
+        };
+        let number = |value: String, what: &str| {
+            value
+                .parse::<u64>()
+                .map_err(|_| Error::Validation(format!("{what}: zadejte nezáporné celé číslo.")))
+        };
         let change = match &d.kind {
             Kind::Search(page) => {
-                self.filters[*page] = v(0);
+                self.filters[*page] = d.fields[0].value.to_string();
                 if *page == self.page {
                     self.selected = 0;
                 }
@@ -1279,8 +2139,8 @@ impl App {
                 };
                 let profile = Profile {
                     id: original_id.clone().unwrap_or_default(),
-                    name: v(0),
-                    user: v(3),
+                    name: d.fields[0].value.to_string(),
+                    user: d.fields[3].value.to_string(),
                     tls,
                     ca: (!v(6).is_empty()).then(|| v(6)),
                     transport: if v(5).is_empty() {
@@ -1312,7 +2172,7 @@ impl App {
                     return Ok(Outcome::Keep);
                 }
                 self.session.connect(profile, d.fields[4].secret(), false);
-                self.page = 0;
+                self.page = SERVER;
                 return Ok(Outcome::Close);
             }
             Kind::Database => {
@@ -1331,28 +2191,63 @@ impl App {
                 account: account.clone(),
                 password: d.fields[0].secret(),
             },
-            Kind::Grant(account) => {
-                let privilege = Privilege::ALL
-                    .into_iter()
-                    .find(|p| p.sql() == v(1))
-                    .ok_or_else(|| Error::Validation("Nepodporované oprávnění.".into()))?;
-                let grant = match v(2).as_str() {
+            Kind::Role => Change::CreateRole { name: v(0) },
+            Kind::RoleMembership(account) => Change::RoleMembership {
+                role: v(0),
+                account: account.clone(),
+                grant: match v(1).to_ascii_uppercase().as_str() {
                     "GRANT" => true,
                     "REVOKE" => false,
                     _ => return Err(Error::Validation("Akce musí být GRANT nebo REVOKE.".into())),
-                };
-                Change::DatabaseGrant {
-                    account: account.clone(),
-                    database: v(0),
-                    privilege,
-                    grant,
-                }
+                },
+            },
+            Kind::DefaultRole(account) => Change::DefaultRole {
+                account: account.clone(),
+                role: (!v(0).is_empty()).then(|| v(0)),
+            },
+            Kind::Template(account) => {
+                let template = Template::parse(&v(0)).ok_or_else(|| {
+                    Error::Validation("Šablona musí být READONLY, APP, BACKUP nebo MONITOR.".into())
+                })?;
+                template.change(account.clone(), &v(1))?
             }
+            Kind::Properties(account) => Change::AlterAccount {
+                account: account.clone(),
+                locked: yes_no(v(0), "Zamčen")?,
+                expire_password: yes_no(v(1), "Vypršení hesla")?,
+                tls: match v(2).to_ascii_uppercase().as_str() {
+                    "NONE" => Some(TlsRequirement::None),
+                    "SSL" => Some(TlsRequirement::Ssl),
+                    "X509" => Some(TlsRequirement::X509),
+                    "KEEP" | "" => None,
+                    _ => {
+                        return Err(Error::Validation(
+                            "TLS musí být NONE, SSL, X509 nebo KEEP.".into(),
+                        ))
+                    }
+                },
+                limits: Limits {
+                    queries_per_hour: number(v(3), "Dotazy za hodinu")?,
+                    updates_per_hour: number(v(4), "Změny za hodinu")?,
+                    connections_per_hour: number(v(5), "Připojení za hodinu")?,
+                    user_connections: number(v(6), "Souběžná spojení")?,
+                },
+            },
+            Kind::Maintenance(database) => Change::Maintenance {
+                database: database.clone(),
+                table: v(0),
+                action: Maintenance::parse(&v(1)).ok_or_else(|| {
+                    Error::Validation("Akce musí být ANALYZE, CHECK, OPTIMIZE nebo REPAIR.".into())
+                })?,
+            },
+            Kind::Variable(variable) => Change::SetGlobal {
+                variable: variable.clone(),
+                value: v(0),
+            },
         };
-        self.confirm = Some(Confirmation {
-            action: Pending::Server(change),
-            yes: false,
-        });
+        // Invalid input is reported in the form, not in an unusable confirmation.
+        preview(&change)?;
+        self.confirm = Some(Confirmation::new(Pending::Server(change)));
         // The caller moves the dialog to `suspended` (no copy of a typed password).
         Ok(Outcome::Suspend)
     }
@@ -1361,28 +2256,48 @@ impl App {
             return;
         };
         let profile_delete = matches!(confirm.action, Pending::DeleteProfile { .. });
+        let restore = |app: &mut Self| {
+            if !profile_delete {
+                app.dialog = app.suspended.take();
+            }
+        };
         match key.code {
             K::Esc => {
-                if !profile_delete {
-                    self.dialog = self.suspended.take();
-                }
+                restore(self);
                 return;
             }
             K::Tab | K::BackTab | K::Left | K::Right => confirm.yes = !confirm.yes,
+            K::Char(c)
+                if confirm.required_name().is_some()
+                    && !key.modifiers.intersects(M::CONTROL | M::ALT) =>
+            {
+                confirm.typed.push(c);
+            }
+            K::Backspace => {
+                confirm.typed.pop();
+            }
             K::Enter if !confirm.yes => {
-                if !profile_delete {
-                    self.dialog = self.suspended.take();
-                }
+                restore(self);
                 return;
             }
             K::Enter => {
+                if confirm
+                    .required_name()
+                    .is_some_and(|name| name != confirm.typed)
+                {
+                    self.say("Pro potvrzení přesně opište název objektu.");
+                    self.confirm = Some(confirm);
+                    return;
+                }
                 let change = match &confirm.action {
                     Pending::DeleteProfile { id } => {
                         let id = id.clone();
                         match self.try_save(|s| s.remove_profile(&id)) {
                             Ok(profile) => {
-                                self.status =
-                                    format!("Profil „{}“ odstraněn.", safe_text(&profile.name));
+                                self.say(format!(
+                                    "Profil „{}“ odstraněn.",
+                                    safe_text(&profile.name)
+                                ));
                                 self.selected = 0;
                             }
                             Err(error) => self.say(error.to_string()),
@@ -1393,6 +2308,7 @@ impl App {
                 };
                 if self.session.request(Operation::Apply(change)) {
                     self.suspended = None;
+                    self.picker = None;
                     return;
                 }
                 self.say("Jiná operace právě běží; potvrzení zůstává otevřené.");
@@ -1401,6 +2317,151 @@ impl App {
         }
         self.confirm = Some(confirm);
     }
+}
+fn account_text(detail: &AccountDetail) -> String {
+    let mut lines = Vec::new();
+    if let Some(props) = &detail.properties {
+        lines.push(format!(
+            "{} • {} • heslo {} • TLS {}",
+            safe_text(&props.plugin),
+            if props.locked { "ZAMČEN" } else { "odemčen" },
+            if props.password_expired {
+                "VYPRŠELO"
+            } else {
+                "platné"
+            },
+            props.tls.label()
+        ));
+        let l = props.limits;
+        lines.push(format!(
+            "Limity: dotazy/h {} • změny/h {} • připojení/h {} • souběžně {} (0 = bez limitu)",
+            l.queries_per_hour, l.updates_per_hour, l.connections_per_hour, l.user_connections
+        ));
+    }
+    lines.push(format!(
+        "Role: {} • výchozí: {}",
+        if detail.roles.is_empty() {
+            "žádné".into()
+        } else {
+            safe_text(&detail.roles.join(", "))
+        },
+        detail
+            .default_role
+            .as_deref()
+            .map(safe_text)
+            .unwrap_or_else(|| "žádná".into())
+    ));
+    for set in &detail.privileges {
+        lines.push(format!(
+            "{}: {}{}",
+            safe_text(&set.scope.label()),
+            if set.privileges.is_empty() {
+                "USAGE".into()
+            } else {
+                set.privileges
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            if set.grantable { " + GRANT OPTION" } else { "" }
+        ));
+    }
+    for column in &detail.columns {
+        lines.push(format!("Sloupec: {}", safe_text(column)));
+    }
+    lines.push("— SHOW GRANTS —".into());
+    lines.extend(detail.grants.iter().map(|g| safe_text(g)));
+    lines.join("\n")
+}
+fn variable_text(v: &Variable) -> String {
+    let mut lines = Vec::new();
+    if let Some(description) = v.key_description() {
+        lines.push(description.to_string());
+    }
+    if !v.comment.is_empty() {
+        lines.push(safe_text(&v.comment));
+    }
+    let human = v
+        .value
+        .parse::<u64>()
+        .ok()
+        .filter(|n| v.var_type.contains("INT") && *n >= 1_048_576)
+        .map(|n| format!(" ({})", human_bytes(n)))
+        .unwrap_or_default();
+    lines.push(format!("Hodnota: {}{human}", safe_text(&v.value)));
+    lines.push(format!(
+        "Výchozí: {} • původ: {} • typ: {}",
+        v.default
+            .as_deref()
+            .map(safe_text)
+            .unwrap_or_else(|| "—".into()),
+        safe_text(&v.origin),
+        safe_text(&v.var_type)
+    ));
+    if v.min.is_some() || v.max.is_some() {
+        lines.push(format!(
+            "Rozsah: {} až {}",
+            v.min.as_deref().unwrap_or("?"),
+            v.max.as_deref().unwrap_or("?")
+        ));
+    }
+    if !v.allowed.is_empty() {
+        lines.push(format!("Povolené: {}", safe_text(&v.allowed.join(", "))));
+    }
+    lines.push(if v.settable() {
+        "Změna: F10 → Proměnná: změnit hodnotu (platí do restartu serveru)".into()
+    } else {
+        "Nelze měnit za běhu; patří do konfiguračního souboru.".into()
+    });
+    lines.join("\n")
+}
+fn table_text(t: &TableDetail) -> String {
+    let mut lines = vec!["SLOUPCE".to_string()];
+    for c in &t.columns {
+        lines.push(format!(
+            "  {:<24} {:<24} {:<4} {:<4} {}{}",
+            safe_text(&c.name),
+            safe_text(&c.column_type),
+            if c.nullable { "NULL" } else { "" },
+            safe_text(&c.key),
+            safe_text(&c.extra),
+            c.default
+                .as_deref()
+                .map(|d| format!(" default {}", safe_text(d)))
+                .unwrap_or_default()
+        ));
+    }
+    if !t.indexes.is_empty() {
+        lines.push("INDEXY".into());
+        for i in &t.indexes {
+            lines.push(format!(
+                "  {}{} ({}) {} ≈{}",
+                safe_text(&i.name),
+                if i.unique { " UNIQUE" } else { "" },
+                safe_text(&i.columns.join(", ")),
+                safe_text(&i.index_type),
+                i.cardinality
+            ));
+        }
+    }
+    if !t.foreign_keys.is_empty() {
+        lines.push("CIZÍ KLÍČE".into());
+        for fk in &t.foreign_keys {
+            lines.push(format!(
+                "  {} ({}) → {} ({}) ON DELETE {} ON UPDATE {}",
+                safe_text(&fk.name),
+                safe_text(&fk.columns.join(", ")),
+                safe_text(&fk.referenced_table),
+                safe_text(&fk.referenced_columns.join(", ")),
+                safe_text(&fk.on_delete),
+                safe_text(&fk.on_update)
+            ));
+        }
+    }
+    lines.push("DEFINICE".into());
+    lines.extend(t.create_sql.lines().map(|l| format!("  {}", safe_text(l))));
+    lines.join("\n")
 }
 /// Ctrl+M is not usable: terminals send it as CR, which crossterm reports as Enter.
 /// F9 and Alt+M are alternatives for terminals that capture F10 (e.g. GNOME Terminal).
@@ -1420,290 +2481,4 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
-    #[test]
-    fn all_screens_themes_modes_and_sizes_render_and_keep_drafts() {
-        let mut app = App::new(&[]);
-        app.store = None;
-        app.profile_dialog(None);
-        app.dialog.as_mut().unwrap().fields[0].value = Zeroizing::new("Rozpracováno".into());
-        for theme in ThemeId::TERMINAL {
-            app.theme = theme;
-            for colors in ["16", "mono", "truecolor"] {
-                app.colors = colors.into();
-                for (w, h) in [(80, 24), (120, 35), (60, 20)] {
-                    let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
-                    for page in 0..6 {
-                        app.page = page;
-                        terminal.draw(|frame| app.draw(frame)).unwrap();
-                    }
-                    app.ascii = true;
-                    terminal.draw(|frame| app.draw(frame)).unwrap();
-                    app.ascii = false;
-                }
-            }
-        }
-        assert_eq!(app.dialog.unwrap().fields[0].value.as_str(), "Rozpracováno");
-    }
-    #[test]
-    fn input_menu_theme_keeps_form_and_confirmation_defaults_to_cancel() {
-        let mut app = App::new(&[]);
-        app.store = None;
-        app.profile_dialog(None);
-        app.key(KeyEvent::new(K::F(10), M::NONE));
-        app.menu = Some(19);
-        app.key(KeyEvent::new(K::Enter, M::NONE));
-        assert!(app.dialog.is_some());
-        app.confirm = Some(Confirmation {
-            action: Pending::Server(Change::CreateDatabase {
-                name: "test".into(),
-                collation: "utf8mb4_unicode_ci".into(),
-            }),
-            yes: false,
-        });
-        app.key(KeyEvent::new(K::Enter, M::NONE));
-        assert!(app.confirm.is_none());
-        assert!(!app.session.worker.busy);
-    }
-    #[test]
-    fn menu_opens_with_f10_f9_alt_m_but_not_enter() {
-        let mut app = App::new(&[]);
-        app.store = None;
-        app.page = 0;
-        for key in [
-            KeyEvent::new(K::F(10), M::NONE),
-            KeyEvent::new(K::F(9), M::NONE),
-            KeyEvent::new(K::Char('m'), M::ALT),
-        ] {
-            app.menu = None;
-            app.key(key);
-            assert!(app.menu.is_some(), "{key:?}");
-        }
-        app.menu = None;
-        app.key(KeyEvent::new(K::Enter, M::NONE));
-        assert!(app.menu.is_none());
-    }
-    #[test]
-    fn newer_form_message_is_not_hidden_by_an_older_connection_error() {
-        let mut app = App::new(&[]);
-        app.store = None;
-        // A refused TCP connection leaves a persistent session error (no snapshot).
-        app.session.connect(
-            Profile {
-                transport: Transport::Tcp {
-                    host: "127.0.0.1".into(),
-                    port: 1,
-                },
-                tls: TlsMode::InsecureTestOnly,
-                ..Default::default()
-            },
-            Secret::default(),
-            false,
-        );
-        let start = std::time::Instant::now();
-        while app.session.worker.busy && start.elapsed() < std::time::Duration::from_secs(20) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            app.tick();
-        }
-        let error = app.session.error.clone().expect("connection error");
-        assert_eq!(app.status_line(), error);
-        app.profile_dialog(None);
-        let dialog = app.dialog.as_mut().unwrap();
-        dialog.fields[2].value = Zeroizing::new("není port".into());
-        dialog.focus = dialog.fields.len() + 1; // "Uložit"
-        key(&mut app, K::Enter);
-        assert_eq!(app.status_line(), "Neplatný vstup: Neplatný port.");
-    }
-    #[test]
-    fn enter_on_a_database_during_refresh_is_queued() {
-        let mut app = App::new(&["--demo".to_string()]);
-        app.store = None;
-        wait_idle(&mut app);
-        app.page = 1;
-        app.selected = 0;
-        assert!(app.session.request(Operation::Refresh));
-        assert!(app.session.worker.busy);
-        key(&mut app, K::Enter);
-        assert!(app.session.has_pending());
-        let start = std::time::Instant::now();
-        while (app.session.worker.busy || app.session.has_pending())
-            && start.elapsed() < std::time::Duration::from_secs(3)
-        {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            app.tick();
-        }
-        assert!(!app.session.tables.is_empty());
-    }
-    #[test]
-    fn selection_follows_the_row_when_a_refresh_reorders_the_list() {
-        let mut app = App::new(&["--demo".to_string()]);
-        app.store = None;
-        wait_idle(&mut app);
-        app.page = 3;
-        let target = app.processes()[1].id;
-        app.selected = 1;
-        app.remember_selection();
-        // A new long query appears on top (processes sort by time).
-        let mut snapshot = (**app.session.snapshot.as_ref().unwrap()).clone();
-        let mut newcomer = snapshot.processes[0].clone();
-        newcomer.id = 9999;
-        newcomer.seconds = 10_000;
-        snapshot.processes.insert(0, newcomer);
-        app.session.snapshot = Some(std::sync::Arc::new(snapshot));
-        app.reconcile_selection();
-        assert_eq!(app.processes()[app.selected].id, target);
-        // The row vanished: the cursor stays in range and picks a real row.
-        let mut snapshot = (**app.session.snapshot.as_ref().unwrap()).clone();
-        snapshot.processes.retain(|p| p.id != target);
-        app.session.snapshot = Some(std::sync::Arc::new(snapshot));
-        app.reconcile_selection();
-        assert!(app.selected < app.processes().len());
-        assert_eq!(
-            app.selected_key,
-            Some(RowKey::Process(app.processes()[app.selected].id))
-        );
-    }
-    #[test]
-    fn filters_are_per_page_and_case_insensitive() {
-        let mut app = App::new(&["--demo".to_string()]);
-        app.store = None;
-        wait_idle(&mut app);
-        app.page = 3;
-        app.action(16);
-        app.dialog.as_mut().unwrap().fields[0].value = Zeroizing::new("SELECT DATE".into());
-        app.dialog.as_mut().unwrap().focus = 2; // "Zkontrolovat"
-        key(&mut app, K::Enter);
-        assert_eq!(
-            app.processes().len(),
-            1,
-            "process query matched case-insensitively"
-        );
-        app.page = 1;
-        assert!(
-            !app.databases().is_empty(),
-            "the database list has its own filter"
-        );
-        app.page = 2;
-        app.filters[2] = "ANALYTICS".into();
-        assert_eq!(app.accounts().len(), 1);
-    }
-    #[test]
-    fn cancelled_confirmation_returns_the_same_draft_with_its_password() {
-        let mut app = App::new(&["--demo".to_string()]);
-        app.store = None;
-        wait_idle(&mut app);
-        app.action(12); // create account
-        let dialog = app.dialog.as_mut().unwrap();
-        dialog.fields[0].value = Zeroizing::new("novy".into());
-        dialog.fields[2].value = Zeroizing::new("tajne".into());
-        dialog.focus = dialog.fields.len() + 1;
-        key(&mut app, K::Enter);
-        assert!(app.confirm.is_some());
-        assert!(app.dialog.is_none(), "dialog moved away, not copied");
-        key(&mut app, K::Esc);
-        assert_eq!(
-            app.dialog.as_ref().unwrap().fields[2].value.as_str(),
-            "tajne"
-        );
-        let dialog = app.dialog.as_mut().unwrap();
-        dialog.focus = dialog.fields.len() + 1;
-        key(&mut app, K::Enter);
-        key(&mut app, K::Tab);
-        key(&mut app, K::Enter);
-        assert!(app.suspended.is_none() && app.dialog.is_none());
-    }
-    fn wait_idle(app: &mut App) {
-        let start = std::time::Instant::now();
-        app.tick();
-        while app.session.worker.busy && start.elapsed() < std::time::Duration::from_secs(3) {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            app.tick();
-        }
-        assert!(app.session.snapshot.is_some());
-    }
-    fn key(app: &mut App, code: K) {
-        app.key(KeyEvent::new(code, M::NONE));
-    }
-    #[test]
-    fn switching_server_drops_account_bound_drafts_and_confirmation() {
-        let mut app = App::new(&["--demo".to_string()]);
-        app.store = None;
-        wait_idle(&mut app);
-        app.page = 2;
-        app.selected = 1;
-        app.action(13); // change password of the selected account
-        assert!(matches!(
-            app.dialog.as_ref().unwrap().kind,
-            Kind::Password(_)
-        ));
-        key(&mut app, K::Esc); // the draft is kept as suspended
-        assert!(app.suspended.is_some());
-        app.tick();
-        assert!(app.suspended.is_some(), "same server keeps the draft");
-        let account = app.accounts()[1].clone();
-        app.confirm = Some(Confirmation {
-            action: Pending::Server(Change::ChangePassword {
-                account,
-                password: Secret::new("x".into()),
-            }),
-            yes: true,
-        });
-        app.action(9); // open DEMO again = new server session
-        app.tick();
-        assert!(app.suspended.is_none());
-        assert!(app.dialog.is_none());
-        assert!(app.confirm.is_none());
-        assert_eq!(app.selected, 0);
-        assert!(app.status.contains("zahozena"));
-    }
-    #[test]
-    fn profiles_are_keyed_by_id_and_deletion_needs_confirmation() {
-        let directory =
-            std::env::temp_dir().join(format!("harbor-tui-profiles-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        let mut app = App::new(&[]);
-        app.store = Some(ConfigStore::at(directory.clone()));
-        app.settings = Settings::default();
-        let save = |app: &mut App, name: &str, existing: Option<Profile>| {
-            app.profile_dialog(existing);
-            let dialog = app.dialog.as_mut().unwrap();
-            dialog.fields[0].value = name.to_string().into();
-            dialog.focus = dialog.fields.len() + 1; // "Uložit"
-            key(app, K::Enter);
-        };
-        save(&mut app, "A", None);
-        // Saving the same open form again must update, not duplicate.
-        key(&mut app, K::Enter);
-        assert_eq!(app.settings.profiles.len(), 1);
-        save(&mut app, "B", None);
-        assert_eq!(app.settings.profiles.len(), 2);
-        let a = app.settings.profiles[0].clone();
-        save(&mut app, "b", Some(a.clone()));
-        assert!(app.status.contains("už existuje"), "{}", app.status);
-        assert_eq!(app.settings.profiles.len(), 2);
-        assert_eq!(app.settings.profile(&a.id).unwrap().name, "A");
-        app.dialog = None;
-        app.page = 4;
-        app.selected = 0;
-        app.action(21);
-        assert_eq!(
-            app.settings.profiles.len(),
-            2,
-            "nothing deleted before confirmation"
-        );
-        key(&mut app, K::Enter); // default is Cancel
-        assert_eq!(app.settings.profiles.len(), 2);
-        assert!(
-            app.dialog.is_none(),
-            "cancel must not reopen an unrelated draft"
-        );
-        app.action(21);
-        key(&mut app, K::Tab);
-        key(&mut app, K::Enter);
-        assert_eq!(app.settings.profiles.len(), 1);
-        assert_eq!(app.settings.profiles[0].name, "B");
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-}
+mod tests;

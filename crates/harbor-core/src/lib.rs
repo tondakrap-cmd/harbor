@@ -1,8 +1,12 @@
+mod admin;
 mod backend;
 mod config;
 mod model;
+mod sql;
 mod worker;
+pub use admin::*;
 pub use backend::Backend;
 pub use config::{ConfigStore, Settings};
 pub use model::*;
+pub use sql::preview;
 pub use worker::{Operation, OperationKind, Response, Session, Worker};

@@ -37,8 +37,11 @@ sestavení DEB v Ubuntu samo o sobě tuto kontrolu nenahrazuje.
 ## TUI
 
 F10 (nebo F9 či Alt+M, pokud F10 zachytí terminál) otevře nabídku všech akcí. F1 zobrazí nápovědu, F3 profily a F5
-obnoví data. Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
-Tab přepíná seznam a detail; v detailu šipky posouvají dlouhý text. Vlevo/vpravo
+obnoví data. Klávesy 1–8 přepínají obrazovky (Server, Databáze, Uživatelé, Spojení,
+Proměnné, Doktor, Profily, Nastavení). Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
+Tab přepíná seznam a detail; v detailu šipky posouvají dlouhý text, na obrazovce
+Databáze vybírají tabulku a Enter zobrazí její strukturu. V editoru oprávnění
+mezerník přepíná zaškrtnutí a ←/→ střídá existující rozsahy. Vlevo/vpravo
 posouvá široký seznam. Ve formuláři Tab/Shift+Tab střídá pole a tlačítka.
 Esc ponechá formulář rozpracovaný; otevřete ho přes nabídku. Ctrl+C ukončuje.
 
@@ -66,15 +69,40 @@ nejvýše 120 skutečně odebraných vzorků; historie před připojením se nev
 Velikosti a počty řádků jsou odhady z information_schema. OS se neodhaduje.
 Při chybě se data označí jako neaktuální. Práva omezují viditelnost dat.
 
-Zápisy: vytvoření DB s kolací ověřenou serverem, účet uživatel@hostitel, změna hesla
-samostatného mysql_native_password, GRANT/REVOKE SELECT/INSERT/UPDATE/DELETE a
-KILL QUERY. Potvrzení ukazuje server i cíl a skrývá heslo. Změna hesla odmítne
-neznámý nebo vícenásobný autentizační mechanismus. KILL QUERY znovu porovná dostupné
-údaje o cíli; MariaDB neposkytuje atomický příkaz „porovnej a ukonči“, mezi kontrolou
-a KILL zůstává krátké časové okno. Relace se neukončuje.
+### Správa (od verze 0.2)
 
-Demo simuluje pouze vytvoření DB/účtu a KILL QUERY; ostatní zápisy výslovně odmítá.
-Demo hodnoty se nikdy nepoužívají jako náhrada selhaného skutečného spojení.
+- **Databáze:** velikost dat, indexů a nevyužitého místa; tabulky s enginem, odhadem
+  řádků, kolací a upozorněními (bez primárního klíče, MyISAM, jiná kolace, fragmentace);
+  počty pohledů, procedur, triggerů a událostí. Detail tabulky: sloupce, indexy, cizí
+  klíče a `SHOW CREATE`. Údržba ANALYZE / CHECK / OPTIMIZE / REPAIR s výstupem serveru.
+  Vytvoření a smazání databáze (systémové databáze smazat nelze).
+- **Uživatelé a oprávnění:** oprávnění na úrovni serveru, databáze a tabulky jako
+  zaškrtávací seznam (jen platná oprávnění dané úrovně, GRANT OPTION); Harbor provede
+  jen rozdíl proti současnému stavu. Granty se zástupnými znaky (`shop_db.*` bez
+  escapování) se zobrazují jako vzor a upravují beze změny. Šablony: jen čtení,
+  aplikační, zálohovací a monitorovací účet. Role MariaDB (vytvoření, přidělení,
+  výchozí role), zámek účtu, vypršení hesla, požadavek TLS a limity v jednom
+  `ALTER USER`. Sloupcová oprávnění se zobrazují. Harbor odmítne smazat nebo zamknout
+  účet, kterým je připojen.
+- **Proměnné:** všechny systémové proměnné s původem (výchozí, konfigurace, změněno za
+  běhu), výchozí hodnotou, rozsahem a popisem; přes 30 klíčových parametrů s českým
+  vysvětlením. `SET GLOBAL` s kontrolou typu a rozsahu (velikosti s příponou K/M/G)
+  a s ověřením, že se vlastnosti proměnné na serveru mezitím nezměnily. Změna platí do
+  restartu serveru; trvalý zápis do konfigurace přinese verze s přístupem k hostiteli.
+- **Doktor:** kontrola podle pravidel bez zápisu: anonymní účty, účty bez hesla,
+  vzdálený root, využití spojení, neúspěšná připojení, buffer pool, dočasné tabulky na
+  disku, tabulky bez PK a MyISAM, fragmentace, binlogy bez expirace, slow log, dlouhé
+  transakce, TLS. Kontroly, na které účet nemá právo, uvede jako neprovedené.
+
+Každá změna má potvrzení se serverem, popisem a **přesným SQL**, které se provede
+(hesla i jejich hashe jsou skryté). Smazání databáze, účtu nebo role vyžaduje opsat
+název. Heslo se serveru posílá jen jako hash `mysql_native_password`. Změna hesla
+odmítne neznámý nebo vícenásobný autentizační mechanismus. KILL QUERY znovu porovná
+údaje o cíli a ukončuje podle QUERY_ID; mezi kontrolou a KILL zůstává krátké okno.
+
+Demo simuluje databáze, účty, role, proměnnou max_connections, údržbu a ukončení
+dotazu; ostatní zápisy výslovně odmítá. Demo hodnoty se nikdy nepoužívají jako náhrada
+selhaného skutečného spojení.
 
 ## Kontroly a balíčky
 

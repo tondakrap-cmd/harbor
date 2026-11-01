@@ -1,3 +1,4 @@
+use crate::admin::*;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -152,7 +153,15 @@ pub struct Account {
 }
 impl Account {
     pub fn label(&self) -> String {
-        format!("{}@{}", self.user, self.host)
+        if self.is_role() {
+            format!("{} (role)", self.user)
+        } else {
+            format!("{}@{}", self.user, self.host)
+        }
+    }
+    /// MariaDB roles are rows of mysql.user with an empty host.
+    pub fn is_role(&self) -> bool {
+        self.host.is_empty()
     }
 }
 #[derive(Clone, Debug)]
@@ -165,15 +174,11 @@ pub struct Database {
 }
 impl Database {
     pub fn system(&self) -> bool {
-        ["mysql", "information_schema", "performance_schema", "sys"].contains(&self.name.as_str())
+        Self::system_name(&self.name)
     }
-}
-#[derive(Clone, Debug)]
-pub struct TableInfo {
-    pub name: String,
-    pub engine: String,
-    pub rows: u64,
-    pub bytes: u64,
+    pub fn system_name(name: &str) -> bool {
+        ["mysql", "information_schema", "performance_schema", "sys"].contains(&name)
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Process {
@@ -220,44 +225,65 @@ impl Snapshot {
         self.processes.iter().filter(|p| p.long_query()).count()
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Privilege {
-    Select,
-    Insert,
-    Update,
-    Delete,
-}
-impl Privilege {
-    pub const ALL: [Self; 4] = [Self::Select, Self::Insert, Self::Update, Self::Delete];
-    pub fn sql(self) -> &'static str {
-        match self {
-            Self::Select => "SELECT",
-            Self::Insert => "INSERT",
-            Self::Update => "UPDATE",
-            Self::Delete => "DELETE",
-        }
-    }
-}
 #[derive(Clone)]
 pub enum Change {
     CreateDatabase {
         name: String,
         collation: String,
     },
+    DropDatabase {
+        name: String,
+    },
     CreateAccount {
         user: String,
         host: String,
         password: Secret,
     },
+    /// DROP USER, or DROP ROLE for a role.
+    DropAccount {
+        account: Account,
+    },
     ChangePassword {
         account: Account,
         password: Secret,
     },
-    DatabaseGrant {
+    /// GRANT and/or REVOKE at one scope; entries come from the scope's whitelist.
+    Privileges {
         account: Account,
-        database: String,
-        privilege: Privilege,
+        scope: GrantScope,
+        grant: Vec<String>,
+        revoke: Vec<String>,
+    },
+    CreateRole {
+        name: String,
+    },
+    RoleMembership {
+        role: String,
+        account: Account,
         grant: bool,
+    },
+    DefaultRole {
+        account: Account,
+        role: Option<String>,
+    },
+    /// One ALTER USER with all account properties; `tls: None` keeps the current
+    /// requirement (used for REQUIRE ISSUER/SUBJECT that Harbor does not rewrite).
+    AlterAccount {
+        account: Account,
+        locked: bool,
+        expire_password: bool,
+        tls: Option<TlsRequirement>,
+        limits: Limits,
+    },
+    /// SET GLOBAL; `variable` is the metadata the user saw (re-checked on the server).
+    SetGlobal {
+        variable: Variable,
+        value: String,
+    },
+    Maintenance {
+        database: String,
+        table: String,
+        action: Maintenance,
     },
     KillQuery {
         target: Process,
@@ -269,28 +295,97 @@ impl Change {
             Self::CreateDatabase { name, collation } => {
                 format!("Vytvořit databázi {name} ({collation})")
             }
+            Self::DropDatabase { name } => {
+                format!("SMAZAT databázi {name} včetně všech tabulek a dat")
+            }
             Self::CreateAccount { user, host, .. } => {
                 format!("Vytvořit účet {user}@{host}; heslo skryto")
             }
+            Self::DropAccount { account } => format!("SMAZAT účet {}", account.label()),
             Self::ChangePassword { account, .. } => {
                 format!("Změnit heslo účtu {}; heslo skryto", account.label())
             }
-            Self::DatabaseGrant {
+            Self::Privileges {
                 account,
-                database,
-                privilege,
+                scope,
+                grant,
+                revoke,
+            } => {
+                let mut parts = Vec::new();
+                if !grant.is_empty() {
+                    parts.push(format!("přidat {}", grant.join(", ")));
+                }
+                if !revoke.is_empty() {
+                    parts.push(format!("odebrat {}", revoke.join(", ")));
+                }
+                format!(
+                    "Oprávnění {} na {}: {}",
+                    account.label(),
+                    scope.label(),
+                    parts.join("; ")
+                )
+            }
+            Self::CreateRole { name } => format!("Vytvořit roli {name}"),
+            Self::RoleMembership {
+                role,
+                account,
                 grant,
             } => format!(
-                "{} {} na {} pro {}",
-                if *grant { "Přidat" } else { "Odebrat" },
-                privilege.sql(),
-                database,
+                "{} roli {role} účtu {}",
+                if *grant { "Přidělit" } else { "Odebrat" },
                 account.label()
+            ),
+            Self::DefaultRole { account, role } => format!(
+                "Výchozí role účtu {}: {}",
+                account.label(),
+                role.as_deref().unwrap_or("žádná")
+            ),
+            Self::AlterAccount {
+                account,
+                locked,
+                expire_password,
+                tls,
+                limits,
+            } => format!(
+                "Vlastnosti účtu {}: {}, TLS {}, limity {}/{}/{}/{}{}",
+                account.label(),
+                if *locked { "ZAMČEN" } else { "odemčen" },
+                tls.map(|t| t.label()).unwrap_or("beze změny"),
+                limits.queries_per_hour,
+                limits.updates_per_hour,
+                limits.connections_per_hour,
+                limits.user_connections,
+                if *expire_password {
+                    ", heslo vyprší (změna při příštím přihlášení)"
+                } else {
+                    ""
+                }
+            ),
+            Self::SetGlobal { variable, value } => format!(
+                "SET GLOBAL {} = {value} (nyní {}; platí do restartu serveru)",
+                variable.name, variable.value
+            ),
+            Self::Maintenance {
+                database,
+                table,
+                action,
+            } => format!(
+                "{} {database}.{table}: {}",
+                action.keyword(),
+                action.description()
             ),
             Self::KillQuery { target } => format!(
                 "Ukončit dotaz #{} účtu {} v {} (relace zůstane otevřena)",
                 target.id, target.user, target.database
             ),
+        }
+    }
+    /// Irreversible changes; UIs require typing the object's name to confirm.
+    pub fn destructive_name(&self) -> Option<&str> {
+        match self {
+            Self::DropDatabase { name } => Some(name),
+            Self::DropAccount { account } => Some(&account.user),
+            _ => None,
         }
     }
 }
@@ -326,6 +421,10 @@ pub fn identifier(value: &str) -> Result<String> {
         ));
     }
     Ok(format!("`{}`", value.replace('`', "``")))
+}
+/// SQL string literal; sessions run with NO_BACKSLASH_ESCAPES, so only quotes double.
+pub fn quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 pub fn safe_text(value: &str) -> String {
     value
