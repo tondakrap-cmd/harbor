@@ -4,7 +4,7 @@ use harbor_themes::{desktop, rgb, ThemeId};
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 10] = [
+const PAGES: [&str; 13] = [
     "Přehled serveru",
     "Databáze",
     "Uživatelé a oprávnění",
@@ -15,6 +15,9 @@ const PAGES: [&str; 10] = [
     "Zálohy",
     "Připojení",
     "Nastavení",
+    "Výkon a dotazy",
+    "Replikace",
+    "SQL konzole",
 ];
 const OVERVIEW: usize = 0;
 const DATABASES: usize = 1;
@@ -26,6 +29,25 @@ const SERVICE: usize = 6;
 const BACKUPS: usize = 7;
 const CONNECTION: usize = 8;
 const SETTINGS: usize = 9;
+const PERFORMANCE: usize = 10;
+const REPLICATION: usize = 11;
+const CONSOLE: usize = 12;
+/// Order of the pages in the sidebar (indices into PAGES).
+const NAV: [usize; 13] = [
+    OVERVIEW,
+    DATABASES,
+    ACCOUNTS,
+    PROCESSES,
+    PERFORMANCE,
+    CONSOLE,
+    REPLICATION,
+    VARIABLES,
+    HEALTH,
+    SERVICE,
+    BACKUPS,
+    CONNECTION,
+    SETTINGS,
+];
 
 /// Forms that prepare one change; the change itself is confirmed in a modal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +101,8 @@ enum Ask {
     DeleteBackup(std::path::PathBuf),
     Unschedule(String),
     Service(ServiceAction),
+    /// A console statement that writes: (database, SQL).
+    ConsoleWrite(String, String),
     /// The complete new content of Harbor's option file.
     WriteConfig(Vec<(String, String)>),
 }
@@ -97,7 +121,7 @@ pub struct Harbor {
     page: usize,
     /// One search per list page (index = page), so typing on one page does not
     /// filter another.
-    filters: [String; 10],
+    filters: [String; 13],
     system: bool,
     long_only: bool,
     key_only: bool,
@@ -178,6 +202,17 @@ pub struct Harbor {
     /// Last SSH settings typed in the profile form (kept when switching access type).
     ssh_target: String,
     ssh_port: u16,
+    /// Aktivní spojení shows transactions and locks instead of the process list.
+    locks_view: bool,
+    locks_requested: Option<std::time::Instant>,
+    selected_trx: Option<u64>,
+    selected_stat: Option<String>,
+    selected_binlog: Option<String>,
+    loaded_performance: Option<u64>,
+    loaded_replication: Option<u64>,
+    console_sql: String,
+    console_db: String,
+    console_export: String,
 }
 #[derive(Clone, Copy)]
 struct Palette {
@@ -423,6 +458,16 @@ impl Harbor {
             config_value: String::new(),
             ssh_target: String::new(),
             ssh_port: 22,
+            locks_view: false,
+            locks_requested: None,
+            selected_trx: None,
+            selected_stat: None,
+            selected_binlog: None,
+            loaded_performance: None,
+            loaded_replication: None,
+            console_sql: "SELECT ".into(),
+            console_db: String::new(),
+            console_export: String::new(),
         };
         app.backup_dir_text = app.settings.backup_dir().display().to_string();
         if demo {
@@ -537,6 +582,30 @@ impl Harbor {
         {
             self.loaded_health = Some(generation);
             self.session.request(Operation::Health);
+        }
+        if self.page == PERFORMANCE
+            && self.session.performance.is_none()
+            && self.loaded_performance != Some(generation)
+        {
+            self.loaded_performance = Some(generation);
+            self.session.request(Operation::Performance);
+        }
+        if self.page == REPLICATION
+            && self.session.replication.is_none()
+            && self.loaded_replication != Some(generation)
+        {
+            self.loaded_replication = Some(generation);
+            self.session.request(Operation::Replication);
+        }
+        // Locks change quickly: refresh with the normal interval while they are shown.
+        if self.page == PROCESSES
+            && self.locks_view
+            && self
+                .locks_requested
+                .is_none_or(|at| at.elapsed().as_secs() >= self.settings.refresh_seconds.max(2))
+        {
+            self.locks_requested = Some(std::time::Instant::now());
+            self.session.request(Operation::Locks);
         }
     }
     fn try_save<T>(&mut self, change: impl FnOnce(&mut Settings) -> Result<T>) -> Option<T> {
@@ -837,6 +906,10 @@ impl Harbor {
         }
         field(ui, "Uživatel", &mut self.profile.user, false);
         field(ui, "Heslo (neukládá se)", &mut self.password, true);
+        ui.checkbox(
+            &mut self.profile.read_only,
+            "Jen pro čtení (produkce): žádné změny, obnovy, akce služby ani zápisy v konzoli",
+        );
         if !self.unix {
             let mut insecure = self.profile.tls == TlsMode::InsecureTestOnly;
             ui.checkbox(
@@ -1570,10 +1643,22 @@ impl Harbor {
         );
     }
     fn processes(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let mut locks = self.locks_view;
         toolbar(ui, |ui| {
+            ui.radio_value(&mut locks, false, "Spojení");
+            ui.radio_value(&mut locks, true, "Transakce a zámky");
+            ui.separator();
             search(ui, &mut self.filters[PROCESSES]);
             ui.checkbox(&mut self.long_only, "Jen dotazy běžící přes 30 s");
         });
+        if locks != self.locks_view {
+            self.locks_view = locks;
+            self.locks_requested = None;
+        }
+        if self.locks_view {
+            self.locks_view(ui, p);
+            return;
+        }
         let processes: Vec<Process> = self
             .session
             .snapshot
@@ -1646,6 +1731,11 @@ impl Harbor {
                             .clicked()
                         {
                             app.confirm(Change::KillQuery {
+                                target: process.clone(),
+                            });
+                        }
+                        if ui.button("Ukončit spojení…").clicked() {
+                            app.confirm(Change::KillConnection {
                                 target: process.clone(),
                             });
                         }
@@ -1958,6 +2048,12 @@ impl Harbor {
             }
         } else if self.page == VARIABLES && self.session.host_config.is_none() {
             self.session.host_request(HostRequest::ReadConfig);
+        } else if self.page == PERFORMANCE && self.session.host_slow_log.is_none() {
+            if let Some(Some(StatsSource::SlowLogFile(path))) =
+                self.session.performance.as_ref().map(|p| p.source.clone())
+            {
+                self.session.host_request(HostRequest::SlowLog { path });
+            }
         }
     }
     fn log_source(&self) -> LogSource {
@@ -2269,6 +2365,701 @@ impl Harbor {
             .collect();
         entries.push(entry);
         Ok(entries)
+    }
+    /// Open transactions and lock waits (Aktivní spojení → Transakce a zámky).
+    fn locks_view(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let Some(report) = self.session.locks.clone() else {
+            ui.label("Načítám transakce a zámky…");
+            return;
+        };
+        for note in &report.notes {
+            banner(ui, p, Severity::Info, note, None);
+        }
+        if !report.waits.is_empty() {
+            banner(
+                ui,
+                p,
+                Severity::Warning,
+                &format!(
+                    "{} dotazů čeká na zámek. Kořenové blokující spojení: {}. Ukončení kořenového spojení vrátí jeho transakci zpět a uvolní ostatní.",
+                    report.waits.len(),
+                    report
+                        .root_blockers
+                        .iter()
+                        .map(|t| format!("#{t}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None,
+            );
+        }
+        if !report.metadata_waits.is_empty() {
+            banner(
+                ui,
+                p,
+                Severity::Warning,
+                &format!(
+                    "{} spojení čeká na zámek metadat (typicky ALTER TABLE za dlouhou transakcí): {}",
+                    report.metadata_waits.len(),
+                    report
+                        .metadata_waits
+                        .iter()
+                        .map(|w| format!("#{} ({} s)", w.thread, w.seconds))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                None,
+            );
+        }
+        let transactions = report.transactions.clone();
+        self.split(
+            ui,
+            "locks_split",
+            |app, ui| {
+                panel_frame(p).show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    ui.label(
+                        RichText::new(format!(
+                            "{} otevřených transakcí InnoDB",
+                            transactions.len()
+                        ))
+                        .color(p.muted),
+                    );
+                    let selected = transactions
+                        .iter()
+                        .position(|t| app.selected_trx == Some(t.thread));
+                    if let Some(i) = data_table(
+                        ui,
+                        "transactions",
+                        &["SPOJENÍ", "UŽIVATEL", "STAV", "TRVÁ", "ZAMČENO", "DOTAZ"],
+                        &[
+                            Some(72.0),
+                            Some(110.0),
+                            Some(90.0),
+                            Some(64.0),
+                            Some(72.0),
+                            None,
+                        ],
+                        transactions.len(),
+                        selected,
+                        None,
+                        |ui, row, col| {
+                            let t = &transactions[row];
+                            let blocker = report.root_blockers.contains(&t.thread);
+                            match col {
+                                0 => {
+                                    let text = RichText::new(format!("#{}", t.thread));
+                                    ui.label(if blocker {
+                                        text.strong().color(p.severity(Severity::Critical))
+                                    } else {
+                                        text
+                                    });
+                                }
+                                1 => cell(ui, &t.user),
+                                2 => cell(ui, if t.idle() { "nečinná" } else { &t.state }),
+                                3 => cell(ui, &format!("{} s", t.seconds)),
+                                4 => cell(ui, &t.rows_locked.to_string()),
+                                _ => cell(ui, &t.query),
+                            }
+                        },
+                    ) {
+                        app.selected_trx = Some(transactions[i].thread);
+                    }
+                });
+            },
+            |app, ui| {
+                let Some(t) = transactions
+                    .iter()
+                    .find(|t| app.selected_trx == Some(t.thread))
+                    .cloned()
+                else {
+                    empty_detail(ui, p, "Vyberte transakci v seznamu.");
+                    return;
+                };
+                let process = app
+                    .session
+                    .snapshot
+                    .as_ref()
+                    .and_then(|s| s.processes.iter().find(|x| x.id == t.thread).cloned());
+                let blocks: Vec<LockWait> = report
+                    .waits
+                    .iter()
+                    .filter(|w| w.blocking_thread == t.thread)
+                    .cloned()
+                    .collect();
+                let waits_for: Vec<LockWait> = report
+                    .waits
+                    .iter()
+                    .filter(|w| w.waiting_thread == t.thread)
+                    .cloned()
+                    .collect();
+                app.detail_pane(
+                    ui,
+                    p,
+                    "transaction_detail",
+                    |app, ui| {
+                        ui.heading(format!("Transakce spojení #{}", t.thread));
+                        if let Some(process) = &process {
+                            if ui
+                                .add_enabled(
+                                    process.running_query(),
+                                    egui::Button::new("Ukončit dotaz…"),
+                                )
+                                .clicked()
+                            {
+                                app.confirm(Change::KillQuery {
+                                    target: process.clone(),
+                                });
+                            }
+                            if ui.button("Ukončit spojení…").clicked() {
+                                app.confirm(Change::KillConnection {
+                                    target: process.clone(),
+                                });
+                            }
+                        }
+                    },
+                    |_, ui| {
+                        egui::Grid::new("trx")
+                            .num_columns(2)
+                            .spacing([24.0, 6.0])
+                            .show(ui, |ui| {
+                                let mut row = |label: &str, value: String| {
+                                    ui.label(RichText::new(label).color(p.muted));
+                                    ui.label(value);
+                                    ui.end_row();
+                                };
+                                row(
+                                    "Účet",
+                                    format!("{}@{}", safe_text(&t.user), safe_text(&t.host)),
+                                );
+                                row("Databáze", safe_text(&t.database));
+                                row(
+                                    "Stav",
+                                    format!(
+                                        "{} • {}",
+                                        safe_text(&t.state),
+                                        if t.idle() {
+                                            "relace nic nedělá (transakce zůstala otevřená)"
+                                        } else {
+                                            "pracuje"
+                                        }
+                                    ),
+                                );
+                                row("Trvá", format!("{} s", t.seconds));
+                                row(
+                                    "Řádky",
+                                    format!(
+                                        "zamčeno {} • změněno {} • tabulek {}",
+                                        t.rows_locked, t.rows_modified, t.tables_locked
+                                    ),
+                                );
+                                row("Izolace", safe_text(&t.isolation));
+                            });
+                        if !t.query.is_empty() {
+                            ui.monospace(safe_text(&t.query));
+                        }
+                        if !blocks.is_empty() {
+                            ui.add_space(8.0);
+                            ui.strong(format!("Blokuje {} dotazů", blocks.len()));
+                            for w in &blocks {
+                                ui.label(format!(
+                                    "#{} čeká {} s na {} ({}): {}",
+                                    w.waiting_thread,
+                                    w.waiting_seconds,
+                                    safe_text(&w.lock_table),
+                                    safe_text(&w.lock_mode),
+                                    safe_text(&w.waiting_query)
+                                ));
+                            }
+                        }
+                        for w in &waits_for {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(format!(
+                                    "Čeká {} s na zámek {} drženým spojením #{}",
+                                    w.waiting_seconds,
+                                    safe_text(&w.lock_table),
+                                    w.blocking_thread
+                                ))
+                                .color(p.warn),
+                            );
+                        }
+                    },
+                );
+            },
+        );
+    }
+    fn performance_page(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let performance = self.session.performance.clone();
+        toolbar(ui, |ui| {
+            if ui.button("Načíst znovu").clicked() {
+                self.session.request(Operation::Performance);
+                self.session.host_slow_log = None;
+            }
+            if let Some(perf) = &performance {
+                if !perf.slow_query_log
+                    && !perf.performance_schema
+                    && ui.button("Zapnout log pomalých dotazů…").clicked()
+                {
+                    if let Some(variable) = self
+                        .session
+                        .variables
+                        .as_ref()
+                        .and_then(|v| v.iter().find(|v| v.name == "slow_query_log"))
+                        .cloned()
+                    {
+                        self.confirm(Change::SetGlobal {
+                            variable,
+                            value: "ON".into(),
+                        });
+                    } else {
+                        self.session.request(Operation::Variables);
+                        self.message = "Načítám proměnné serveru; akci zopakujte.".into();
+                    }
+                }
+                if perf.performance_schema && ui.button("Vynulovat statistiky…").clicked() {
+                    self.confirm(Change::ResetStatementStats);
+                }
+                ui.label(
+                    RichText::new(match &perf.source {
+                        Some(StatsSource::PerformanceSchema) => {
+                            "zdroj: performance_schema".to_string()
+                        }
+                        Some(StatsSource::SlowLogTable) => format!(
+                            "zdroj: mysql.slow_log (long_query_time {} s)",
+                            perf.long_query_time
+                        ),
+                        Some(StatsSource::SlowLogFile(file)) => format!(
+                            "zdroj: soubor {} (long_query_time {} s)",
+                            safe_text(file),
+                            perf.long_query_time
+                        ),
+                        _ => "statistiky se nesbírají".into(),
+                    })
+                    .color(p.muted),
+                );
+            }
+        });
+        let Some(perf) = performance else {
+            ui.label(if self.session.snapshot.is_some() {
+                "Načítám…"
+            } else {
+                "Nejprve se připojte k serveru."
+            });
+            return;
+        };
+        let statements = match &perf.source {
+            Some(StatsSource::SlowLogFile(_)) => match &self.session.host_slow_log {
+                Some(stats) => stats.clone(),
+                None => {
+                    if self.session.host.is_none() {
+                        banner(ui, p, Severity::Info, "Log pomalých dotazů se zapisuje do souboru na serveru. Pro jeho čtení nastavte v profilu přístup k serveru, nebo přepněte log_output na TABLE (Proměnné).", None);
+                    } else if let Some(error) = &self.session.host_error {
+                        banner(ui, p, Severity::Critical, error, None);
+                    } else {
+                        ui.label("Čtu log pomalých dotazů ze serveru…");
+                    }
+                    Vec::new()
+                }
+            },
+            _ => perf.statements.clone(),
+        };
+        if perf.source == Some(StatsSource::Off) {
+            banner(ui, p, Severity::Info, "Server nesbírá statistiky dotazů. Zapněte log pomalých dotazů (platí do restartu), nebo trvale performance_schema = ON v konfiguraci (Proměnné → Uložit do konfigurace, pak restart).", None);
+            return;
+        }
+        self.split(
+            ui,
+            "performance_split",
+            |app, ui| {
+                panel_frame(p).show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    ui.label(RichText::new(format!("{} tvarů dotazů, seřazeno podle celkového času", statements.len())).color(p.muted));
+                    let selected = statements.iter().position(|s| app.selected_stat.as_ref() == Some(&s.query));
+                    if let Some(i) = data_table(
+                        ui,
+                        "statements",
+                        &["CELKEM", "POČET", "PRŮMĚR", "DOTAZ"],
+                        &[Some(80.0), Some(70.0), Some(80.0), None],
+                        statements.len(),
+                        selected,
+                        None,
+                        |ui, row, col| {
+                            let s = &statements[row];
+                            match col {
+                                0 => cell(ui, &format!("{:.1} s", s.total_seconds)),
+                                1 => cell(ui, &s.count.to_string()),
+                                2 => cell(ui, &format!("{:.0} ms", s.average_ms())),
+                                _ => cell(ui, &s.query),
+                            }
+                        },
+                    ) {
+                        app.selected_stat = Some(statements[i].query.clone());
+                    }
+                });
+            },
+            |app, ui| {
+                let Some(stat) = statements.iter().find(|s| app.selected_stat.as_ref() == Some(&s.query)).cloned() else {
+                    empty_detail(ui, p, "Vyberte dotaz v seznamu.");
+                    return;
+                };
+                app.detail_pane(
+                    ui,
+                    p,
+                    "statement_detail",
+                    |app, ui| {
+                        ui.heading("Dotaz");
+                        let explainable = stat.sample.as_deref().is_some_and(|s| {
+                            matches!(console_statement(s), Ok((_, ConsoleKind::Read)))
+                        });
+                        if ui
+                            .add_enabled(explainable, egui::Button::new("EXPLAIN vzorku v konzoli"))
+                            .on_disabled_hover_text("Vzorek je k dispozici jen ze slow logu a jen pro čtecí dotazy.")
+                            .clicked()
+                        {
+                            app.console_sql = format!("EXPLAIN {}", stat.sample.clone().unwrap_or_default());
+                            app.console_db = stat.schema.clone();
+                            app.page = CONSOLE;
+                        }
+                    },
+                    |_, ui| {
+                        ui.monospace(safe_text(&stat.query));
+                        ui.add_space(6.0);
+                        egui::Grid::new("stat").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                            let mut row = |label: &str, value: String| {
+                                ui.label(RichText::new(label).color(p.muted));
+                                ui.label(value);
+                                ui.end_row();
+                            };
+                            row("Schéma", safe_text(&stat.schema));
+                            row("Spuštění", stat.count.to_string());
+                            row("Celkem", format!("{:.2} s", stat.total_seconds));
+                            row("Průměr / maximum", format!("{:.1} ms / {:.2} s", stat.average_ms(), stat.max_seconds));
+                            row("Řádky prohledané / vrácené", format!("{} / {}", stat.rows_examined, stat.rows_sent));
+                            if stat.no_index > 0 {
+                                row("Bez indexu", format!("{}×", stat.no_index));
+                            }
+                            row("Naposledy", safe_text(&stat.last_seen));
+                        });
+                        if stat.rows_examined > stat.rows_sent.max(1) * 100 {
+                            ui.label(RichText::new("Dotaz prohledá stokrát víc řádků, než vrací: nejspíš mu chybí vhodný index.").color(p.warn));
+                        }
+                        if let Some(sample) = &stat.sample {
+                            ui.add_space(6.0);
+                            ui.strong("Nejpomalejší spuštění");
+                            ui.monospace(safe_text(sample));
+                        }
+                    },
+                );
+            },
+        );
+    }
+    fn replication_page(&mut self, ui: &mut egui::Ui, p: Palette) {
+        toolbar(ui, |ui| {
+            if ui.button("Načíst znovu").clicked() {
+                self.session.request(Operation::Replication);
+            }
+        });
+        let Some(r) = self.session.replication.clone() else {
+            ui.label(if self.session.snapshot.is_some() {
+                "Načítám…"
+            } else {
+                "Nejprve se připojte k serveru."
+            });
+            return;
+        };
+        for note in &r.notes {
+            banner(ui, p, Severity::Info, note, None);
+        }
+        egui::ScrollArea::vertical().id_salt("replication").auto_shrink([false, false]).show(ui, |ui| {
+            card(ui, p, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.heading("Tento server");
+                egui::Grid::new("repl_server").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
+                    let mut row = |label: &str, value: String| {
+                        ui.label(RichText::new(label).color(p.muted));
+                        ui.label(value);
+                        ui.end_row();
+                    };
+                    row("server_id", r.server_id.to_string());
+                    row("Jen pro čtení (read_only)", if r.read_only { "ano".into() } else { "ne".into() });
+                    row("Binární log", if r.log_bin { format!("zapnutý • {}", safe_text(&r.binlog_format)) } else { "vypnutý".into() });
+                    row("GTID binlog", safe_text(&r.gtid_binlog_pos));
+                    row("GTID repliky", safe_text(&r.gtid_slave_pos));
+                    if !r.replicas.is_empty() {
+                        row("Připojené repliky", safe_text(&r.replicas.join(", ")));
+                    }
+                });
+            });
+            card(ui, p, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.heading("Replikace z jiného serveru");
+                if r.channels.is_empty() {
+                    ui.label("Server není replikou (žádné replikační spojení).");
+                }
+                for channel in &r.channels {
+                    ui.horizontal_wrapped(|ui| {
+                        let ok = channel.healthy();
+                        ui.label(
+                            RichText::new(format!("● {}", if ok { "běží" } else { "NEBĚŽÍ" }))
+                                .strong()
+                                .color(if ok { p.accent } else { p.severity(Severity::Critical) }),
+                        );
+                        ui.strong(format!("Spojení {} z {}", safe_text(&channel.label()), safe_text(&channel.master)));
+                        if ui.button("Spustit").clicked() {
+                            self.confirm(Change::ReplicaControl { connection: channel.name.clone(), start: true });
+                        }
+                        if ui.button("Zastavit…").clicked() {
+                            self.confirm(Change::ReplicaControl { connection: channel.name.clone(), start: false });
+                        }
+                    });
+                    ui.label(format!(
+                        "IO {} • SQL {} • zpoždění {} • GTID {} ({})",
+                        safe_text(&channel.io_running),
+                        safe_text(&channel.sql_running),
+                        channel.seconds_behind.map(|s| format!("{s} s")).unwrap_or_else(|| "—".into()),
+                        safe_text(&channel.gtid_io_pos),
+                        safe_text(&channel.using_gtid)
+                    ));
+                    ui.label(RichText::new(safe_text(&channel.state)).color(p.muted));
+                    for error in [&channel.last_io_error, &channel.last_sql_error] {
+                        if !error.is_empty() {
+                            ui.label(RichText::new(safe_text(error)).color(p.severity(Severity::Critical)));
+                        }
+                    }
+                    ui.separator();
+                }
+            });
+            if let Some(g) = &r.galera {
+                card(ui, p, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.heading(format!("Galera • {}", safe_text(&g.cluster_name)));
+                    ui.label(format!(
+                        "Uzel {} • {} • cluster {} ({} uzlů) • připraven {} • flow control {:.1} % • fronta {:.2}",
+                        safe_text(&g.node_name),
+                        safe_text(&g.local_state),
+                        safe_text(&g.cluster_status),
+                        g.cluster_size,
+                        if g.ready { "ano" } else { "NE" },
+                        g.flow_control_paused * 100.0,
+                        g.recv_queue_avg
+                    ));
+                });
+            }
+            card(ui, p, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    ui.heading("Binární logy");
+                    let selected = self.selected_binlog.clone().filter(|b| r.binlogs.iter().any(|l| &l.name == b));
+                    if ui
+                        .add_enabled(selected.is_some(), egui::Button::new("Smazat starší než vybraný…"))
+                        .clicked()
+                    {
+                        if let Some(to) = selected {
+                            self.confirm(Change::PurgeBinlogs { to });
+                        }
+                    }
+                });
+                if !r.log_bin {
+                    ui.label("Binární log je vypnutý.");
+                    return;
+                }
+                ui.label(format!(
+                    "{} souborů • celkem {} • automatické mazání {}",
+                    r.binlogs.len(),
+                    human_bytes(r.binlog_bytes()),
+                    if r.expire_seconds > 0.0 { format!("po {:.1} dnech", r.expire_seconds / 86_400.0) } else { "VYPNUTÉ".into() }
+                ));
+                let logs = r.binlogs.clone();
+                let selected = logs.iter().position(|l| self.selected_binlog.as_ref() == Some(&l.name));
+                if let Some(i) = data_table(ui, "binlogs", &["SOUBOR", "VELIKOST"], &[Some(240.0), None], logs.len(), selected, Some(260.0), |ui, row, col| {
+                    let l = &logs[row];
+                    cell(ui, &if col == 0 { l.name.clone() } else { human_bytes(l.bytes) });
+                }) {
+                    self.selected_binlog = Some(logs[i].name.clone());
+                }
+            });
+        });
+    }
+    fn console_page(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let databases: Vec<String> = self
+            .session
+            .snapshot
+            .as_ref()
+            .map(|s| s.databases.iter().map(|d| d.name.clone()).collect())
+            .unwrap_or_default();
+        let running = self.session.console.as_ref().is_some_and(|c| c.running());
+        let mut run = false;
+        toolbar(ui, |ui| {
+            egui::ComboBox::from_id_salt("console_db")
+                .selected_text(if self.console_db.is_empty() {
+                    "(bez databáze)".to_string()
+                } else {
+                    safe_text(&self.console_db)
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.console_db, String::new(), "(bez databáze)");
+                    for db in &databases {
+                        ui.selectable_value(&mut self.console_db, db.clone(), safe_text(db));
+                    }
+                });
+            if ui
+                .add_enabled(
+                    !running && self.session.snapshot.is_some(),
+                    egui::Button::new("▶ Spustit (Ctrl+Enter)"),
+                )
+                .clicked()
+            {
+                run = true;
+            }
+            if ui
+                .add_enabled(running, egui::Button::new("■ Zrušit"))
+                .clicked()
+            {
+                if let Some(job) = &self.session.console {
+                    job.cancel();
+                }
+            }
+            let history = self.session.console_history.clone();
+            egui::ComboBox::from_id_salt("console_history")
+                .selected_text("Historie")
+                .show_ui(ui, |ui| {
+                    for sql in history.iter().rev() {
+                        if ui
+                            .selectable_label(
+                                false,
+                                safe_text(&sql.chars().take(80).collect::<String>()),
+                            )
+                            .clicked()
+                        {
+                            self.console_sql = sql.clone();
+                        }
+                    }
+                });
+            ui.label(
+                RichText::new(if self.session.read_only() {
+                    "profil jen pro čtení: zápisy zakázané"
+                } else {
+                    "čtení v transakci READ ONLY, max. 1000 řádků a 60 s; zápis po potvrzení"
+                })
+                .color(p.muted),
+            );
+        });
+        let editor = ui.add(
+            egui::TextEdit::multiline(&mut self.console_sql)
+                .code_editor()
+                .hint_text("SELECT … (jeden příkaz)")
+                .desired_rows(6)
+                .desired_width(f32::INFINITY),
+        );
+        if editor.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
+            run = true;
+        }
+        if run && !running {
+            match self
+                .session
+                .console(&self.console_db, &self.console_sql, false)
+            {
+                Ok(ConsoleKind::Write) => {
+                    self.ask_text.clear();
+                    self.ask = Some(Ask::ConsoleWrite(
+                        self.console_db.clone(),
+                        self.console_sql.clone(),
+                    ));
+                }
+                Ok(_) => (),
+                Err(error) => self.message = error.to_string(),
+            }
+        }
+        ui.add_space(6.0);
+        let Some(job) = self.session.console.clone() else {
+            empty_detail(ui, p, "Výsledek dotazu se zobrazí zde.");
+            return;
+        };
+        panel_frame(p).show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
+            match job.result() {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Běží {} s…", job.started.elapsed().as_secs()));
+                    });
+                }
+                Some(Err(error)) => {
+                    ui.label(
+                        RichText::new(safe_text(&error)).color(p.severity(Severity::Critical)),
+                    );
+                }
+                Some(Ok(result)) => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(match result.affected {
+                            Some(n) => {
+                                format!("Provedeno: {n} řádků změněno • {} ms", result.elapsed_ms)
+                            }
+                            None => format!(
+                                "{} řádků{} • {} ms",
+                                result.rows.len(),
+                                if result.truncated {
+                                    " (zobrazeno prvních 1000)"
+                                } else {
+                                    ""
+                                },
+                                result.elapsed_ms
+                            ),
+                        });
+                        if result.affected.is_none() {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.console_export)
+                                    .hint_text("soubor CSV")
+                                    .desired_width(260.0)
+                                    .margin(egui::Margin::symmetric(8, 5)),
+                            );
+                            if ui.button("Uložit CSV").clicked() {
+                                self.message =
+                                    match write_private(&self.console_export, &result.csv()) {
+                                        Ok(path) => format!("Uloženo do {path}."),
+                                        Err(error) => error,
+                                    };
+                            }
+                        }
+                    });
+                    if !result.columns.is_empty() {
+                        let widths: Vec<Option<f32>> = (0..result.columns.len())
+                            .map(|i| {
+                                if i + 1 == result.columns.len() {
+                                    None
+                                } else {
+                                    Some(140.0)
+                                }
+                            })
+                            .collect();
+                        let headers: Vec<&str> =
+                            result.columns.iter().map(String::as_str).collect();
+                        egui::ScrollArea::horizontal()
+                            .id_salt("console_result")
+                            .show(ui, |ui| {
+                                data_table(
+                                    ui,
+                                    "console_rows",
+                                    &headers,
+                                    &widths,
+                                    result.rows.len(),
+                                    None,
+                                    None,
+                                    |ui, row, col| match &result.rows[row][col] {
+                                        Some(value) => cell(ui, value),
+                                        None => {
+                                            ui.label(
+                                                RichText::new("NULL").italics().color(p.muted),
+                                            );
+                                        }
+                                    },
+                                );
+                            });
+                    }
+                }
+            }
+        });
     }
     fn backups_page(&mut self, ui: &mut egui::Ui, p: Palette) {
         if !self.backups_loaded {
@@ -2945,6 +3736,24 @@ impl Harbor {
                         },
                     )
                 }
+                Ask::ConsoleWrite(database, sql) => (
+                    "Provést zápisový příkaz?",
+                    vec![
+                        format!(
+                            "Server: {} • databáze {}",
+                            self.session
+                                .profile
+                                .as_ref()
+                                .map(|p| safe_text(&p.name))
+                                .unwrap_or_default(),
+                            if database.is_empty() { "—".to_string() } else { safe_text(database) }
+                        ),
+                        "Příkaz se provede tak, jak je napsaný; nelze ho vrátit tlačítkem Zpět:".into(),
+                        format!("    {}", safe_text(sql)),
+                    ],
+                    None,
+                    "Provést",
+                ),
                 Ask::WriteConfig(entries) => {
                     let mut lines = vec![
                         "Nový obsah souboru Harboru (ověří se nanečisto binárkou serveru):".to_string(),
@@ -3011,6 +3820,12 @@ impl Harbor {
                             }
                             self.ask = None;
                             self.reload_backups();
+                        }
+                        Ask::ConsoleWrite(database, sql) => {
+                            match self.session.console(&database, &sql, true) {
+                                Ok(_) => self.ask = None,
+                                Err(error) => self.message = error.to_string(),
+                            }
                         }
                         Ask::Service(action) => {
                             if self.session.host_request(HostRequest::Control(action)) {
@@ -3596,11 +4411,12 @@ impl Harbor {
                 );
                 ui.small(safe_text(&self.session.status));
                 ui.add_space(14.0);
-                for (index, label) in PAGES.iter().enumerate() {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                for index in NAV {
                     if ui
                         .add_sized(
-                            [176.0, 34.0],
-                            egui::Button::new(*label).selected(self.page == index),
+                            [176.0, 30.0],
+                            egui::Button::new(PAGES[index]).selected(self.page == index),
                         )
                         .clicked()
                     {
@@ -3627,6 +4443,13 @@ impl Harbor {
                             .unwrap_or_else(|| "—".into()),
                     );
                     ui.strong(&self.session.status);
+                    if self.session.read_only() {
+                        ui.label(
+                            RichText::new("JEN PRO ČTENÍ")
+                                .strong()
+                                .color(p.severity(Severity::Warning)),
+                        );
+                    }
                     if self.session.worker.busy {
                         ui.spinner();
                     }
@@ -3708,6 +4531,9 @@ impl Harbor {
                     HEALTH => self.health(ui, p),
                     BACKUPS => self.backups_page(ui, p),
                     SERVICE => self.service_page(ui, p),
+                    PERFORMANCE => self.performance_page(ui, p),
+                    REPLICATION => self.replication_page(ui, p),
+                    CONSOLE => self.console_page(ui, p),
                     CONNECTION => self.connection(ui, p),
                     _ => self.overview(ui, p),
                 }
@@ -3720,6 +4546,35 @@ impl Harbor {
 }
 /// sudoers rule allowing exactly the commands Harbor runs with elevation.
 const SUDOERS_EXAMPLE: &str = "uzivatel ALL=(root) NOPASSWD: /usr/bin/systemctl, /usr/bin/journalctl, \\\n  /usr/bin/tail, /usr/bin/cat, /usr/bin/tee, /usr/bin/cp, /usr/bin/mv, \\\n  /usr/bin/rm, /usr/bin/mktemp, /usr/sbin/mariadbd, /usr/libexec/mariadbd";
+/// Writes a file readable by the owner only; empty path = ~/harbor-export-<time>.csv.
+fn write_private(path: &str, content: &str) -> std::result::Result<String, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = if path.trim().is_empty() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let stamp: String = utc_timestamp(std::time::SystemTime::now())
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        format!("{home}/harbor-export-{stamp}.csv")
+    } else if let Some(rest) = path.trim().strip_prefix("~/") {
+        format!(
+            "{}/{rest}",
+            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+        )
+    } else {
+        path.trim().to_string()
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("Soubor {path} nelze vytvořit: {e}"))?;
+    file.write_all(content.as_bytes())
+        .map_err(|e| format!("Zápis do {path} selhal: {e}"))?;
+    Ok(path)
+}
 /// Short description under the page title.
 fn page_subtitle(page: usize) -> &'static str {
     match page {
@@ -3730,6 +4585,9 @@ fn page_subtitle(page: usize) -> &'static str {
         VARIABLES => "parametry serveru a jejich změna za běhu",
         HEALTH => "kontrola bezpečnosti, výkonu a údržby",
         SERVICE => "spuštění a zastavení, disk, logy a trvalá konfigurace",
+        PERFORMANCE => "nejnáročnější dotazy podle celkového času",
+        REPLICATION => "repliky, Galera a binární logy",
+        CONSOLE => "jeden příkaz SQL; čtení bezpečně, zápis po potvrzení",
         BACKUPS => "zálohy do ZIP, obnova a plánování",
         CONNECTION => "uložené profily a připojení",
         _ => "vzhled a chování aplikace",

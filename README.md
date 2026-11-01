@@ -37,7 +37,7 @@ sestavení DEB v Ubuntu samo o sobě tuto kontrolu nenahrazuje.
 ## TUI
 
 F10 (nebo F9 či Alt+M, pokud F10 zachytí terminál) otevře nabídku všech akcí. F1 zobrazí nápovědu, F3 profily a F5
-obnoví data. Klávesy 1–9 a 0 přepínají obrazovky (Server, Databáze, Uživatelé, Spojení,
+obnoví data. Klávesy 1–9 a 0 přepínají obrazovky (další přes `[` a `]`) (Server, Databáze, Uživatelé, Spojení,
 Proměnné, Doktor, Služba, Zálohy, Profily, Nastavení; klávesa 0 = Nastavení). Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
 Tab přepíná seznam a detail; v detailu šipky posouvají dlouhý text, na obrazovce
 Databáze vybírají tabulku a Enter zobrazí její strukturu. V editoru oprávnění
@@ -133,6 +133,18 @@ NOPASSWD jen pro vybrané příkazy, návrh je v aplikaci) nebo lokálně přes 
 - Všechny příkazy jsou pevné programy s argumenty; hodnoty jsou ověřené a pro SSH
   escapované pro vzdálený shell.
 
+### Diagnostika (od verze 0.5)
+
+- **Transakce a zámky** (Aktivní spojení): kdo koho blokuje, kořenové blokující spojení,
+  nečinné relace s otevřenou transakcí, čekání na zámky metadat; ukončení dotazu nebo
+  celého spojení.
+- **Výkon a dotazy:** nejnáročnější dotazy podle celkového času z `performance_schema`,
+  tabulky `mysql.slow_log` nebo souboru slow logu (přes přístup k serveru).
+- **Replikace:** repliky a jejich chyby, start/stop, Galera, binární logy a jejich mazání.
+- **SQL konzole:** čtení bezpečně v transakci READ ONLY (1000 řádků, 60 s), zápis jen po
+  potvrzení, export CSV. Chyby serveru se zobrazují celé.
+- **Profil jen pro čtení** pro produkční servery: Harbor pak nic nemění.
+
 Každá změna má potvrzení se serverem, popisem a **přesným SQL**, které se provede
 (hesla i jejich hashe jsou skryté). Smazání databáze, účtu nebo role vyžaduje opsat
 název. Heslo se serveru posílá jen jako hash `mysql_native_password`. Změna hesla
@@ -152,6 +164,7 @@ cargo test --locked --workspace
 python3 scripts/test-pty.py
 bash scripts/test-instances.sh
 bash scripts/test-host.sh
+bash scripts/test-replication.sh
 bash scripts/package.sh
 bash scripts/smoke-packages.sh
 bash scripts/test-upgrade.sh

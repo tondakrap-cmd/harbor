@@ -1,5 +1,24 @@
 # Změny
 
+## 0.5.0
+
+- Aktivní spojení → Transakce a zámky: otevřené transakce InnoDB, čekání na zámky,
+  kořenové blokující spojení, čekání na zámky metadat; ukončení celého spojení
+  (KILL CONNECTION) s kontrolou, že číslo stále patří stejnému účtu.
+- Výkon a dotazy: nejnáročnější tvary dotazů z performance_schema, z mysql.slow_log nebo
+  ze souboru slow logu přes přístup k serveru; normalizace literálů, nejpomalejší vzorek,
+  EXPLAIN vzorku v konzoli, zapnutí slow logu, vynulování statistik.
+- Replikace: stav všech replikačních spojení (SHOW ALL SLAVES STATUS), start/stop,
+  připojené repliky, GTID, Galera; binární logy s velikostí a mazáním starších
+  (opsat název; Harbor upozorní, pokud server log ponechal, protože ho čte replika).
+- SQL konzole: jeden příkaz na vlastním spojení; čtení v transakci READ ONLY s limitem
+  1000 řádků a 60 s, zrušení, chybové zprávy serveru, historie, export do CSV (0600);
+  zápisové příkazy jen po potvrzení.
+- Profil „jen pro čtení“: zakáže změny, obnovy, akce služby, zápis konfigurace a zápisy v konzoli.
+- Doktor: zastavená nebo zpožděná replika, stav uzlu Galera, flow control.
+- Testy proti skutečnému páru primár/replika (scripts/test-replication.sh).
+- TUI: obrazovky Výkon, Replikace a Konzole (klávesy [ a ]), záhlaví se posouvá.
+
 ## 0.4.0
 
 - Přístup k serveru v profilu: lokálně nebo přes SSH (jen klíče/agent, BatchMode),

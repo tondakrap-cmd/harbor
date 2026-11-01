@@ -570,3 +570,64 @@ fn service_page_loads_from_the_host_and_guards_actions() {
     assert!(entries.contains(&("max_connections".into(), "300".into())));
     assert!(entries.iter().any(|(n, _)| n == "innodb_buffer_pool_size"));
 }
+#[test]
+fn diagnostics_pages_and_console_render_in_demo() {
+    let (ctx, mut app) = demo();
+    for page in [PERFORMANCE, REPLICATION] {
+        app.page = page;
+        settle(&ctx, &mut app);
+    }
+    app.page = PROCESSES;
+    app.locks_view = true;
+    settle(&ctx, &mut app);
+    let all = texts(&frame(&ctx, &mut app).shapes).join("\n");
+    assert!(all.contains("Kořenové blokující spojení: #1842"), "{all}");
+    app.page = REPLICATION;
+    let all = texts(&frame(&ctx, &mut app).shapes).join("\n");
+    assert!(all.contains("db-primary.demo") && all.contains("mariadb-bin.000042"));
+    // A console write is only proposed; it runs after the modal confirmation.
+    app.page = CONSOLE;
+    app.console_sql = "DELETE FROM orders".into();
+    assert_eq!(
+        app.session
+            .console("", &app.console_sql.clone(), false)
+            .unwrap(),
+        ConsoleKind::Write
+    );
+    assert!(app.session.console.is_none(), "nothing ran yet");
+    app.console_sql = "SELECT 1".into();
+    app.session.console("", "SELECT 1", false).unwrap();
+    settle(&ctx, &mut app);
+    let start = std::time::Instant::now();
+    while app.session.console.as_ref().is_none_or(|c| c.running())
+        && start.elapsed() < Duration::from_secs(3)
+    {
+        frame(&ctx, &mut app);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let all = texts(&frame(&ctx, &mut app).shapes).join("\n");
+    assert!(all.contains("Zákazník 1 (demo)"), "{all}");
+    // CSV export goes to a private file.
+    let path = std::env::temp_dir().join(format!("harbor-console-{}.csv", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let csv = app
+        .session
+        .console
+        .as_ref()
+        .unwrap()
+        .result()
+        .unwrap()
+        .unwrap()
+        .csv();
+    write_private(path.to_str().unwrap(), &csv).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(
+        write_private(path.to_str().unwrap(), &csv).is_err(),
+        "never overwrites"
+    );
+    std::fs::remove_file(path).unwrap();
+}

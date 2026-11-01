@@ -3,6 +3,8 @@ mod backend;
 mod backup;
 pub mod cli;
 mod config;
+mod console;
+mod diagnostics;
 pub mod host;
 mod model;
 pub mod schedule;
@@ -16,6 +18,8 @@ pub use backup::{
     Progress, RestoreRequest, Statements,
 };
 pub use config::{ConfigStore, Settings};
+pub use console::ConsoleJob;
+pub use diagnostics::*;
 pub use host::{
     Disk, Elevation, HarborConfig, HostAccess, HostRequest, HostResponse, HostSettings, HostWorker,
     LogSource, ServiceAction, ServiceStatus,

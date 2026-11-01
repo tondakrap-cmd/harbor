@@ -51,6 +51,7 @@ informaci o nedostatečné velikosti a ponechat možnost bezpečného ukončení
 | F3 | Připojení a přepínání profilů. |
 | F5 | Obnovení aktuálního přehledu (na obrazovce Doktor i nová kontrola). |
 | 1–9, 0 | Přímý přechod na obrazovku Server … Nastavení (mimo formuláře). |
+| [ / ] | Předchozí / další obrazovka (také Výkon, Replikace, Konzole). |
 | Mezerník | Zaškrtnutí oprávnění v editoru oprávnění. |
 | F10 / F9 / Alt+M | Aktivace horní nabídky (F9 a Alt+M pro terminály, které F10 zachytí; Ctrl+M terminál posílá jako Enter). |
 | Tab / Shift+Tab | Přechod mezi ovládacími prvky nebo panely. |

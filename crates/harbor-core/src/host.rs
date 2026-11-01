@@ -472,6 +472,11 @@ impl Host {
         self.check(&["mv", "-f", &staged, &current.path], true, None)?;
         self.read_config()
     }
+    /// The last 30 MB of the slow query log, aggregated by statement shape.
+    pub fn slow_log(&self, file: &str) -> Result<Vec<StatementStat>> {
+        let text = self.check(&["tail", "-c", "30000000", path(file)?], true, None)?;
+        Ok(aggregate_slow_log(&text))
+    }
     fn server_binary(&self) -> Result<Option<String>> {
         for candidate in [
             "/usr/sbin/mariadbd",
@@ -654,6 +659,10 @@ pub enum HostRequest {
         entries: Vec<(String, String)>,
         profile: String,
     },
+    /// Reads the end of the slow query log file and aggregates it.
+    SlowLog {
+        path: String,
+    },
 }
 pub enum HostResponse {
     Status(ServiceStatus),
@@ -661,6 +670,7 @@ pub enum HostResponse {
     Logs(Vec<String>),
     Config(HarborConfig),
     ConfigWritten(HarborConfig),
+    SlowLog(Vec<StatementStat>),
 }
 /// Runs host commands one at a time in a thread, so slow SSH never blocks the UI or
 /// database monitoring.
@@ -733,6 +743,7 @@ fn handle(host: &Host, request: HostRequest) -> Result<HostResponse> {
         HostRequest::WriteConfig { entries, profile } => {
             HostResponse::ConfigWritten(host.write_config(&entries, &profile)?)
         }
+        HostRequest::SlowLog { path } => HostResponse::SlowLog(host.slow_log(&path)?),
     })
 }
 /// In-memory host for the demo mode.
@@ -789,6 +800,7 @@ impl DemoHost {
                 self.config = entries;
                 HostResponse::ConfigWritten(config(&self.config))
             }
+            HostRequest::SlowLog { .. } => HostResponse::SlowLog(Vec::new()),
         })
     }
 }

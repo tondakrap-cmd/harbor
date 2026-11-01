@@ -168,6 +168,41 @@ impl Tour {
                 Box::new(move |a| set(a, HEALTH)),
             ));
             steps.push((
+                format!("{}-3b-zamky", t.key()),
+                Box::new(move |a| {
+                    set(a, PROCESSES);
+                    a.locks_view = true;
+                }),
+            ));
+            steps.push((
+                format!("{}-9-vykon", t.key()),
+                Box::new(move |a| {
+                    a.locks_view = false;
+                    set(a, PERFORMANCE);
+                    if a.selected_stat.is_none() {
+                        a.selected_stat = a
+                            .session
+                            .performance
+                            .as_ref()
+                            .and_then(|p| p.statements.first().map(|s| s.query.clone()));
+                    }
+                }),
+            ));
+            steps.push((
+                format!("{}-9b-replikace", t.key()),
+                Box::new(move |a| set(a, REPLICATION)),
+            ));
+            steps.push((
+                format!("{}-9c-konzole", t.key()),
+                Box::new(move |a| {
+                    set(a, CONSOLE);
+                    if a.session.console.is_none() && a.session.snapshot.is_some() && !a.session.worker.busy {
+                        a.console_sql = "SELECT TABLE_SCHEMA, TABLE_NAME, ENGINE, TABLE_ROWS FROM information_schema.TABLES ORDER BY TABLE_ROWS DESC".into();
+                        let _ = a.session.console("", &a.console_sql.clone(), false);
+                    }
+                }),
+            ));
+            steps.push((
                 format!("{}-5b-sluzba", t.key()),
                 Box::new(move |a| set(a, SERVICE)),
             ));
@@ -258,6 +293,18 @@ impl eframe::App for Tour {
             && !self.app.session.has_pending()
             && (self.app.page != HEALTH || self.app.session.health.is_some())
             && (self.app.page != VARIABLES || self.app.session.variables.is_some())
+            && (self.app.page != PERFORMANCE || self.app.session.performance.is_some())
+            && (self.app.page != REPLICATION || self.app.session.replication.is_some())
+            && (self.app.page != CONSOLE
+                || self
+                    .app
+                    .session
+                    .console
+                    .as_ref()
+                    .is_some_and(|c| !c.running()))
+            && (self.app.page != PROCESSES
+                || !self.app.locks_view
+                || self.app.session.locks.is_some())
             && (self.app.page != SERVICE
                 || self.app.session.host.is_none()
                 || (!self.app.session.host_busy() && self.app.session.host_logs.is_some())

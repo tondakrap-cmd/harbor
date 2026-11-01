@@ -106,6 +106,9 @@ pub struct Profile {
     pub user: String,
     pub tls: TlsMode,
     pub ca: Option<String>,
+    /// Production safety: no changes, restores, service actions or console writes.
+    #[serde(default)]
+    pub read_only: bool,
     /// Access to the server machine (service, logs, configuration); optional.
     #[serde(default)]
     pub host: HostSettings,
@@ -125,6 +128,7 @@ impl Default for Profile {
             user: "harbor".into(),
             tls: TlsMode::VerifyIdentity,
             ca: None,
+            read_only: false,
             host: HostSettings::default(),
             extra: serde_json::Map::new(),
         }
@@ -303,6 +307,21 @@ pub enum Change {
     KillQuery {
         target: Process,
     },
+    /// KILL CONNECTION: ends the whole session (rolls back its open transaction).
+    KillConnection {
+        target: Process,
+    },
+    /// START SLAVE / STOP SLAVE for one replication connection ('' = default).
+    ReplicaControl {
+        connection: String,
+        start: bool,
+    },
+    /// PURGE BINARY LOGS TO 'name': deletes all older binary logs.
+    PurgeBinlogs {
+        to: String,
+    },
+    /// Clears performance_schema statement statistics.
+    ResetStatementStats,
 }
 impl Change {
     pub fn summary(&self) -> String {
@@ -393,6 +412,21 @@ impl Change {
                 "Ukončit dotaz #{} účtu {} v {} (relace zůstane otevřena)",
                 target.id, target.user, target.database
             ),
+            Self::KillConnection { target } => format!(
+                "Ukončit SPOJENÍ #{} účtu {}@{}; jeho otevřená transakce se vrátí zpět",
+                target.id, target.user, target.host
+            ),
+            Self::ReplicaControl { connection, start } => format!(
+                "{} replikaci (spojení {})",
+                if *start { "Spustit" } else { "Zastavit" },
+                if connection.is_empty() { "výchozí" } else { connection }
+            ),
+            Self::PurgeBinlogs { to } => format!(
+                "SMAZAT všechny binární logy starší než {to}; repliky, které je ještě nepřečetly, přestanou fungovat"
+            ),
+            Self::ResetStatementStats => {
+                "Vynulovat statistiky dotazů v performance_schema".into()
+            }
         }
     }
     /// Irreversible changes; UIs require typing the object's name to confirm.
@@ -400,6 +434,7 @@ impl Change {
         match self {
             Self::DropDatabase { name } => Some(name),
             Self::DropAccount { account } => Some(&account.user),
+            Self::PurgeBinlogs { to } => Some(to),
             _ => None,
         }
     }

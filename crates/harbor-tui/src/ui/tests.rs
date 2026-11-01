@@ -321,8 +321,8 @@ fn type_text(app: &mut App, text: &str) {
 #[test]
 fn number_keys_switch_pages_and_every_menu_action_is_safe_everywhere() {
     let mut app = demo();
-    for (i, page) in PAGES.iter().enumerate() {
-        // 1–9, then 0 for the tenth screen.
+    for (i, page) in PAGES.iter().enumerate().take(10) {
+        // 1–9, then 0 for the tenth screen; the rest through [ ] (tested separately).
         key(&mut app, K::Char(char::from(b'0' + ((i + 1) % 10) as u8)));
         assert_eq!(app.page, i, "{page}");
     }
@@ -723,4 +723,102 @@ fn long_profile_form_scrolls_and_saves_ssh_access() {
     key(&mut app, K::Enter);
     assert!(app.status_line().contains("SSH"), "{}", app.status_line());
     std::fs::remove_dir_all(directory).unwrap();
+}
+#[test]
+fn page_bar_fits_and_brackets_cycle_through_all_screens() {
+    let mut app = demo();
+    for (page, name) in PAGES.iter().enumerate() {
+        let bar = page_bar(page, 80);
+        assert!(bar.chars().count() <= 80, "{bar}");
+        assert!(bar.contains(&format!("[{name}]")), "{bar}");
+    }
+    app.run(Action::Page(SETTINGS));
+    key(&mut app, K::Char(']'));
+    assert_eq!(app.page, PERFORMANCE);
+    key(&mut app, K::Char('['));
+    assert_eq!(app.page, SETTINGS);
+    app.run(Action::Page(SERVER));
+    key(&mut app, K::Char('['));
+    assert_eq!(app.page, CONSOLE, "wraps around");
+}
+#[test]
+fn locks_performance_replication_and_console_screens_work_in_demo() {
+    let mut app = demo();
+    // Locks: the idle blocker is marked and can be ended (connection kill confirmed).
+    app.run(Action::Page(PROCESSES));
+    app.run(Action::ToggleLocks);
+    settle(&mut app);
+    let screen = render(&app, 120, 35);
+    assert!(
+        screen.contains("!#1842") && screen.contains("nečinná"),
+        "root blocker marked"
+    );
+    app.selected = 0;
+    app.run(Action::KillConnection);
+    assert!(matches!(
+        app.confirm.as_ref().map(|c| &c.action),
+        Some(Pending::Server(Change::KillConnection { .. }))
+    ));
+    app.confirm = None;
+    // Performance: statements sorted by total time with a sample for EXPLAIN.
+    app.run(Action::Page(PERFORMANCE));
+    settle(&mut app);
+    assert!(render(&app, 120, 35).contains("SELECT * FROM orders WHERE customer_id = ?"));
+    app.selected = 0;
+    app.run(Action::ExplainSample);
+    let dialog = app.dialog.as_ref().expect("console dialog");
+    assert!(dialog.fields[1].value.starts_with("EXPLAIN SELECT"));
+    app.dialog = None;
+    // Replication: channel and binlogs; purging needs the typed log name.
+    app.run(Action::Page(REPLICATION));
+    settle(&mut app);
+    let rows = app.replication_rows();
+    assert!(rows[0].1.contains("db-primary.demo"));
+    app.selected = rows
+        .iter()
+        .position(|(k, _)| k.starts_with("binlog:"))
+        .unwrap()
+        + 1;
+    app.run(Action::PurgeBinlogs);
+    assert_eq!(
+        app.confirm.as_ref().unwrap().required_name(),
+        Some("mariadb-bin.000042")
+    );
+    app.confirm = None;
+    // Console: a read runs (demo result), a write is refused in demo after confirmation.
+    app.run(Action::Page(CONSOLE));
+    app.run(Action::ConsoleRun);
+    let dialog = app.dialog.as_mut().unwrap();
+    dialog.fields[1].value = Zeroizing::new("SELECT * FROM orders".into());
+    dialog.focus = dialog.fields.len() + 1;
+    key(&mut app, K::Enter);
+    let start = std::time::Instant::now();
+    while app.session.console.as_ref().is_none_or(|c| c.running())
+        && start.elapsed() < std::time::Duration::from_secs(3)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.tick();
+    }
+    let screen = render(&app, 120, 35);
+    assert!(
+        screen.contains("Zákazník 1 (demo)") && screen.contains("NULL"),
+        "result grid"
+    );
+    app.run(Action::ConsoleRun);
+    let dialog = app.dialog.as_mut().unwrap();
+    dialog.fields[1].value = Zeroizing::new("DELETE FROM orders".into());
+    dialog.focus = dialog.fields.len() + 1;
+    key(&mut app, K::Enter);
+    assert!(
+        matches!(
+            app.confirm.as_ref().map(|c| &c.action),
+            Some(Pending::ConsoleWrite(..))
+        ),
+        "writes need confirmation"
+    );
+    assert!(render(&app, 120, 35).contains("DELETE FROM orders"));
+    key(&mut app, K::Tab);
+    key(&mut app, K::Enter);
+    settle(&mut app);
+    assert!(app.status_line().contains("Demo"), "{}", app.status_line());
 }

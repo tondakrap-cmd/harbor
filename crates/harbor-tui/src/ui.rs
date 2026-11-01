@@ -13,7 +13,7 @@ use ratatui::{
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 10] = [
+const PAGES: [&str; 13] = [
     "Server",
     "Databáze",
     "Účty",
@@ -24,6 +24,9 @@ const PAGES: [&str; 10] = [
     "Zálohy",
     "Profily",
     "Nastavení",
+    "Výkon",
+    "Replikace",
+    "Konzole",
 ];
 const SERVER: usize = 0;
 const DATABASES: usize = 1;
@@ -35,6 +38,9 @@ const SERVICE: usize = 6;
 const BACKUPS: usize = 7;
 const PROFILES: usize = 8;
 const SETTINGS: usize = 9;
+const PERFORMANCE: usize = 10;
+const REPLICATION: usize = 11;
+const CONSOLE: usize = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
@@ -60,6 +66,19 @@ enum Action {
     KillQuery,
     SetVariable,
     RunHealth,
+    ToggleLocks,
+    KillConnection,
+    PerformanceReload,
+    EnableSlowLog,
+    ResetStats,
+    ExplainSample,
+    ReplicationReload,
+    ReplicaStart,
+    ReplicaStop,
+    PurgeBinlogs,
+    ConsoleRun,
+    ConsoleCancel,
+    ConsoleExport,
     HostRefresh,
     ServiceStart,
     ServiceRestart,
@@ -96,6 +115,9 @@ const MENU: &[(&str, Action)] = &[
     ("Zálohy (8)", Action::Page(BACKUPS)),
     ("Profily (9, F3)", Action::Page(PROFILES)),
     ("Nastavení (0)", Action::Page(SETTINGS)),
+    ("Výkon a dotazy ([ ])", Action::Page(PERFORMANCE)),
+    ("Replikace ([ ])", Action::Page(REPLICATION)),
+    ("SQL konzole ([ ])", Action::Page(CONSOLE)),
     ("Nápověda", Action::Help),
     ("Obnovit", Action::Refresh),
     ("Nový profil", Action::NewProfile),
@@ -118,6 +140,19 @@ const MENU: &[(&str, Action)] = &[
     ("Účet: výchozí role…", Action::DefaultRole),
     ("Účet / role: smazat…", Action::DropAccount),
     ("Spojení: ukončit vybraný dotaz", Action::KillQuery),
+    ("Spojení: ukončit celé spojení…", Action::KillConnection),
+    ("Spojení: transakce a zámky ano/ne", Action::ToggleLocks),
+    ("Výkon: načíst znovu", Action::PerformanceReload),
+    ("Výkon: zapnout log pomalých dotazů…", Action::EnableSlowLog),
+    ("Výkon: vynulovat statistiky…", Action::ResetStats),
+    ("Výkon: EXPLAIN vzorku v konzoli", Action::ExplainSample),
+    ("Replikace: načíst znovu", Action::ReplicationReload),
+    ("Replikace: spustit vybrané spojení", Action::ReplicaStart),
+    ("Replikace: zastavit vybrané spojení…", Action::ReplicaStop),
+    ("Binlogy: smazat starší než vybraný…", Action::PurgeBinlogs),
+    ("Konzole: spustit dotaz…", Action::ConsoleRun),
+    ("Konzole: zrušit běžící dotaz", Action::ConsoleCancel),
+    ("Konzole: uložit výsledek do CSV…", Action::ConsoleExport),
     ("Proměnná: změnit hodnotu (SET GLOBAL)", Action::SetVariable),
     ("Doktor: spustit kontrolu", Action::RunHealth),
     (
@@ -174,7 +209,31 @@ fn page_actions(page: usize) -> &'static [Action] {
             Action::DropAccount,
             Action::Search,
         ],
-        PROCESSES => &[Action::KillQuery, Action::Search, Action::ToggleLong],
+        PROCESSES => &[
+            Action::ToggleLocks,
+            Action::KillQuery,
+            Action::KillConnection,
+            Action::Search,
+            Action::ToggleLong,
+        ],
+        PERFORMANCE => &[
+            Action::PerformanceReload,
+            Action::ExplainSample,
+            Action::EnableSlowLog,
+            Action::ResetStats,
+            Action::Search,
+        ],
+        REPLICATION => &[
+            Action::ReplicationReload,
+            Action::ReplicaStart,
+            Action::ReplicaStop,
+            Action::PurgeBinlogs,
+        ],
+        CONSOLE => &[
+            Action::ConsoleRun,
+            Action::ConsoleCancel,
+            Action::ConsoleExport,
+        ],
         VARIABLES => &[
             Action::SetVariable,
             Action::VariableToConfig,
@@ -301,6 +360,8 @@ enum Kind {
     Unschedule,
     /// Value of this option in Harbor's option file.
     ConfigValue(String),
+    Console,
+    ConsoleExport,
     ConfigRemove,
     /// Search for the list on this page.
     Search(usize),
@@ -388,6 +449,8 @@ enum Pending {
     Service(ServiceAction, String),
     /// The complete new content of Harbor's option file.
     WriteConfig(Vec<(String, String)>),
+    /// A console statement that writes: (database, SQL).
+    ConsoleWrite(String, String),
 }
 struct Confirmation {
     action: Pending,
@@ -447,7 +510,7 @@ pub struct App {
     picker: Option<PrivilegePicker>,
     confirm: Option<Confirmation>,
     /// One search per page, like the desktop.
-    filters: [String; 10],
+    filters: [String; 13],
     system: bool,
     long: bool,
     key_only: bool,
@@ -464,6 +527,11 @@ pub struct App {
     jobs_finished_seen: usize,
     /// Installed timers; read with the backup list (asks systemctl), not per frame.
     schedules: Vec<schedule::InstalledSchedule>,
+    /// Spojení shows open transactions and locks instead of the process list.
+    locks_view: bool,
+    locks_requested: Option<std::time::Instant>,
+    loaded_performance: Option<u64>,
+    loaded_replication: Option<u64>,
     log_from_file: bool,
     /// 0 = all, 1 = warnings and errors, 2 = errors.
     log_level: u8,
@@ -530,6 +598,10 @@ impl App {
             backups_loaded: false,
             jobs_finished_seen: 0,
             schedules: Vec::new(),
+            locks_view: false,
+            locks_requested: None,
+            loaded_performance: None,
+            loaded_replication: None,
             log_from_file: false,
             log_level: 0,
             quit: false,
@@ -581,6 +653,29 @@ impl App {
             self.loaded_health = Some(generation);
             self.session.request(Operation::Health);
         }
+        if self.page == PERFORMANCE
+            && self.session.performance.is_none()
+            && self.loaded_performance != Some(generation)
+        {
+            self.loaded_performance = Some(generation);
+            self.session.request(Operation::Performance);
+        }
+        if self.page == REPLICATION
+            && self.session.replication.is_none()
+            && self.loaded_replication != Some(generation)
+        {
+            self.loaded_replication = Some(generation);
+            self.session.request(Operation::Replication);
+        }
+        if self.page == PROCESSES
+            && self.locks_view
+            && self
+                .locks_requested
+                .is_none_or(|at| at.elapsed().as_secs() >= self.settings.refresh_seconds.max(2))
+        {
+            self.locks_requested = Some(std::time::Instant::now());
+            self.session.request(Operation::Locks);
+        }
     }
     fn reload_backups(&mut self) {
         self.backups = list_backups(&self.settings.backup_dir());
@@ -625,6 +720,12 @@ impl App {
             }
         } else if self.page == VARIABLES && self.session.host_config.is_none() {
             self.session.host_request(HostRequest::ReadConfig);
+        } else if self.page == PERFORMANCE && self.session.host_slow_log.is_none() {
+            if let Some(Some(StatsSource::SlowLogFile(path))) =
+                self.session.performance.as_ref().map(|p| p.source.clone())
+            {
+                self.session.host_request(HostRequest::SlowLog { path });
+            }
         }
     }
     fn log_lines(&self) -> Vec<&String> {
@@ -731,6 +832,299 @@ impl App {
         entries.push(entry);
         Ok(entries)
     }
+    /// Statement statistics shown on Výkon (database source or the slow log file).
+    fn statements(&self) -> Vec<StatementStat> {
+        match self
+            .session
+            .performance
+            .as_ref()
+            .and_then(|p| p.source.clone())
+        {
+            Some(StatsSource::SlowLogFile(_)) => {
+                self.session.host_slow_log.clone().unwrap_or_default()
+            }
+            _ => self
+                .session
+                .performance
+                .as_ref()
+                .map(|p| p.statements.clone())
+                .unwrap_or_default(),
+        }
+        .into_iter()
+        .filter(|s| matches_filter(&self.filters[PERFORMANCE], &[&s.query, &s.schema]))
+        .collect()
+    }
+    fn transactions(&self) -> Vec<Transaction> {
+        self.session
+            .locks
+            .as_ref()
+            .map(|r| r.transactions.clone())
+            .unwrap_or_default()
+    }
+    /// Rows of Replikace: replication channels first, then binary logs.
+    fn replication_rows(&self) -> Vec<(String, String)> {
+        let Some(r) = &self.session.replication else {
+            return Vec::new();
+        };
+        let mut rows: Vec<(String, String)> = r
+            .channels
+            .iter()
+            .map(|c| {
+                (
+                    format!("channel:{}", c.name),
+                    format!(
+                        "{} Replikace {} z {} • IO {} SQL {} • zpoždění {}",
+                        if c.healthy() { "●" } else { "✗" },
+                        safe_text(&c.label()),
+                        safe_text(&c.master),
+                        safe_text(&c.io_running),
+                        safe_text(&c.sql_running),
+                        c.seconds_behind
+                            .map(|s| format!("{s} s"))
+                            .unwrap_or_else(|| "—".into())
+                    ),
+                )
+            })
+            .collect();
+        rows.extend(r.binlogs.iter().map(|b| {
+            (
+                format!("binlog:{}", b.name),
+                format!(
+                    "  Binlog {:<28} {:>12}",
+                    safe_text(&b.name),
+                    human_bytes(b.bytes)
+                ),
+            )
+        }));
+        rows
+    }
+    fn replication_text(&self) -> String {
+        let Some(r) = &self.session.replication else {
+            return "Načítám…".into();
+        };
+        let mut lines = vec![format!(
+            "server_id {} • read_only {} • binlog {} {} • GTID binlog {} • GTID repliky {}",
+            r.server_id,
+            if r.read_only { "ano" } else { "ne" },
+            if r.log_bin { "ZAP" } else { "VYP" },
+            safe_text(&r.binlog_format),
+            safe_text(&r.gtid_binlog_pos),
+            safe_text(&r.gtid_slave_pos)
+        )];
+        if r.log_bin {
+            lines.push(format!(
+                "Binární logy: {} souborů, {} • automatické mazání {}",
+                r.binlogs.len(),
+                human_bytes(r.binlog_bytes()),
+                if r.expire_seconds > 0.0 {
+                    format!("po {:.1} dnech", r.expire_seconds / 86_400.0)
+                } else {
+                    "VYPNUTÉ".into()
+                }
+            ));
+        }
+        if !r.replicas.is_empty() {
+            lines.push(format!(
+                "Připojené repliky: {}",
+                safe_text(&r.replicas.join(", "))
+            ));
+        }
+        if let Some(g) = &r.galera {
+            lines.push(format!(
+                "Galera {}: uzel {} {} • cluster {} ({} uzlů) • flow control {:.1} %",
+                safe_text(&g.cluster_name),
+                safe_text(&g.node_name),
+                safe_text(&g.local_state),
+                safe_text(&g.cluster_status),
+                g.cluster_size,
+                g.flow_control_paused * 100.0
+            ));
+        }
+        let rows = self.replication_rows();
+        if let Some((key, _)) = rows.get(self.selected) {
+            if let Some(name) = key.strip_prefix("channel:") {
+                if let Some(c) = r.channels.iter().find(|c| c.name == name) {
+                    lines.push(format!("Stav: {}", safe_text(&c.state)));
+                    for error in [&c.last_io_error, &c.last_sql_error] {
+                        if !error.is_empty() {
+                            lines.push(format!("! {}", safe_text(error)));
+                        }
+                    }
+                    lines.push("F10: spustit / zastavit replikaci".into());
+                }
+            } else {
+                lines.push("F10: smazat starší binární logy než vybraný".into());
+            }
+        }
+        lines.extend(r.notes.iter().map(|n| safe_text(n)));
+        lines.join("\n")
+    }
+    fn console_rows(&self) -> Vec<String> {
+        let Some(job) = &self.session.console else {
+            return Vec::new();
+        };
+        match job.result() {
+            None => vec![format!(
+                "Běží {} s… (F10 → zrušit)",
+                job.started.elapsed().as_secs()
+            )],
+            Some(Err(error)) => vec![format!("! {}", safe_text(&error))],
+            Some(Ok(result)) => {
+                if let Some(n) = result.affected {
+                    return vec![format!(
+                        "Provedeno: {n} řádků změněno • {} ms",
+                        result.elapsed_ms
+                    )];
+                }
+                let widths: Vec<usize> = (0..result.columns.len())
+                    .map(|c| {
+                        result
+                            .rows
+                            .iter()
+                            .map(|r| r[c].as_deref().unwrap_or("NULL").chars().count())
+                            .chain([result.columns[c].chars().count()])
+                            .max()
+                            .unwrap_or(4)
+                            .min(30)
+                    })
+                    .collect();
+                let format_row = |values: Vec<&str>| {
+                    values
+                        .iter()
+                        .zip(&widths)
+                        .map(|(v, w)| {
+                            let v: String = safe_text(v).chars().take(*w).collect();
+                            format!("{v:<w$}", w = *w)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" │ ")
+                };
+                let mut rows = vec![format_row(
+                    result.columns.iter().map(String::as_str).collect(),
+                )];
+                rows.extend(result.rows.iter().map(|r| {
+                    format_row(r.iter().map(|v| v.as_deref().unwrap_or("NULL")).collect())
+                }));
+                rows
+            }
+        }
+    }
+    fn console_text(&self) -> String {
+        let Some(job) = &self.session.console else {
+            return "F10 → Konzole: spustit dotaz… (jeden příkaz; čtení v transakci READ ONLY, zápis po potvrzení)".into();
+        };
+        let mut lines = vec![format!("SQL: {}", safe_text(&job.statement))];
+        if let Some(Ok(result)) = job.result() {
+            if result.affected.is_none() {
+                lines.push(format!(
+                    "{} řádků{} • {} ms",
+                    result.rows.len(),
+                    if result.truncated {
+                        " (prvních 1000)"
+                    } else {
+                        ""
+                    },
+                    result.elapsed_ms
+                ));
+                if let Some(row) = self
+                    .selected
+                    .checked_sub(1)
+                    .and_then(|i| result.rows.get(i))
+                {
+                    for (column, value) in result.columns.iter().zip(row) {
+                        lines.push(format!(
+                            "{}: {}",
+                            safe_text(column),
+                            value
+                                .as_deref()
+                                .map(safe_text)
+                                .unwrap_or_else(|| "NULL".into())
+                        ));
+                    }
+                }
+            }
+        }
+        lines.join("\n")
+    }
+    fn performance_hint(&self) -> String {
+        match self.session.performance.as_ref().and_then(|p| p.source.clone()) {
+            Some(StatsSource::Off) => "Server nesbírá statistiky dotazů. F10 → Výkon: zapnout log pomalých dotazů (platí do restartu), nebo trvale performance_schema = ON v konfiguraci.".into(),
+            Some(StatsSource::SlowLogFile(file)) if self.session.host.is_none() => format!(
+                "Slow log je soubor {} na serveru: nastavte v profilu přístup k serveru, nebo log_output = TABLE.",
+                safe_text(&file)
+            ),
+            Some(StatsSource::SlowLogFile(_)) => self
+                .session
+                .host_error
+                .clone()
+                .unwrap_or_else(|| "Čtu slow log ze serveru…".into()),
+            _ => String::new(),
+        }
+    }
+    fn locks_text(&self) -> String {
+        let Some(report) = &self.session.locks else {
+            return String::new();
+        };
+        let mut lines: Vec<String> = report
+            .notes
+            .iter()
+            .map(|n| format!("! {}", safe_text(n)))
+            .collect();
+        if !report.waits.is_empty() {
+            lines.push(format!(
+                "{} dotazů čeká na zámek • kořenové blokující spojení: {} (označené !)",
+                report.waits.len(),
+                report
+                    .root_blockers
+                    .iter()
+                    .map(|t| format!("#{t}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for w in &report.metadata_waits {
+            lines.push(format!(
+                "Čeká na zámek metadat: #{} {} s {}",
+                w.thread,
+                w.seconds,
+                safe_text(&w.query)
+            ));
+        }
+        if let Some(t) = self.transactions().get(self.selected) {
+            lines.push(format!(
+                "#{} {}@{} db {} • {} • {} s • zamčeno {} změněno {} • {}",
+                t.thread,
+                safe_text(&t.user),
+                safe_text(&t.host),
+                safe_text(&t.database),
+                if t.idle() {
+                    "nečinná relace s otevřenou transakcí"
+                } else {
+                    &t.state
+                },
+                t.seconds,
+                t.rows_locked,
+                t.rows_modified,
+                safe_text(&t.isolation)
+            ));
+            for w in report
+                .waits
+                .iter()
+                .filter(|w| w.blocking_thread == t.thread)
+            {
+                lines.push(format!(
+                    "  blokuje #{} ({} s, {} {}): {}",
+                    w.waiting_thread,
+                    w.waiting_seconds,
+                    safe_text(&w.lock_table),
+                    safe_text(&w.lock_mode),
+                    safe_text(&w.waiting_query)
+                ));
+            }
+            lines.push("F10: ukončit dotaz nebo celé spojení".into());
+        }
+        lines.join("\n")
+    }
     fn filter(&self) -> &str {
         &self.filters[self.page]
     }
@@ -746,11 +1140,27 @@ impl App {
                 .iter()
                 .map(|a| RowKey::Account((*a).clone()))
                 .collect(),
+            PROCESSES if self.locks_view => self
+                .transactions()
+                .iter()
+                .map(|t| RowKey::Process(t.thread))
+                .collect(),
             PROCESSES => self
                 .processes()
                 .iter()
                 .map(|p| RowKey::Process(p.id))
                 .collect(),
+            PERFORMANCE => self
+                .statements()
+                .into_iter()
+                .map(|s| RowKey::Variable(s.query))
+                .collect(),
+            REPLICATION => self
+                .replication_rows()
+                .into_iter()
+                .map(|(k, _)| RowKey::Variable(k))
+                .collect(),
+            CONSOLE => (0..self.console_rows().len()).map(RowKey::Log).collect(),
             VARIABLES => self
                 .variables()
                 .iter()
@@ -1009,21 +1419,7 @@ impl App {
         ])
         .split(area);
         frame.render_widget(
-            Paragraph::new(
-                PAGES
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        if i == self.page {
-                            format!("[{name}]")
-                        } else {
-                            name.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            )
-            .style(p.menu),
+            Paragraph::new(page_bar(self.page, rows[0].width as usize)).style(p.menu),
             rows[0],
         );
         let profile = self
@@ -1216,6 +1612,19 @@ impl App {
                         self.session.snapshot.as_ref().map_or(0, |s| s.connections)
                     ),
                 });
+            }
+            Pending::ConsoleWrite(database, sql) => {
+                lines.push(format!(
+                    "Server: {} • databáze {}",
+                    safe_text(profile),
+                    if database.is_empty() {
+                        "—".to_string()
+                    } else {
+                        safe_text(database)
+                    }
+                ));
+                lines.push("Zápisový příkaz se provede tak, jak je napsaný:".into());
+                lines.push(format!("  {}", safe_text(sql)));
             }
             Pending::WriteConfig(entries) => {
                 lines.push(
@@ -1416,6 +1825,52 @@ impl App {
                     )
                 })
                 .collect(),
+            PROCESSES if self.locks_view => {
+                let roots = self
+                    .session
+                    .locks
+                    .as_ref()
+                    .map(|r| r.root_blockers.clone())
+                    .unwrap_or_default();
+                self.transactions()
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{}#{:<7} {:<16} {:<10} {:>5}s zamčeno {:>6} {}",
+                            if roots.contains(&t.thread) { "!" } else { " " },
+                            t.thread,
+                            safe_text(&t.user),
+                            if t.idle() {
+                                "nečinná".to_string()
+                            } else {
+                                safe_text(&t.state)
+                            },
+                            t.seconds,
+                            t.rows_locked,
+                            safe_text(&t.query)
+                        )
+                    })
+                    .collect()
+            }
+            PERFORMANCE => self
+                .statements()
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{:>8.1} s {:>7}× {:>7.0} ms  {}",
+                        s.total_seconds,
+                        s.count,
+                        s.average_ms(),
+                        safe_text(&s.query)
+                    )
+                })
+                .collect(),
+            REPLICATION => self
+                .replication_rows()
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect(),
+            CONSOLE => self.console_rows(),
             PROCESSES => self
                 .processes()
                 .iter()
@@ -1501,6 +1956,20 @@ impl App {
             VARIABLES if self.session.variables.is_none() => Some("Načítám proměnné…"),
             HEALTH if self.session.health.is_none() => Some("Probíhá kontrola…"),
             HEALTH if self.findings().is_empty() => Some("Bez nálezů."),
+            PROCESSES if self.locks_view && self.session.locks.is_none() => {
+                Some("Načítám transakce…")
+            }
+            PROCESSES if self.locks_view && self.transactions().is_empty() => {
+                Some("Žádná otevřená transakce InnoDB.")
+            }
+            PERFORMANCE if self.session.performance.is_none() => Some("Načítám statistiky…"),
+            PERFORMANCE if self.statements().is_empty() => {
+                Some("Žádné statistiky dotazů (viz detail).")
+            }
+            REPLICATION if self.session.replication.is_none() => Some("Načítám…"),
+            CONSOLE if self.session.console.is_none() => {
+                Some("Enter nebo F10 → Konzole: spustit dotaz…")
+            }
             SERVICE if self.session.host.is_none() => {
                 Some("Profil nemá přístup k serveru (F3 → profil → Přístup k serveru).")
             }
@@ -1523,6 +1992,27 @@ impl App {
             },
             BACKUPS => self.backups_text(),
             SERVICE => self.service_text(),
+            REPLICATION => self.replication_text(),
+            CONSOLE => self.console_text(),
+            PERFORMANCE => match self.statements().get(self.selected) {
+                Some(s) => format!(
+                    "{}\nschéma {} • {}× • celkem {:.2} s • průměr {:.1} ms • max {:.2} s • řádky prohledané/vrácené {}/{}{}",
+                    safe_text(&s.query),
+                    safe_text(&s.schema),
+                    s.count,
+                    s.total_seconds,
+                    s.average_ms(),
+                    s.max_seconds,
+                    s.rows_examined,
+                    s.rows_sent,
+                    s.sample
+                        .as_ref()
+                        .map(|x| format!("\nNejpomalejší spuštění: {}", safe_text(x)))
+                        .unwrap_or_default()
+                ),
+                None => self.performance_hint(),
+            },
+            PROCESSES if self.locks_view => self.locks_text(),
             HEALTH => match self.findings().get(self.selected) {
                 Some(f) => format!(
                     "{} • {}\n{}\nDoporučení: {}",
@@ -1987,6 +2477,8 @@ impl App {
                 self.run(Action::Page(c as usize - '1' as usize));
             }
             K::Char('0') if key.modifiers.is_empty() => self.run(Action::Page(SETTINGS)),
+            K::Char(']') => self.run(Action::Page((self.page + 1) % PAGES.len())),
+            K::Char('[') => self.run(Action::Page((self.page + PAGES.len() - 1) % PAGES.len())),
             K::F(3) => self.run(Action::Page(PROFILES)),
             K::F(5) => {
                 self.session.request(Operation::Refresh);
@@ -2065,6 +2557,9 @@ impl App {
                     self.session.request(Operation::Grants(account));
                 }
             }
+            CONSOLE => self.run(Action::ConsoleRun),
+            PERFORMANCE | REPLICATION => self.detail_focus = true,
+            PROCESSES if self.locks_view => self.detail_focus = true,
             PROCESSES => {
                 if let Some(process) = self.processes().get(self.selected) {
                     self.detail = format!(
@@ -2420,6 +2915,188 @@ impl App {
                 self.session.request(Operation::Health);
                 self.page = HEALTH;
             }
+            Action::ToggleLocks => {
+                self.locks_view = !self.locks_view;
+                self.locks_requested = None;
+                self.selected = 0;
+                self.page = PROCESSES;
+            }
+            Action::KillConnection => {
+                let thread = match self.page {
+                    PROCESSES if self.locks_view => {
+                        self.transactions().get(self.selected).map(|t| t.thread)
+                    }
+                    PROCESSES => self.processes().get(self.selected).map(|p| p.id),
+                    _ => None,
+                };
+                let target = thread.and_then(|id| {
+                    self.session
+                        .snapshot
+                        .as_ref()
+                        .and_then(|s| s.processes.iter().find(|p| p.id == id).cloned())
+                });
+                match target {
+                    Some(target) => {
+                        self.confirm =
+                            Some(Confirmation::new(Pending::Server(Change::KillConnection {
+                                target,
+                            })))
+                    }
+                    None => self.say("Spojení vyberte na obrazovce Spojení (4)."),
+                }
+            }
+            Action::PerformanceReload => {
+                self.session.request(Operation::Performance);
+                self.session.host_slow_log = None;
+                self.page = PERFORMANCE;
+            }
+            Action::EnableSlowLog => {
+                match self
+                    .session
+                    .variables
+                    .as_ref()
+                    .and_then(|v| v.iter().find(|v| v.name == "slow_query_log"))
+                    .cloned()
+                {
+                    Some(variable) => {
+                        self.confirm = Some(Confirmation::new(Pending::Server(Change::SetGlobal {
+                            variable,
+                            value: "ON".into(),
+                        })))
+                    }
+                    None => {
+                        self.session.request(Operation::Variables);
+                        self.say("Načítám proměnné serveru; akci zopakujte.");
+                    }
+                }
+            }
+            Action::ResetStats => {
+                if self
+                    .session
+                    .performance
+                    .as_ref()
+                    .is_some_and(|p| p.performance_schema)
+                {
+                    self.confirm = Some(Confirmation::new(Pending::Server(
+                        Change::ResetStatementStats,
+                    )));
+                } else {
+                    self.say("Vynulovat lze jen statistiky performance_schema.");
+                }
+            }
+            Action::ExplainSample => {
+                let stat = (self.page == PERFORMANCE)
+                    .then(|| self.statements().get(self.selected).cloned())
+                    .flatten();
+                match stat.and_then(|s| s.sample.map(|sample| (s.schema, sample))) {
+                    Some((schema, sample)) => {
+                        self.page = CONSOLE;
+                        self.dialog = dialog(
+                            Kind::Console,
+                            vec![
+                                Field::new("Databáze (prázdné = žádná)", &schema),
+                                Field::new("SQL (jeden příkaz)", &format!("EXPLAIN {sample}")),
+                            ],
+                        );
+                    }
+                    None => {
+                        self.say("Vyberte dotaz se vzorkem (jen ze slow logu) na obrazovce Výkon.")
+                    }
+                }
+            }
+            Action::ReplicationReload => {
+                self.session.request(Operation::Replication);
+                self.page = REPLICATION;
+            }
+            Action::ReplicaStart | Action::ReplicaStop => {
+                let key = (self.page == REPLICATION)
+                    .then(|| {
+                        self.replication_rows()
+                            .get(self.selected)
+                            .map(|(k, _)| k.clone())
+                    })
+                    .flatten();
+                match key.as_deref().and_then(|k| k.strip_prefix("channel:")) {
+                    Some(name) => {
+                        self.confirm =
+                            Some(Confirmation::new(Pending::Server(Change::ReplicaControl {
+                                connection: name.to_string(),
+                                start: action == Action::ReplicaStart,
+                            })))
+                    }
+                    None => self.say("Vyberte replikační spojení na obrazovce Replikace."),
+                }
+            }
+            Action::PurgeBinlogs => {
+                let key = (self.page == REPLICATION)
+                    .then(|| {
+                        self.replication_rows()
+                            .get(self.selected)
+                            .map(|(k, _)| k.clone())
+                    })
+                    .flatten();
+                match key.as_deref().and_then(|k| k.strip_prefix("binlog:")) {
+                    Some(name) => {
+                        self.confirm =
+                            Some(Confirmation::new(Pending::Server(Change::PurgeBinlogs {
+                                to: name.to_string(),
+                            })))
+                    }
+                    None => self.say("Vyberte binární log na obrazovce Replikace."),
+                }
+            }
+            Action::ConsoleRun => {
+                let (database, sql) = self
+                    .session
+                    .console
+                    .as_ref()
+                    .map(|c| (String::new(), c.statement.clone()))
+                    .unwrap_or_default();
+                let database = if database.is_empty() {
+                    self.session.tables_for.clone().unwrap_or_default()
+                } else {
+                    database
+                };
+                self.page = CONSOLE;
+                self.dialog = dialog(
+                    Kind::Console,
+                    vec![
+                        Field::new("Databáze (prázdné = žádná)", &database),
+                        Field::new("SQL (jeden příkaz)", &sql),
+                    ],
+                );
+            }
+            Action::ConsoleCancel => match &self.session.console {
+                Some(job) if job.running() => {
+                    job.cancel();
+                    self.say("Ruším dotaz…");
+                }
+                _ => self.say("Žádný dotaz neběží."),
+            },
+            Action::ConsoleExport => {
+                if self
+                    .session
+                    .console
+                    .as_ref()
+                    .and_then(|c| c.result())
+                    .is_some_and(|r| r.is_ok())
+                {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                    let stamp: String = utc_timestamp(std::time::SystemTime::now())
+                        .chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .collect();
+                    self.dialog = dialog(
+                        Kind::ConsoleExport,
+                        vec![Field::new(
+                            "Soubor CSV",
+                            &format!("{home}/harbor-export-{stamp}.csv"),
+                        )],
+                    );
+                } else {
+                    self.say("Nejdřív spusťte dotaz s výsledkem.");
+                }
+            }
             Action::HostRefresh => {
                 self.session.host_status = None;
                 self.session.host_config = None;
@@ -2695,6 +3372,10 @@ impl App {
                     "Adresář konfigurace (prázdné = najít)",
                     &profile.host.config_dir,
                 ),
+                Field::new(
+                    "Jen pro čtení (produkce): ANO / NE",
+                    if profile.read_only { "ANO" } else { "NE" },
+                ),
             ],
             focus: 0,
         });
@@ -2941,6 +3622,7 @@ impl App {
                         },
                         config_dir: v(13),
                     },
+                    read_only: yes_no(v(14), "Jen pro čtení")?,
                     // upsert_profile keeps unknown fields of the stored profile.
                     extra: Default::default(),
                 };
@@ -3139,6 +3821,43 @@ impl App {
                 self.confirm = Some(Confirmation::new(Pending::WriteConfig(entries)));
                 return Ok(Outcome::Suspend);
             }
+            Kind::Console => {
+                let database = v(0);
+                let sql = d.fields[1].value.to_string();
+                match self.session.console(&database, &sql, false)? {
+                    ConsoleKind::Write => {
+                        self.confirm =
+                            Some(Confirmation::new(Pending::ConsoleWrite(database, sql)));
+                        return Ok(Outcome::Suspend);
+                    }
+                    ConsoleKind::Read => {
+                        self.selected = 0;
+                        return Ok(Outcome::Close);
+                    }
+                }
+            }
+            Kind::ConsoleExport => {
+                let result = self
+                    .session
+                    .console
+                    .as_ref()
+                    .and_then(|c| c.result())
+                    .and_then(|r| r.ok())
+                    .ok_or_else(|| Error::Validation("Žádný výsledek k uložení.".into()))?;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let path = v(0);
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(|e| Error::File(format!("{path}: {e}")))?;
+                file.write_all(result.csv().as_bytes())
+                    .map_err(|e| Error::File(format!("{path}: {e}")))?;
+                self.say(format!("Uloženo do {path}."));
+                return Ok(Outcome::Close);
+            }
             Kind::ConfigRemove => {
                 let config = self
                     .session
@@ -3258,6 +3977,13 @@ impl App {
                     Pending::Service(action, _) => {
                         if !self.session.host_request(HostRequest::Control(*action)) {
                             self.say("Na serveru právě běží jiný příkaz.");
+                        }
+                        return;
+                    }
+                    Pending::ConsoleWrite(database, sql) => {
+                        match self.session.console(database, sql, true) {
+                            Ok(_) => self.suspended = None,
+                            Err(error) => self.say(error.to_string()),
                         }
                         return;
                     }
@@ -3444,6 +4170,41 @@ fn table_text(t: &TableDetail) -> String {
     lines.push("DEFINICE".into());
     lines.extend(t.create_sql.lines().map(|l| format!("  {}", safe_text(l))));
     lines.join("\n")
+}
+/// Page names for the top line; scrolls so the current page stays visible.
+fn page_bar(page: usize, width: usize) -> String {
+    let full: Vec<String> = PAGES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            if i == page {
+                format!("[{name}]")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect();
+    let mut start = 0;
+    loop {
+        let shown = full[start..].join(" ");
+        let prefix = if start > 0 { "‹ " } else { "" };
+        let end = full[..=page].join(" ").chars().count();
+        let before = full[..start].join(" ").chars().count();
+        if start >= page || end - before + prefix.len() + 2 <= width {
+            let text = format!("{prefix}{shown}");
+            return if text.chars().count() > width {
+                format!(
+                    "{}›",
+                    text.chars()
+                        .take(width.saturating_sub(1))
+                        .collect::<String>()
+                )
+            } else {
+                text
+            };
+        }
+        start += 1;
+    }
 }
 /// Ctrl+M is not usable: terminals send it as CR, which crossterm reports as Enter.
 /// F9 and Alt+M are alternatives for terminals that capture F10 (e.g. GNOME Terminal).

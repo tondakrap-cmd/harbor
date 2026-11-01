@@ -32,6 +32,15 @@ pub enum Operation {
     Apply(Change),
     /// Backup or restore in the background with its own connection.
     StartJob(JobSpec),
+    Locks,
+    Performance,
+    Replication,
+    /// One console statement (already classified) on its own connection.
+    Console {
+        database: String,
+        statement: String,
+        kind: ConsoleKind,
+    },
 }
 /// Which request a response answers; decides whether a failure means lost connectivity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +56,10 @@ pub enum OperationKind {
     Health,
     Apply,
     StartJob,
+    Locks,
+    Performance,
+    Replication,
+    Console,
 }
 impl Operation {
     pub fn kind(&self) -> OperationKind {
@@ -62,6 +75,10 @@ impl Operation {
             Self::Health => OperationKind::Health,
             Self::Apply(_) => OperationKind::Apply,
             Self::StartJob(_) => OperationKind::StartJob,
+            Self::Locks => OperationKind::Locks,
+            Self::Performance => OperationKind::Performance,
+            Self::Replication => OperationKind::Replication,
+            Self::Console { .. } => OperationKind::Console,
         }
     }
 }
@@ -76,6 +93,10 @@ pub enum Response {
     /// Server messages of the change (maintenance output); usually empty.
     Changed(Vec<String>),
     JobStarted(Job),
+    Locks(LockReport),
+    Performance(Performance),
+    Replication(Replication),
+    ConsoleStarted(ConsoleJob),
     Disconnected,
 }
 /// Reads must finish quickly; table maintenance (OPTIMIZE of a large table) may not.
@@ -253,6 +274,26 @@ async fn execute(backend: &mut Option<Backend>, operation: Operation) -> Result<
                 Operation::Variables => Ok(Response::Variables(backend.variables().await?)),
                 Operation::Health => Ok(Response::Health(backend.health().await?)),
                 Operation::Apply(change) => Ok(Response::Changed(backend.apply(change).await?)),
+                Operation::Locks => Ok(Response::Locks(backend.locks().await?)),
+                Operation::Performance => Ok(Response::Performance(backend.performance().await?)),
+                Operation::Replication => Ok(Response::Replication(backend.replication().await?)),
+                Operation::Console {
+                    database,
+                    statement,
+                    kind,
+                } => {
+                    if kind == ConsoleKind::Write && backend.job_options().is_none() {
+                        return Err(Error::Unsupported(
+                            "Demo zápisové příkazy konzole neprovádí.".into(),
+                        ));
+                    }
+                    Ok(Response::ConsoleStarted(crate::console::spawn(
+                        backend.job_options(),
+                        database,
+                        statement,
+                        kind,
+                    )))
+                }
                 Operation::StartJob(spec) => {
                     if spec.needs_server() && backend.job_options().is_none() {
                         return Err(Error::Unsupported(
@@ -303,6 +344,15 @@ pub struct Session {
     pub host_error: Option<String>,
     /// Result of the last service action or configuration write.
     pub host_message: Option<String>,
+    /// Statement statistics aggregated from the slow log file (read via host access).
+    pub host_slow_log: Option<Vec<StatementStat>>,
+    pub locks: Option<LockReport>,
+    pub performance: Option<Performance>,
+    pub replication: Option<Replication>,
+    /// The last console statement and its (pending) result.
+    pub console: Option<ConsoleJob>,
+    /// Console statements of this session, newest last (memory only).
+    pub console_history: Vec<String>,
     /// Read-only for UIs; set through the session so `error_at` stays in sync.
     pub error: Option<String>,
     pub error_at: Instant,
@@ -343,6 +393,12 @@ impl Default for Session {
             host_config: None,
             host_error: None,
             host_message: None,
+            host_slow_log: None,
+            locks: None,
+            performance: None,
+            replication: None,
+            console: None,
+            console_history: Vec::new(),
             error: None,
             error_at: Instant::now(),
             test_result: None,
@@ -375,9 +431,66 @@ impl Session {
         self.host_config = None;
         self.host_error = None;
         self.host_message = None;
+        self.host_slow_log = None;
+        self.locks = None;
+        self.performance = None;
+        self.replication = None;
+        self.console = None;
+    }
+    /// True when the connected profile forbids changes (production safety).
+    pub fn read_only(&self) -> bool {
+        self.profile.as_ref().is_some_and(|p| p.read_only)
+    }
+    /// Runs one console statement. Writes need `allow_write` (the UI confirmed) and a
+    /// profile that is not read-only.
+    pub fn console(&mut self, database: &str, sql: &str, allow_write: bool) -> Result<ConsoleKind> {
+        let (statement, kind) = console_statement(sql)?;
+        if kind == ConsoleKind::Write {
+            if self.read_only() {
+                return Err(Error::Validation(
+                    "Profil je jen pro čtení; zápisové příkazy jsou zakázané.".into(),
+                ));
+            }
+            if !allow_write {
+                return Ok(kind);
+            }
+        }
+        if self.console.as_ref().is_some_and(ConsoleJob::running) {
+            return Err(Error::Validation("Předchozí dotaz ještě běží.".into()));
+        }
+        if !database.is_empty() {
+            identifier(database)?;
+        }
+        if self.console_history.last() != Some(&statement) {
+            self.console_history.push(statement.clone());
+            if self.console_history.len() > 50 {
+                self.console_history.remove(0);
+            }
+        }
+        if self.request(Operation::Console {
+            database: database.to_string(),
+            statement,
+            kind,
+        }) {
+            Ok(kind)
+        } else {
+            Err(Error::Validation(
+                "Jiná operace právě běží; zkuste to za chvíli.".into(),
+            ))
+        }
     }
     /// Sends a host command; false while another one runs or without host access.
     pub fn host_request(&mut self, request: HostRequest) -> bool {
+        if self.read_only()
+            && matches!(
+                request,
+                HostRequest::Control(_) | HostRequest::WriteConfig { .. }
+            )
+        {
+            self.host_error =
+                Some("Profil je jen pro čtení; akce na serveru jsou zakázané.".into());
+            return false;
+        }
         match &mut self.host {
             Some(host) => {
                 if host.send(request) {
@@ -466,6 +579,17 @@ impl Session {
         if !self.error_is_connectivity {
             self.error = None;
         }
+        let writes = matches!(
+            &operation,
+            Operation::Apply(_) | Operation::StartJob(JobSpec::Restore(_))
+        );
+        if writes && self.read_only() {
+            self.set_error(
+                "Profil je jen pro čtení: změny, obnova a zápisy jsou zakázané (vypněte v Připojení).".into(),
+                false,
+            );
+            return false;
+        }
         let kind = operation.kind();
         match &operation {
             Operation::Tables(database) => {
@@ -484,6 +608,7 @@ impl Session {
         let queueable = !matches!(
             kind,
             OperationKind::Apply
+                | OperationKind::Console
                 | OperationKind::StartJob
                 | OperationKind::Connect
                 | OperationKind::Disconnect
@@ -647,6 +772,9 @@ impl Session {
                             .clone()
                             .map(|(database, table)| Operation::Table { database, table }),
                         self.variables.is_some().then_some(Operation::Variables),
+                        self.locks.is_some().then_some(Operation::Locks),
+                        self.replication.is_some().then_some(Operation::Replication),
+                        self.performance.is_some().then_some(Operation::Performance),
                     ]
                     .into_iter()
                     .flatten()
@@ -655,6 +783,10 @@ impl Session {
                         self.enqueue(reload);
                     }
                 }
+                Ok(Response::Locks(report)) => self.locks = Some(report),
+                Ok(Response::Performance(performance)) => self.performance = Some(performance),
+                Ok(Response::Replication(replication)) => self.replication = Some(replication),
+                Ok(Response::ConsoleStarted(job)) => self.console = Some(job),
                 Ok(Response::JobStarted(job)) => {
                     self.status = format!("Spuštěno: {}", job.title);
                     self.jobs.push(job);
@@ -668,6 +800,7 @@ impl Session {
             Some(Ok(HostResponse::Status(status))) => self.host_status = Some(status),
             Some(Ok(HostResponse::Logs(lines))) => self.host_logs = Some(lines),
             Some(Ok(HostResponse::Config(config))) => self.host_config = Some(config),
+            Some(Ok(HostResponse::SlowLog(stats))) => self.host_slow_log = Some(stats),
             Some(Ok(HostResponse::Controlled(message))) => {
                 self.host_message = Some(message);
                 // The service changed: refresh its state and reconnect the monitoring.

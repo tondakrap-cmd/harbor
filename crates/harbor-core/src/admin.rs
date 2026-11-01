@@ -779,6 +779,9 @@ pub struct HealthFacts {
     pub have_ssl: Option<String>,
     pub uptime: u64,
     pub version: String,
+    /// Replication channels of this server (empty when it is no replica).
+    pub replicas: Vec<ReplicaChannel>,
+    pub galera: Option<Galera>,
 }
 fn list(items: &[String]) -> String {
     let shown: Vec<&str> = items.iter().take(8).map(String::as_str).collect();
@@ -975,6 +978,65 @@ pub fn evaluate_health(f: &HealthFacts) -> Vec<Finding> {
             ),
             "Kontrolu zopakujte po delším provozu.",
         );
+    }
+    for channel in &f.replicas {
+        if !channel.healthy() {
+            let error = [&channel.last_io_error, &channel.last_sql_error]
+                .into_iter()
+                .filter(|e| !e.is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" | ");
+            add(
+                Severity::Critical,
+                "Replikace neběží",
+                format!(
+                    "Spojení {} z {}: IO {}, SQL {}{}",
+                    channel.label(),
+                    channel.master,
+                    channel.io_running,
+                    channel.sql_running,
+                    if error.is_empty() { String::new() } else { format!(" • {error}") }
+                ),
+                "Obrazovka Replikace: opravte příčinu chyby a replikaci spusťte; při chybě SQL zvažte přeskočení transakce jen po pečlivé kontrole.",
+            );
+        } else if channel.seconds_behind.is_some_and(|s| s > 300) {
+            add(
+                Severity::Warning,
+                "Replika se zpožďuje",
+                format!(
+                    "Spojení {} je {} s za primárním serverem.",
+                    channel.label(),
+                    channel.seconds_behind.unwrap_or(0)
+                ),
+                "Zkontrolujte zatížení repliky (disk, dlouhé dotazy) a velké transakce na primárním serveru.",
+            );
+        }
+    }
+    if let Some(galera) = &f.galera {
+        if galera.cluster_status != "Primary" {
+            add(
+                Severity::Critical,
+                "Uzel Galery není v primární komponentě",
+                format!("wsrep_cluster_status = {}; uzel nepřijímá zápisy.", galera.cluster_status),
+                "Zkontrolujte síť mezi uzly a stav ostatních uzlů; při úplném výpadku je nutný bootstrap nejnovějšího uzlu.",
+            );
+        } else if galera.local_state != "Synced" {
+            add(
+                Severity::Warning,
+                "Uzel Galery není synchronizovaný",
+                format!("Stav uzlu: {}.", galera.local_state),
+                "Počkejte na dokončení synchronizace (IST/SST); pokud trvá dlouho, zkontrolujte log.",
+            );
+        }
+        if galera.flow_control_paused > 0.1 {
+            add(
+                Severity::Warning,
+                "Galera brzdí zápisy (flow control)",
+                format!("Cluster byl {:.0} % času pozastaven řízením toku.", galera.flow_control_paused * 100.0),
+                "Nejpomalejší uzel nestíhá aplikovat změny; zkontrolujte jeho disk a wsrep_slave_threads.",
+            );
+        }
     }
     if !skipped.is_empty() {
         add(

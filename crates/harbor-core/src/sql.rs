@@ -185,6 +185,28 @@ pub(crate) fn statement(change: &Change, reveal: bool) -> Result<Zeroizing<Strin
             identifier(database)?,
             identifier(table)?
         ),
+        Change::KillConnection { target } => {
+            if target.id == 0 {
+                return Err(Error::Validation("Neplatné spojení.".into()));
+            }
+            format!("KILL CONNECTION {}", target.id)
+        }
+        Change::ReplicaControl { connection, start } => {
+            validate_connection_name(connection)?;
+            let verb = if *start { "START" } else { "STOP" };
+            if connection.is_empty() {
+                format!("{verb} SLAVE")
+            } else {
+                format!("{verb} SLAVE {}", quoted(connection))
+            }
+        }
+        Change::PurgeBinlogs { to } => {
+            validate_binlog_name(to)?;
+            format!("PURGE BINARY LOGS TO {}", quoted(to))
+        }
+        Change::ResetStatementStats => {
+            "TRUNCATE TABLE performance_schema.events_statements_summary_by_digest".into()
+        }
         Change::KillQuery { target } => {
             if target.query_id == 0 {
                 return Err(Error::Validation("Dotaz už neběží.".into()));

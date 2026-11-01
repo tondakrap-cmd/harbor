@@ -749,7 +749,288 @@ impl Backend {
                 .map(|(.., bytes, _)| *bytes)
                 .sum(),
         );
+        if let Ok(replication) = self.replication().await {
+            facts.replicas = replication.channels;
+            facts.galera = replication.galera;
+        }
         Ok(evaluate_health(&facts))
+    }
+    /// Open InnoDB transactions, lock waits and metadata lock waits.
+    pub async fn locks(&self) -> Result<LockReport> {
+        let pool = match &self.inner {
+            Kind::Demo(_) => return Ok(demo_locks()),
+            Kind::MariaDb(Server { pool, .. }) => pool,
+        };
+        let mut report = LockReport::default();
+        match sqlx::query(
+            "SELECT CAST(t.trx_mysql_thread_id AS UNSIGNED) AS thread, t.trx_state AS state, \
+             CAST(GREATEST(TIMESTAMPDIFF(SECOND, t.trx_started, NOW()), 0) AS UNSIGNED) AS seconds, \
+             CAST(t.trx_rows_locked AS UNSIGNED) AS rows_locked, CAST(t.trx_rows_modified AS UNSIGNED) AS rows_modified, \
+             CAST(t.trx_tables_locked AS UNSIGNED) AS tables_locked, CAST(COALESCE(t.trx_isolation_level,'') AS CHAR(32)) AS isolation, \
+             COALESCE(t.trx_query,'') AS query, COALESCE(p.USER,'') AS user, COALESCE(p.HOST,'') AS host, \
+             COALESCE(p.DB,'') AS db, COALESCE(p.COMMAND,'') AS command \
+             FROM information_schema.INNODB_TRX t LEFT JOIN information_schema.PROCESSLIST p ON p.ID = t.trx_mysql_thread_id \
+             ORDER BY t.trx_started",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => {
+                for r in rows {
+                    report.transactions.push(Transaction {
+                        thread: r.try_get("thread")?,
+                        state: r.try_get("state")?,
+                        seconds: r.try_get("seconds")?,
+                        rows_locked: r.try_get("rows_locked")?,
+                        rows_modified: r.try_get("rows_modified")?,
+                        tables_locked: r.try_get("tables_locked")?,
+                        isolation: r.try_get("isolation")?,
+                        query: r.try_get("query")?,
+                        user: r.try_get("user")?,
+                        host: r.try_get("host")?,
+                        database: r.try_get("db")?,
+                        command: r.try_get("command")?,
+                    });
+                }
+            }
+            Err(error) => report.notes.push(format!(
+                "Transakce nelze číst ({}); potřebné je právo PROCESS.",
+                Error::from(error)
+            )),
+        }
+        if let Ok(rows) = sqlx::query(
+            "SELECT CAST(r.trx_mysql_thread_id AS UNSIGNED) AS waiting_thread, COALESCE(r.trx_query,'') AS waiting_query, \
+             CAST(GREATEST(TIMESTAMPDIFF(SECOND, r.trx_wait_started, NOW()), 0) AS UNSIGNED) AS waiting_seconds, \
+             CAST(b.trx_mysql_thread_id AS UNSIGNED) AS blocking_thread, COALESCE(b.trx_query,'') AS blocking_query, \
+             COALESCE(l.lock_table,'') AS lock_table, COALESCE(l.lock_mode,'') AS lock_mode \
+             FROM information_schema.INNODB_LOCK_WAITS w \
+             JOIN information_schema.INNODB_TRX r ON r.trx_id = w.requesting_trx_id \
+             JOIN information_schema.INNODB_TRX b ON b.trx_id = w.blocking_trx_id \
+             LEFT JOIN information_schema.INNODB_LOCKS l ON l.lock_id = w.requested_lock_id \
+             ORDER BY waiting_seconds DESC",
+        )
+        .fetch_all(pool)
+        .await
+        {
+            for r in rows {
+                report.waits.push(LockWait {
+                    waiting_thread: r.try_get("waiting_thread")?,
+                    waiting_query: r.try_get("waiting_query")?,
+                    waiting_seconds: r.try_get("waiting_seconds")?,
+                    blocking_thread: r.try_get("blocking_thread")?,
+                    blocking_query: r.try_get("blocking_query")?,
+                    lock_table: r.try_get("lock_table")?,
+                    lock_mode: r.try_get("lock_mode")?,
+                });
+            }
+        }
+        report.root_blockers = root_blockers(&report.waits);
+        for r in sqlx::query(
+            "SELECT CAST(ID AS UNSIGNED) AS thread, CAST(TIME AS UNSIGNED) AS seconds, COALESCE(DB,'') AS db, COALESCE(INFO,'') AS query \
+             FROM information_schema.PROCESSLIST WHERE STATE LIKE 'Waiting for table metadata lock%' ORDER BY TIME DESC",
+        )
+        .fetch_all(pool)
+        .await?
+        {
+            report.metadata_waits.push(MetadataWait {
+                thread: r.try_get("thread")?,
+                seconds: r.try_get("seconds")?,
+                database: r.try_get("db")?,
+                query: r.try_get("query")?,
+            });
+        }
+        Ok(report)
+    }
+    /// Statement statistics from performance_schema or mysql.slow_log; for a slow log
+    /// file the source is returned and the file is read through host access.
+    pub async fn performance(&self) -> Result<Performance> {
+        let pool = match &self.inner {
+            Kind::Demo(_) => return Ok(demo_performance()),
+            Kind::MariaDb(Server { pool, .. }) => pool,
+        };
+        let (ps, slow, long, output, file): (i64, i64, f64, String, String) = sqlx::query_as(
+            "SELECT CAST(@@GLOBAL.performance_schema AS SIGNED), CAST(@@GLOBAL.slow_query_log AS SIGNED), CAST(@@GLOBAL.long_query_time AS DOUBLE), \
+             CONVERT(@@GLOBAL.log_output USING utf8mb4), CONVERT(@@GLOBAL.slow_query_log_file USING utf8mb4)",
+        )
+        .fetch_one(pool)
+        .await?;
+        let mut performance = Performance {
+            performance_schema: ps == 1,
+            slow_query_log: slow == 1,
+            long_query_time: long,
+            log_output: output.clone(),
+            slow_log_file: file.clone(),
+            ..Default::default()
+        };
+        if performance.performance_schema {
+            performance.source = Some(StatsSource::PerformanceSchema);
+            performance.statements = sqlx::query(
+                "SELECT COALESCE(DIGEST_TEXT,'') AS query, COALESCE(SCHEMA_NAME,'') AS schema_name, \
+                 CAST(COUNT_STAR AS UNSIGNED) AS count, CAST(SUM_TIMER_WAIT / 1e12 AS DOUBLE) AS total, \
+                 CAST(MAX_TIMER_WAIT / 1e12 AS DOUBLE) AS max_seconds, CAST(SUM_ROWS_EXAMINED AS UNSIGNED) AS examined, \
+                 CAST(SUM_ROWS_SENT AS UNSIGNED) AS sent, CAST(SUM_NO_INDEX_USED AS UNSIGNED) AS no_index, \
+                 COALESCE(CAST(LAST_SEEN AS CHAR),'') AS last_seen \
+                 FROM performance_schema.events_statements_summary_by_digest ORDER BY SUM_TIMER_WAIT DESC LIMIT 200",
+            )
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .map(|r| {
+                Ok(StatementStat {
+                    query: r.try_get("query")?,
+                    schema: r.try_get("schema_name")?,
+                    count: r.try_get("count")?,
+                    total_seconds: r.try_get("total")?,
+                    max_seconds: r.try_get("max_seconds")?,
+                    rows_examined: r.try_get("examined")?,
+                    rows_sent: r.try_get("sent")?,
+                    no_index: r.try_get("no_index")?,
+                    last_seen: r.try_get("last_seen")?,
+                    sample: None,
+                })
+            })
+            .collect::<std::result::Result<_, sqlx::Error>>()?;
+        } else if performance.slow_query_log && output.to_ascii_uppercase().contains("TABLE") {
+            performance.source = Some(StatsSource::SlowLogTable);
+            let rows: Vec<(String, f64, u64, u64, String, String)> = sqlx::query_as(
+                "SELECT CAST(start_time AS CHAR), CAST(TIME_TO_SEC(query_time) + MICROSECOND(query_time) / 1e6 AS DOUBLE), \
+                 CAST(rows_sent AS UNSIGNED), CAST(rows_examined AS UNSIGNED), CONVERT(db USING utf8mb4), CONVERT(sql_text USING utf8mb4) \
+                 FROM mysql.slow_log ORDER BY start_time DESC LIMIT 20000",
+            )
+            .fetch_all(pool)
+            .await?;
+            performance.statements = aggregate_slow_rows(&rows);
+        } else if performance.slow_query_log {
+            performance.source = Some(StatsSource::SlowLogFile(file));
+        } else {
+            performance.source = Some(StatsSource::Off);
+        }
+        Ok(performance)
+    }
+    /// Replication channels, primary state, binary logs and Galera.
+    pub async fn replication(&self) -> Result<Replication> {
+        let pool = match &self.inner {
+            Kind::Demo(_) => return Ok(demo_replication()),
+            Kind::MariaDb(Server { pool, .. }) => pool,
+        };
+        let (server_id, read_only, log_bin, format, binlog_pos, slave_pos): (u64, i64, i64, String, String, String) =
+            sqlx::query_as(
+                "SELECT CAST(@@server_id AS UNSIGNED), CAST(@@read_only AS SIGNED), CAST(@@log_bin AS SIGNED), \
+                 CONVERT(@@GLOBAL.binlog_format USING utf8mb4), CONVERT(@@gtid_binlog_pos USING utf8mb4), CONVERT(@@gtid_slave_pos USING utf8mb4)",
+            )
+            .fetch_one(pool)
+            .await?;
+        let mut replication = Replication {
+            server_id,
+            read_only: read_only == 1,
+            log_bin: log_bin == 1,
+            binlog_format: format,
+            gtid_binlog_pos: binlog_pos,
+            gtid_slave_pos: slave_pos,
+            ..Default::default()
+        };
+        let expire: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT VARIABLE_NAME, GLOBAL_VALUE FROM information_schema.SYSTEM_VARIABLES WHERE VARIABLE_NAME IN ('BINLOG_EXPIRE_LOGS_SECONDS','EXPIRE_LOGS_DAYS')",
+        )
+        .fetch_all(pool)
+        .await?;
+        let value = |name: &str| {
+            expire
+                .iter()
+                .find(|(n, _)| n == name)
+                .and_then(|(_, v)| v.as_deref())
+                .and_then(|v| v.parse::<f64>().ok())
+        };
+        replication.expire_seconds = value("BINLOG_EXPIRE_LOGS_SECONDS")
+            .or_else(|| value("EXPIRE_LOGS_DAYS").map(|d| d * 86_400.0))
+            .unwrap_or(0.0);
+        match sqlx::raw_sql("SHOW ALL SLAVES STATUS").fetch_all(pool).await {
+            Ok(rows) => {
+                for row in rows {
+                    let col = |name: &str| named(&row, name);
+                    replication.channels.push(ReplicaChannel {
+                        name: col("Connection_name"),
+                        master: format!("{}:{}", col("Master_Host"), col("Master_Port")),
+                        io_running: col("Slave_IO_Running"),
+                        sql_running: col("Slave_SQL_Running"),
+                        seconds_behind: col("Seconds_Behind_Master").parse().ok(),
+                        using_gtid: col("Using_Gtid"),
+                        gtid_io_pos: col("Gtid_IO_Pos"),
+                        last_io_error: col("Last_IO_Error"),
+                        last_sql_error: col("Last_SQL_Error"),
+                        relay_log_space: col("Relay_Log_Space").parse().unwrap_or(0),
+                        state: col("Slave_SQL_Running_State"),
+                    });
+                }
+            }
+            Err(error) => replication.notes.push(format!(
+                "Stav replik nelze číst ({}); potřebné je právo REPLICATION CLIENT / SLAVE MONITOR.",
+                Error::from(error)
+            )),
+        }
+        if replication.log_bin {
+            match sqlx::raw_sql("SHOW BINARY LOGS").fetch_all(pool).await {
+                Ok(rows) => {
+                    for row in rows {
+                        replication.binlogs.push(BinaryLog {
+                            name: named(&row, "Log_name"),
+                            bytes: named(&row, "File_size").parse().unwrap_or(0),
+                        });
+                    }
+                }
+                Err(error) => replication.notes.push(format!(
+                    "Binární logy nelze vypsat ({}).",
+                    Error::from(error)
+                )),
+            }
+            if let Ok(rows) = sqlx::raw_sql("SHOW SLAVE HOSTS").fetch_all(pool).await {
+                for row in rows {
+                    replication.replicas.push(format!(
+                        "server_id {} • {}:{}",
+                        named(&row, "Server_id"),
+                        named(&row, "Host"),
+                        named(&row, "Port")
+                    ));
+                }
+            }
+        }
+        let wsrep: HashMap<String, String> = sqlx::query_as::<_, (String, String)>(
+            "SELECT VARIABLE_NAME, VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME IN \
+             ('WSREP_ON','WSREP_CLUSTER_SIZE','WSREP_CLUSTER_STATUS','WSREP_LOCAL_STATE_COMMENT','WSREP_READY','WSREP_CONNECTED','WSREP_FLOW_CONTROL_PAUSED','WSREP_LOCAL_RECV_QUEUE_AVG')",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+        let galera_on: Option<String> = sqlx::query_scalar(
+            "SELECT GLOBAL_VALUE FROM information_schema.SYSTEM_VARIABLES WHERE VARIABLE_NAME='WSREP_ON'",
+        )
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+        if galera_on.as_deref() == Some("ON") {
+            let names: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT VARIABLE_NAME, GLOBAL_VALUE FROM information_schema.SYSTEM_VARIABLES WHERE VARIABLE_NAME IN ('WSREP_CLUSTER_NAME','WSREP_NODE_NAME')",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            let var = |n: &str| {
+                names
+                    .iter()
+                    .find(|(k, _)| k == n)
+                    .and_then(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            };
+            replication.galera = Some(galera_from_status(
+                &wsrep,
+                var("WSREP_CLUSTER_NAME"),
+                var("WSREP_NODE_NAME"),
+            ));
+        }
+        Ok(replication)
     }
     /// Runs a confirmed change. Returns the server's messages (maintenance output).
     pub async fn apply(&mut self, change: Change) -> Result<Vec<String>> {
@@ -821,6 +1102,36 @@ impl Backend {
                     ));
                 }
             }
+            Change::KillConnection { target } => {
+                let current = processes(pool)
+                    .await?
+                    .into_iter()
+                    .find(|p| p.id == target.id)
+                    .ok_or_else(|| Error::Validation("Spojení už neexistuje.".into()))?;
+                if current.user != target.user || current.host != target.host {
+                    return Err(Error::Validation(
+                        "Pod tímto číslem je teď jiné spojení; nic nebylo ukončeno.".into(),
+                    ));
+                }
+            }
+            Change::PurgeBinlogs { to } => {
+                let logs: Vec<String> = sqlx::raw_sql("SHOW BINARY LOGS")
+                    .fetch_all(pool)
+                    .await?
+                    .iter()
+                    .map(|r| named(r, "Log_name"))
+                    .collect();
+                if !logs.contains(to) {
+                    return Err(Error::Validation(
+                        "Takový binární log na serveru není.".into(),
+                    ));
+                }
+                if logs.first() == Some(to) {
+                    return Err(Error::Validation(
+                        "To je nejstarší log; není co mazat.".into(),
+                    ));
+                }
+            }
             Change::KillQuery { target } => {
                 let current = processes(pool)
                     .await?
@@ -845,6 +1156,15 @@ impl Backend {
         }
         let statement = sql::statement(&change, true)?;
         let kill = matches!(change, Change::KillQuery { .. });
+        let oldest_before = if matches!(change, Change::PurgeBinlogs { .. }) {
+            sqlx::raw_sql("SHOW BINARY LOGS")
+                .fetch_all(pool)
+                .await?
+                .first()
+                .map(|r| named(r, "Log_name"))
+        } else {
+            None
+        };
         // Text protocol: DDL must not be prepared and kept in sqlx's per-connection
         // statement cache (keyed by the SQL text) or as an open statement on the server.
         let result = if matches!(change, Change::Maintenance { .. }) {
@@ -870,9 +1190,29 @@ impl Backend {
                 .map(|_| Vec::new())
         };
         match result {
-            Ok(output) => {
+            Ok(mut output) => {
                 // Our own write can change counts and sizes: measure on the next snapshot.
                 server.sizes = None;
+                if let Change::PurgeBinlogs { to } = &change {
+                    // The server silently keeps logs a connected replica still reads.
+                    let first = sqlx::raw_sql("SHOW BINARY LOGS")
+                        .fetch_all(pool)
+                        .await?
+                        .first()
+                        .map(|r| named(r, "Log_name"))
+                        .unwrap_or_default();
+                    output.push(if &first == to {
+                        format!("Smazány binární logy starší než {to}.")
+                    } else if Some(&first) == oldest_before.as_ref() {
+                        format!(
+                            "Nic nebylo smazáno: log {first} ještě čte připojená replika."
+                        )
+                    } else {
+                        format!(
+                            "Server smazal jen logy starší než {first}: novější ještě čte připojená replika."
+                        )
+                    });
+                }
                 Ok(output)
             }
             // ER_NO_SUCH_QUERY: the statement finished between the check and KILL.
@@ -970,6 +1310,165 @@ fn variable_from_row(r: &sqlx::mysql::MySqlRow) -> std::result::Result<Variable,
     })
 }
 
+/// A column of a SHOW result by name, as text (types differ between versions).
+fn named(row: &sqlx::mysql::MySqlRow, name: &str) -> String {
+    use sqlx::Column;
+    let Some(index) = row.columns().iter().position(|c| c.name() == name) else {
+        return String::new();
+    };
+    if let Ok(Some(text)) = row.try_get_unchecked::<Option<String>, _>(index) {
+        return text;
+    }
+    row.try_get_unchecked::<Option<Vec<u8>>, _>(index)
+        .ok()
+        .flatten()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+pub(crate) fn galera_from_status(
+    status: &HashMap<String, String>,
+    cluster: String,
+    node: String,
+) -> Galera {
+    let get = |k: &str| status.get(k).cloned().unwrap_or_default();
+    Galera {
+        cluster_name: cluster,
+        node_name: node,
+        cluster_size: get("WSREP_CLUSTER_SIZE").parse().unwrap_or(0),
+        cluster_status: get("WSREP_CLUSTER_STATUS"),
+        local_state: get("WSREP_LOCAL_STATE_COMMENT"),
+        ready: get("WSREP_READY") == "ON",
+        connected: get("WSREP_CONNECTED") == "ON",
+        flow_control_paused: get("WSREP_FLOW_CONTROL_PAUSED").parse().unwrap_or(0.0),
+        recv_queue_avg: get("WSREP_LOCAL_RECV_QUEUE_AVG").parse().unwrap_or(0.0),
+    }
+}
+fn demo_locks() -> LockReport {
+    let waits = vec![LockWait {
+        waiting_thread: 1871,
+        waiting_query: "UPDATE stock SET n = n - 1 WHERE id = 5 (demo)".into(),
+        waiting_seconds: 38,
+        blocking_thread: 1842,
+        blocking_query: String::new(),
+        lock_table: "`commerce`.`stock`".into(),
+        lock_mode: "X".into(),
+    }];
+    LockReport {
+        transactions: vec![
+            Transaction {
+                thread: 1842,
+                state: "RUNNING".into(),
+                seconds: 312,
+                rows_locked: 1,
+                rows_modified: 1,
+                tables_locked: 1,
+                isolation: "REPEATABLE READ".into(),
+                user: "commerce_app".into(),
+                host: "demo:5001".into(),
+                database: "commerce".into(),
+                command: "Sleep".into(),
+                ..Default::default()
+            },
+            Transaction {
+                thread: 1871,
+                state: "LOCK WAIT".into(),
+                seconds: 38,
+                rows_locked: 0,
+                isolation: "REPEATABLE READ".into(),
+                query: "UPDATE stock SET n = n - 1 WHERE id = 5 (demo)".into(),
+                user: "commerce_app".into(),
+                host: "demo:5002".into(),
+                database: "commerce".into(),
+                command: "Query".into(),
+                ..Default::default()
+            },
+        ],
+        root_blockers: root_blockers(&waits),
+        waits,
+        metadata_waits: vec![],
+        notes: vec![],
+    }
+}
+fn demo_performance() -> Performance {
+    let stat = |query: &str, count, total, max, examined| StatementStat {
+        query: query.into(),
+        schema: "commerce".into(),
+        count,
+        total_seconds: total,
+        max_seconds: max,
+        rows_examined: examined,
+        rows_sent: count * 10,
+        sample: Some(query.replace('?', "42")),
+        last_seen: "2026-11-01 09:12:00".into(),
+        ..Default::default()
+    };
+    Performance {
+        source: Some(StatsSource::SlowLogTable),
+        statements: vec![
+            stat(
+                "SELECT * FROM orders WHERE customer_id = ? ORDER BY created_at DESC",
+                1840,
+                2210.5,
+                9.8,
+                92_000_000,
+            ),
+            stat(
+                "SELECT COUNT(*) FROM audit_log WHERE created_at > ?",
+                96,
+                410.2,
+                12.1,
+                8_400_000_000,
+            ),
+            stat(
+                "UPDATE stock SET n = n - ? WHERE id = ?",
+                22_000,
+                120.0,
+                38.0,
+                22_000,
+            ),
+        ],
+        performance_schema: false,
+        slow_query_log: true,
+        long_query_time: 1.0,
+        log_output: "TABLE".into(),
+        slow_log_file: String::new(),
+    }
+}
+fn demo_replication() -> Replication {
+    Replication {
+        server_id: 2,
+        read_only: true,
+        log_bin: true,
+        binlog_format: "ROW".into(),
+        gtid_binlog_pos: "0-1-48211".into(),
+        gtid_slave_pos: "0-1-48211".into(),
+        expire_seconds: 7.0 * 86_400.0,
+        channels: vec![ReplicaChannel {
+            name: String::new(),
+            master: "db-primary.demo:3306".into(),
+            io_running: "Yes".into(),
+            sql_running: "Yes".into(),
+            seconds_behind: Some(3),
+            using_gtid: "Slave_Pos".into(),
+            gtid_io_pos: "0-1-48211".into(),
+            state: "Slave has read all relay log; waiting for more updates".into(),
+            ..Default::default()
+        }],
+        replicas: vec![],
+        binlogs: vec![
+            BinaryLog {
+                name: "mariadb-bin.000041".into(),
+                bytes: 1_073_741_824,
+            },
+            BinaryLog {
+                name: "mariadb-bin.000042".into(),
+                bytes: 524_288_000,
+            },
+        ],
+        galera: None,
+        notes: vec!["DEMO: simulovaná replika.".into()],
+    }
+}
 // ---------------------------------------------------------------- demo data
 
 fn demo_database(database: &str) -> DatabaseDetail {
@@ -1244,6 +1743,23 @@ fn demo_apply(snapshot: &mut Snapshot, change: Change) -> Result<Vec<String>> {
                 snapshot.max_connections = variable.literal(&value)?.parse().unwrap_or(151);
             }
         }
+        Change::KillConnection { target } => {
+            let before = snapshot.processes.len();
+            snapshot.processes.retain(|p| p.id != target.id);
+            if before == snapshot.processes.len() {
+                return Err(Error::Validation("Spojení už neexistuje.".into()));
+            }
+        }
+        Change::ReplicaControl { start, .. } => {
+            return Ok(vec![format!(
+                "DEMO: replikace {}.",
+                if start { "spuštěna" } else { "zastavena" }
+            )])
+        }
+        Change::PurgeBinlogs { to } => {
+            return Ok(vec![format!("DEMO: smazány binární logy starší než {to}.")])
+        }
+        Change::ResetStatementStats => return Ok(vec!["DEMO: statistiky vynulovány.".into()]),
         Change::Maintenance {
             database,
             table,
