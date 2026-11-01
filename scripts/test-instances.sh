@@ -37,4 +37,8 @@ SQL
   HARBOR_TEST_SOCKET="$instance/run/mariadb.sock" cargo test --locked -p harbor-core --test mariadb -- --ignored --nocapture 2>&1 | tee "$instance/test.log"
   podman inspect --format '{{.ImageDigest}}' "$container" > "$instance/image-digest.txt"
 done
+# Comparison of two different versions.
+HARBOR_TEST_SOCKET_A="$PWD/.test-data/mariadb-10.11/run/mariadb.sock" \
+HARBOR_TEST_SOCKET_B="$PWD/.test-data/mariadb-11.4/run/mariadb.sock" \
+  cargo test --locked -p harbor-core --test compare -- --ignored --nocapture
 printf 'Both isolated instances are running without TCP. Stop with podman stop harbor-test-10-11 harbor-test-11-4\n'

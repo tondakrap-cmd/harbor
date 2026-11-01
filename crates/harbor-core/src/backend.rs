@@ -100,7 +100,10 @@ impl Backend {
         }
     }
     pub async fn connect(profile: &Profile, password: Secret) -> Result<Self> {
-        let options = connect_options(profile, &password)?;
+        Self::open(connect_options(profile, &password)?).await
+    }
+    /// Connects with prepared settings (the connected server's own, for comparisons).
+    pub(crate) async fn open(options: MySqlConnectOptions) -> Result<Self> {
         let pool = MySqlPoolOptions::new()
             .max_connections(1)
             .min_connections(0)
@@ -135,6 +138,112 @@ impl Backend {
                 size_interval: SIZE_REFRESH_INTERVAL,
             }),
         })
+    }
+    /// A second demo server that differs from `demo()` (for comparisons).
+    pub(crate) fn demo_other() -> Self {
+        let mut other = Self::demo();
+        if let Kind::Demo(snapshot) = &mut other.inner {
+            snapshot.version = "10.11 • simulace".into();
+            snapshot.max_connections = 300;
+            snapshot.databases.retain(|d| d.name != "analytics");
+            snapshot.accounts.push(Account {
+                user: "backup".into(),
+                host: "localhost".into(),
+                plugin: "mysql_native_password".into(),
+            });
+        }
+        other
+    }
+    /// Databases, tables, columns and indexes of user databases as comparable lines.
+    pub async fn schema_overview(&self) -> Result<compare::SchemaOverview> {
+        let pool = match &self.inner {
+            Kind::Demo(snapshot) => {
+                let mut objects = std::collections::BTreeMap::new();
+                for db in snapshot.databases.iter().filter(|d| !d.system()) {
+                    objects.insert(db.name.clone(), format!("databáze {}", db.collation));
+                    objects.insert(
+                        format!("{}.orders", db.name),
+                        "InnoDB utf8mb4_unicode_ci".into(),
+                    );
+                    objects.insert(
+                        format!("{}.orders.total", db.name),
+                        if snapshot.max_connections == 300 {
+                            "decimal(12,2) NOT NULL"
+                        } else {
+                            "decimal(10,2) NOT NULL"
+                        }
+                        .into(),
+                    );
+                }
+                return Ok(compare::SchemaOverview { objects });
+            }
+            Kind::MariaDb(Server { pool, .. }) => pool,
+        };
+        let system = "('mysql','information_schema','performance_schema','sys')";
+        let mut objects = std::collections::BTreeMap::new();
+        for (db, collation) in sqlx::query_as::<_, (String, String)>(&format!(
+            "SELECT SCHEMA_NAME, DEFAULT_COLLATION_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN {system}"
+        ))
+        .fetch_all(pool)
+        .await?
+        {
+            objects.insert(db, format!("databáze {collation}"));
+        }
+        for (db, table, kind, engine, collation) in sqlx::query_as::<_, (String, String, String, String, String)>(&format!(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, COALESCE(ENGINE,''), COALESCE(TABLE_COLLATION,'') \
+             FROM information_schema.TABLES WHERE TABLE_SCHEMA NOT IN {system}"
+        ))
+        .fetch_all(pool)
+        .await?
+        {
+            objects.insert(
+                format!("{db}.{table}"),
+                if kind == "VIEW" { "pohled".to_string() } else { format!("{engine} {collation}") },
+            );
+        }
+        for (db, table, column, column_type, nullable, default, extra) in
+            sqlx::query_as::<_, (String, String, String, String, String, Option<String>, String)>(&format!(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA \
+                 FROM information_schema.COLUMNS WHERE TABLE_SCHEMA NOT IN {system}"
+            ))
+            .fetch_all(pool)
+            .await?
+        {
+            objects.insert(
+                format!("{db}.{table}.{column}"),
+                format!(
+                    "{column_type}{}{}{}",
+                    if nullable == "NO" { " NOT NULL" } else { "" },
+                    default.map(|d| format!(" DEFAULT {d}")).unwrap_or_default(),
+                    if extra.is_empty() { String::new() } else { format!(" {extra}") }
+                ),
+            );
+        }
+        let mut indexes: std::collections::BTreeMap<String, (bool, Vec<String>)> =
+            Default::default();
+        for (db, table, index, non_unique, column) in sqlx::query_as::<_, (String, String, String, u64, String)>(&format!(
+            "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, CAST(NON_UNIQUE AS UNSIGNED), COLUMN_NAME \
+             FROM information_schema.STATISTICS WHERE TABLE_SCHEMA NOT IN {system} ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+        ))
+        .fetch_all(pool)
+        .await?
+        {
+            let entry = indexes
+                .entry(format!("{db}.{table} [index {index}]"))
+                .or_insert((non_unique == 0, Vec::new()));
+            entry.1.push(column);
+        }
+        for (key, (unique, columns)) in indexes {
+            objects.insert(
+                key,
+                format!(
+                    "{}({})",
+                    if unique { "UNIQUE " } else { "" },
+                    columns.join(", ")
+                ),
+            );
+        }
+        Ok(compare::SchemaOverview { objects })
     }
     /// Connection settings for a background job; None in demo mode.
     pub(crate) fn job_options(&self) -> Option<MySqlConnectOptions> {

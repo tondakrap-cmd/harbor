@@ -2,12 +2,14 @@ mod admin;
 mod backend;
 mod backup;
 pub mod cli;
+mod compare;
 mod config;
 mod console;
 mod diagnostics;
 pub mod host;
 mod model;
 pub mod schedule;
+pub mod secrets;
 mod sql;
 mod worker;
 pub use admin::*;
@@ -16,6 +18,10 @@ pub use backup::{
     backup_file_name, default_backup_dir, list_backups, prune_backups, read_manifest, slug,
     start_job, utc_timestamp, BackupFile, BackupRequest, Job, JobSpec, Manifest, ManifestDatabase,
     Progress, RestoreRequest, Statements,
+};
+pub use compare::{
+    account_map, diff_maps, variable_map, Area, Areas, CompareJob, Comparison, DiffKind,
+    Difference, SchemaOverview,
 };
 pub use config::{ConfigStore, Settings};
 pub use console::ConsoleJob;

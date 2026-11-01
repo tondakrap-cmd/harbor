@@ -22,7 +22,8 @@ Bez `--demo` se klient automaticky nepřipojuje k žádnému serveru. V Připoje
 Profilech zadejte **testovací** server. TCP standardně ověřuje TLS certifikát i
 identitu, volitelně s vlastní CA. Nešifrované TCP musí být výslovně zvolené jako
 testovací. Lokální Unix socket TLS nepoužívá. Hesla jsou pouze v paměti procesu.
-Zapamatování hesla přes systémové úložiště zatím není implementované.
+Volitelně lze heslo uloženého profilu zapamatovat v systémovém úložišti hesel (GNOME
+Keyring, KWallet přes Secret Service); nikdy se neukládá do souboru.
 
 Desktop nabízí Original (výchozí), Terra, Clarity a Nocturne. Terminál přidává
 výchozí Turbo Classic. Změna motivu nemění spojení ani formuláře. Desktop používá
@@ -145,6 +146,13 @@ NOPASSWD jen pro vybrané příkazy, návrh je v aplikaci) nebo lokálně přes 
   potvrzení, export CSV. Chyby serveru se zobrazují celé.
 - **Profil jen pro čtení** pro produkční servery: Harbor pak nic nemění.
 
+### Porovnání serverů (od verze 0.6)
+
+Připojený server lze porovnat s jiným uloženým profilem: proměnné (bez těch, které se
+liší vždy), účty a role včetně oprávnění a schémata (databáze, tabulky, sloupce, indexy).
+Výsledek je seznam rozdílů „jen vlevo / jen vpravo / liší se“ s hodnotami vedle sebe
+a exportem do CSV. Typické použití: vývoj proti produkci, primár proti replice.
+
 Každá změna má potvrzení se serverem, popisem a **přesným SQL**, které se provede
 (hesla i jejich hashe jsou skryté). Smazání databáze, účtu nebo role vyžaduje opsat
 název. Heslo se serveru posílá jen jako hash `mysql_native_password`. Změna hesla
@@ -165,6 +173,7 @@ python3 scripts/test-pty.py
 bash scripts/test-instances.sh
 bash scripts/test-host.sh
 bash scripts/test-replication.sh
+bash scripts/test-keyring.sh
 bash scripts/package.sh
 bash scripts/smoke-packages.sh
 bash scripts/test-upgrade.sh

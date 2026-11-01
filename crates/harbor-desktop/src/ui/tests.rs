@@ -284,6 +284,8 @@ fn demo() -> (egui::Context, Harbor) {
     let ctx = egui::Context::default();
     let mut app = Harbor::new(&ctx, true);
     app.store = None;
+    // Never use the developer's real profiles or settings.
+    app.settings = Settings::default();
     wait_for_snapshot(&ctx, &mut app);
     (ctx, app)
 }
@@ -630,4 +632,41 @@ fn diagnostics_pages_and_console_render_in_demo() {
         "never overwrites"
     );
     std::fs::remove_file(path).unwrap();
+}
+#[test]
+fn comparison_page_shows_differences_side_by_side() {
+    let (ctx, mut app) = demo();
+    app.settings.profiles.push(Profile {
+        id: "druhy".into(),
+        name: "Druhý server".into(),
+        ..Default::default()
+    });
+    app.page = COMPARE;
+    app.compare_target = "druhy".into();
+    app.session
+        .compare_with(
+            app.settings.profiles[0].clone(),
+            Secret::default(),
+            Areas::default(),
+        )
+        .unwrap();
+    let start = std::time::Instant::now();
+    while app.session.compare.as_ref().is_none_or(|c| c.running())
+        && start.elapsed() < Duration::from_secs(5)
+    {
+        frame(&ctx, &mut app);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    app.selected_diff = Some("max_connections".into());
+    frame(&ctx, &mut app);
+    let all = texts(&frame(&ctx, &mut app).shapes).join("\n");
+    assert!(
+        all.contains("max_connections") && all.contains("liší se"),
+        "{all}"
+    );
+    assert!(all.contains("300"), "right value shown");
+    // Without another saved profile the page explains what to do.
+    app.settings.profiles.clear();
+    let all = texts(&frame(&ctx, &mut app).shapes).join("\n");
+    assert!(all.contains("uložte"));
 }

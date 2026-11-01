@@ -294,7 +294,8 @@ fn settle(app: &mut App) {
 fn demo() -> App {
     let mut app = App::new(&["--demo".to_string()]);
     app.store = None;
-    // Never list or touch the developer's real backups.
+    // Never use the developer's real profiles, backups or settings.
+    app.settings = Settings::default();
     app.settings.backup_dir = std::env::temp_dir()
         .join(format!("harbor-tui-test-backups-{}", std::process::id()))
         .display()
@@ -739,7 +740,7 @@ fn page_bar_fits_and_brackets_cycle_through_all_screens() {
     assert_eq!(app.page, SETTINGS);
     app.run(Action::Page(SERVER));
     key(&mut app, K::Char('['));
-    assert_eq!(app.page, CONSOLE, "wraps around");
+    assert_eq!(app.page, COMPARE, "wraps around to the last screen");
 }
 #[test]
 fn locks_performance_replication_and_console_screens_work_in_demo() {
@@ -821,4 +822,52 @@ fn locks_performance_replication_and_console_screens_work_in_demo() {
     key(&mut app, K::Enter);
     settle(&mut app);
     assert!(app.status_line().contains("Demo"), "{}", app.status_line());
+}
+#[test]
+fn comparison_lists_differences_and_exports_csv() {
+    let mut app = demo();
+    app.settings.profiles.push(Profile {
+        id: "druhy".into(),
+        name: "Druhý server".into(),
+        ..Default::default()
+    });
+    app.run(Action::Page(COMPARE));
+    key(&mut app, K::Enter);
+    let dialog = app.dialog.as_mut().expect("compare dialog");
+    assert_eq!(dialog.fields[0].value.as_str(), "Druhý server");
+    dialog.focus = dialog.fields.len() + 1;
+    key(&mut app, K::Enter);
+    let start = std::time::Instant::now();
+    while app.session.compare.as_ref().is_none_or(|c| c.running())
+        && start.elapsed() < std::time::Duration::from_secs(5)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        app.tick();
+    }
+    let differences = app.differences();
+    assert!(differences
+        .iter()
+        .any(|d| d.object == "max_connections" && d.kind == DiffKind::Different));
+    assert!(differences
+        .iter()
+        .any(|d| d.object.starts_with("backup@localhost") && d.kind == DiffKind::OnlyRight));
+    assert!(differences
+        .iter()
+        .any(|d| d.object == "commerce.orders.total"));
+    app.selected = differences
+        .iter()
+        .position(|d| d.object == "commerce.orders.total")
+        .unwrap();
+    assert!(render(&app, 120, 35).contains("decimal(12,2)"));
+    app.run(Action::CompareExport);
+    let path = std::env::temp_dir().join(format!("harbor-compare-{}.csv", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let dialog = app.dialog.as_mut().unwrap();
+    dialog.fields[0].value = Zeroizing::new(path.display().to_string());
+    dialog.focus = dialog.fields.len() + 1;
+    key(&mut app, K::Enter);
+    assert!(std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("commerce.orders.total"));
+    std::fs::remove_file(path).unwrap();
 }

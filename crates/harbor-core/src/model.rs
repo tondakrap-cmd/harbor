@@ -109,6 +109,9 @@ pub struct Profile {
     /// Production safety: no changes, restores, service actions or console writes.
     #[serde(default)]
     pub read_only: bool,
+    /// Keep the password in the desktop's secret service (never in this file).
+    #[serde(default)]
+    pub remember_password: bool,
     /// Access to the server machine (service, logs, configuration); optional.
     #[serde(default)]
     pub host: HostSettings,
@@ -129,6 +132,7 @@ impl Default for Profile {
             tls: TlsMode::VerifyIdentity,
             ca: None,
             read_only: false,
+            remember_password: false,
             host: HostSettings::default(),
             extra: serde_json::Map::new(),
         }

@@ -35,6 +35,13 @@ pub enum Operation {
     Locks,
     Performance,
     Replication,
+    /// Compares the connected server with another saved profile.
+    Compare {
+        left_name: String,
+        right: Profile,
+        password: Secret,
+        areas: Areas,
+    },
     /// One console statement (already classified) on its own connection.
     Console {
         database: String,
@@ -60,6 +67,7 @@ pub enum OperationKind {
     Performance,
     Replication,
     Console,
+    Compare,
 }
 impl Operation {
     pub fn kind(&self) -> OperationKind {
@@ -79,6 +87,7 @@ impl Operation {
             Self::Performance => OperationKind::Performance,
             Self::Replication => OperationKind::Replication,
             Self::Console { .. } => OperationKind::Console,
+            Self::Compare { .. } => OperationKind::Compare,
         }
     }
 }
@@ -97,6 +106,7 @@ pub enum Response {
     Performance(Performance),
     Replication(Replication),
     ConsoleStarted(ConsoleJob),
+    CompareStarted(CompareJob),
     Disconnected,
 }
 /// Reads must finish quickly; table maintenance (OPTIMIZE of a large table) may not.
@@ -236,23 +246,47 @@ impl Worker {
 }
 async fn execute(backend: &mut Option<Backend>, operation: Operation) -> Result<Response> {
     match operation {
-        Operation::TestConnection { profile, password } => Ok(Response::ConnectionTested(
-            Backend::connect(&profile, password).await.map(|_| ()),
-        )),
+        Operation::TestConnection { profile, password } => {
+            let result = async {
+                let password = stored_password(&profile, password).await?;
+                Backend::connect(&profile, password).await.map(|_| ())
+            }
+            .await;
+            Ok(Response::ConnectionTested(result))
+        }
         Operation::Connect {
             profile,
             password,
             demo,
         } => {
             *backend = None;
+            let typed = !password.0.is_empty();
+            let mut notice = None;
             *backend = Some(if demo {
                 Backend::demo()
             } else {
-                Backend::connect(&profile, password).await?
+                let password = stored_password(&profile, password).await?;
+                let connected = Backend::connect(&profile, password.clone()).await?;
+                // Only a password that just worked is remembered.
+                if typed && profile.remember_password && !profile.id.is_empty() {
+                    let id = profile.id.clone();
+                    let stored = tokio::task::spawn_blocking(move || {
+                        secrets::store_password(&id, &password)
+                    })
+                    .await
+                    .unwrap_or(Err(Error::Worker));
+                    notice = Some(match stored {
+                        Ok(()) => "Heslo je uložené v systémovém úložišti hesel.".to_string(),
+                        Err(error) => format!("Heslo se nepodařilo zapamatovat: {error}"),
+                    });
+                }
+                connected
             });
-            Ok(Response::Snapshot(
-                backend.as_mut().expect("connected").snapshot().await?,
-            ))
+            let mut snapshot = backend.as_mut().expect("connected").snapshot().await?;
+            if let Some(notice) = notice {
+                snapshot.notices.insert(0, notice);
+            }
+            Ok(Response::Snapshot(snapshot))
         }
         Operation::Disconnect => {
             *backend = None;
@@ -294,6 +328,18 @@ async fn execute(backend: &mut Option<Backend>, operation: Operation) -> Result<
                         kind,
                     )))
                 }
+                Operation::Compare {
+                    left_name,
+                    right,
+                    password,
+                    areas,
+                } => Ok(Response::CompareStarted(crate::compare::spawn(
+                    backend.job_options(),
+                    left_name,
+                    right,
+                    password,
+                    areas,
+                ))),
                 Operation::StartJob(spec) => {
                     if spec.needs_server() && backend.job_options().is_none() {
                         return Err(Error::Unsupported(
@@ -309,6 +355,17 @@ async fn execute(backend: &mut Option<Backend>, operation: Operation) -> Result<
             }
         }
     }
+}
+/// The typed password, or the stored one for profiles that remember it. The secret
+/// service may ask the user to unlock it, so this runs off the async worker loop.
+async fn stored_password(profile: &Profile, typed: Secret) -> Result<Secret> {
+    if !typed.0.is_empty() || !profile.remember_password {
+        return Ok(typed);
+    }
+    let profile = profile.clone();
+    tokio::task::spawn_blocking(move || secrets::password_for(&profile, typed))
+        .await
+        .unwrap_or(Err(Error::Worker))
 }
 // Shared live data; navigation, forms and theme selection remain in each UI.
 pub struct Session {
@@ -353,6 +410,8 @@ pub struct Session {
     pub console: Option<ConsoleJob>,
     /// Console statements of this session, newest last (memory only).
     pub console_history: Vec<String>,
+    /// The last server comparison.
+    pub compare: Option<CompareJob>,
     /// Read-only for UIs; set through the session so `error_at` stays in sync.
     pub error: Option<String>,
     pub error_at: Instant,
@@ -399,6 +458,7 @@ impl Default for Session {
             replication: None,
             console: None,
             console_history: Vec::new(),
+            compare: None,
             error: None,
             error_at: Instant::now(),
             test_result: None,
@@ -436,6 +496,32 @@ impl Session {
         self.performance = None;
         self.replication = None;
         self.console = None;
+        self.compare = None;
+    }
+    /// Compares the connected server with a saved profile (password typed or stored).
+    pub fn compare_with(&mut self, right: Profile, password: Secret, areas: Areas) -> Result<()> {
+        if self.compare.as_ref().is_some_and(CompareJob::running) {
+            return Err(Error::Validation("Porovnání už běží.".into()));
+        }
+        let left = self
+            .profile
+            .clone()
+            .ok_or_else(|| Error::Validation("Nejprve se připojte k serveru.".into()))?;
+        if !areas.variables && !areas.accounts && !areas.schema {
+            return Err(Error::Validation("Vyberte, co porovnat.".into()));
+        }
+        if self.request(Operation::Compare {
+            left_name: left.name,
+            right,
+            password,
+            areas,
+        }) {
+            Ok(())
+        } else {
+            Err(Error::Validation(
+                "Jiná operace právě běží; zkuste to za chvíli.".into(),
+            ))
+        }
     }
     /// True when the connected profile forbids changes (production safety).
     pub fn read_only(&self) -> bool {
@@ -609,6 +695,7 @@ impl Session {
             kind,
             OperationKind::Apply
                 | OperationKind::Console
+                | OperationKind::Compare
                 | OperationKind::StartJob
                 | OperationKind::Connect
                 | OperationKind::Disconnect
@@ -787,6 +874,7 @@ impl Session {
                 Ok(Response::Performance(performance)) => self.performance = Some(performance),
                 Ok(Response::Replication(replication)) => self.replication = Some(replication),
                 Ok(Response::ConsoleStarted(job)) => self.console = Some(job),
+                Ok(Response::CompareStarted(job)) => self.compare = Some(job),
                 Ok(Response::JobStarted(job)) => {
                     self.status = format!("Spuštěno: {}", job.title);
                     self.jobs.push(job);

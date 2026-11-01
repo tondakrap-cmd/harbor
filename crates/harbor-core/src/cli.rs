@@ -148,10 +148,12 @@ impl Options {
             )
         })
     }
-    fn password(&self) -> Result<Secret> {
+    /// Password file first; else the secret service for profiles that remember it
+    /// (works in a desktop session with an unlocked keyring, not in plain cron).
+    fn password_for(&self, profile: &Profile) -> Result<Secret> {
         match &self.password_file {
             Some(path) => read_secret_file(path),
-            None => Ok(Secret::default()),
+            None => secrets::password_for(profile, Secret::default()),
         }
     }
     fn encryption(&self) -> Result<Option<Secret>> {
@@ -222,7 +224,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 fn backup(options: &Options) -> Result<String> {
     let profile = options.profile()?;
-    let password = options.password()?;
+    let password = options.password_for(&profile)?;
     let databases = if options.databases.is_empty() {
         // All user databases the account can see.
         let snapshot = runtime()?.block_on(async {
@@ -284,7 +286,7 @@ fn restore(options: &Options) -> Result<String> {
             database,
             replace: options.replace,
         }),
-        Some((&profile, options.password()?)),
+        Some((&profile, options.password_for(&profile)?)),
     )?;
     wait(&job)
 }

@@ -1,5 +1,19 @@
 # Změny
 
+## 0.6.0
+
+- Porovnání dvou serverů: připojený server proti uloženému profilu; proměnné (bez těch,
+  které se liší vždy: id, cesty, pozice GTID), účty a role po vlastnostech a oprávněních,
+  schémata (databáze, tabulky, sloupce, indexy). Filtr podle oblasti, hledání, export CSV.
+- Zapamatování hesla v systémovém úložišti (Secret Service: GNOME Keyring, KWallet),
+  jen na požádání u uloženého profilu a jen po úspěšném přihlášení; nikdy do souboru.
+  Bez úložiště (server, SSH) Harbor vysvětlí, že je třeba heslo zadat. Příkazová řádka
+  použije uložené heslo, není-li zadán soubor s heslem. Zrušení volby nebo smazání
+  profilu uložené heslo odstraní.
+- Testy úložiště hesel v izolované relaci D-Bus (scripts/test-keyring.sh), porovnání
+  instancí 10.11 a 11.4.
+- CI: actions/checkout@v5.
+
 ## 0.5.0
 
 - Aktivní spojení → Transakce a zámky: otevřené transakce InnoDB, čekání na zámky,

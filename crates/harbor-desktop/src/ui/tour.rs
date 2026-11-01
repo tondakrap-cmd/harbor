@@ -203,6 +203,31 @@ impl Tour {
                 }),
             ));
             steps.push((
+                format!("{}-9d-porovnani", t.key()),
+                Box::new(move |a| {
+                    set(a, COMPARE);
+                    if a.session.compare.is_none()
+                        && a.session.snapshot.is_some()
+                        && !a.session.worker.busy
+                    {
+                        let other = Profile {
+                            id: "tour-other".into(),
+                            name: "Druhý server".into(),
+                            ..Default::default()
+                        };
+                        a.settings.profiles.retain(|p| p.id != other.id);
+                        a.settings.profiles.push(other.clone());
+                        a.compare_target = other.id.clone();
+                        let _ = a
+                            .session
+                            .compare_with(other, Secret::default(), Areas::default());
+                    }
+                    if a.selected_diff.is_none() {
+                        a.selected_diff = Some("max_connections".into());
+                    }
+                }),
+            ));
+            steps.push((
                 format!("{}-5b-sluzba", t.key()),
                 Box::new(move |a| set(a, SERVICE)),
             ));
@@ -295,6 +320,13 @@ impl eframe::App for Tour {
             && (self.app.page != VARIABLES || self.app.session.variables.is_some())
             && (self.app.page != PERFORMANCE || self.app.session.performance.is_some())
             && (self.app.page != REPLICATION || self.app.session.replication.is_some())
+            && (self.app.page != COMPARE
+                || self
+                    .app
+                    .session
+                    .compare
+                    .as_ref()
+                    .is_some_and(|c| !c.running()))
             && (self.app.page != CONSOLE
                 || self
                     .app

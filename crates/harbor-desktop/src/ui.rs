@@ -4,7 +4,7 @@ use harbor_themes::{desktop, rgb, ThemeId};
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 13] = [
+const PAGES: [&str; 14] = [
     "Přehled serveru",
     "Databáze",
     "Uživatelé a oprávnění",
@@ -18,6 +18,7 @@ const PAGES: [&str; 13] = [
     "Výkon a dotazy",
     "Replikace",
     "SQL konzole",
+    "Porovnání serverů",
 ];
 const OVERVIEW: usize = 0;
 const DATABASES: usize = 1;
@@ -32,8 +33,9 @@ const SETTINGS: usize = 9;
 const PERFORMANCE: usize = 10;
 const REPLICATION: usize = 11;
 const CONSOLE: usize = 12;
+const COMPARE: usize = 13;
 /// Order of the pages in the sidebar (indices into PAGES).
-const NAV: [usize; 13] = [
+const NAV: [usize; 14] = [
     OVERVIEW,
     DATABASES,
     ACCOUNTS,
@@ -41,6 +43,7 @@ const NAV: [usize; 13] = [
     PERFORMANCE,
     CONSOLE,
     REPLICATION,
+    COMPARE,
     VARIABLES,
     HEALTH,
     SERVICE,
@@ -121,7 +124,7 @@ pub struct Harbor {
     page: usize,
     /// One search per list page (index = page), so typing on one page does not
     /// filter another.
-    filters: [String; 13],
+    filters: [String; 14],
     system: bool,
     long_only: bool,
     key_only: bool,
@@ -213,6 +216,12 @@ pub struct Harbor {
     console_sql: String,
     console_db: String,
     console_export: String,
+    compare_target: String,
+    compare_password: Zeroizing<String>,
+    compare_areas: Areas,
+    compare_filter: Option<Area>,
+    selected_diff: Option<String>,
+    compare_export: String,
 }
 #[derive(Clone, Copy)]
 struct Palette {
@@ -468,6 +477,12 @@ impl Harbor {
             console_sql: "SELECT ".into(),
             console_db: String::new(),
             console_export: String::new(),
+            compare_target: String::new(),
+            compare_password: Zeroizing::new(String::new()),
+            compare_areas: Areas::default(),
+            compare_filter: None,
+            selected_diff: None,
+            compare_export: String::new(),
         };
         app.backup_dir_text = app.settings.backup_dir().display().to_string();
         if demo {
@@ -628,8 +643,17 @@ impl Harbor {
     }
     fn save_profile(&mut self) {
         let profile = self.profile.clone();
+        // Turning "remember" off removes what was stored (only then is the keyring asked).
+        let forget = !profile.remember_password
+            && self
+                .settings
+                .profile(&profile.id)
+                .is_some_and(|stored| stored.remember_password);
         if let Some(id) = self.try_save(move |s| s.upsert_profile(profile)) {
             self.profile.id = id;
+            if forget {
+                let _ = secrets::delete_password(&self.profile.id);
+            }
         }
     }
     fn request_delete_profile(&mut self) {
@@ -646,7 +670,15 @@ impl Harbor {
             return;
         };
         let target = id.clone();
-        if self.try_save(move |s| s.remove_profile(&target)).is_some() && self.profile.id == id {
+        let remembered = self
+            .settings
+            .profile(&id)
+            .is_some_and(|p| p.remember_password);
+        let removed = self.try_save(move |s| s.remove_profile(&target)).is_some();
+        if removed && remembered {
+            let _ = secrets::delete_password(&id);
+        }
+        if removed && self.profile.id == id {
             // The form stays filled in as an unsaved draft.
             self.profile.id.clear();
         }
@@ -812,7 +844,7 @@ impl Harbor {
                 self.session.disconnect();
             }
             ui.label(
-                RichText::new("Hesla se neukládají; zůstávají jen v paměti relace.").color(p.muted),
+                RichText::new("Heslo se ukládá jen na požádání, a to do systémového úložiště hesel, nikdy do souboru.").color(p.muted),
             );
         });
         let profiles = self.settings.profiles.clone();
@@ -905,7 +937,28 @@ impl Harbor {
             });
         }
         field(ui, "Uživatel", &mut self.profile.user, false);
-        field(ui, "Heslo (neukládá se)", &mut self.password, true);
+        field(
+            ui,
+            if self.profile.remember_password {
+                "Heslo (prázdné = uložené v systémovém úložišti)"
+            } else {
+                "Heslo (neukládá se)"
+            },
+            &mut self.password,
+            true,
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut self.profile.remember_password,
+                "Zapamatovat heslo v systémovém úložišti (GNOME Keyring / KWallet)",
+            );
+            if !self.profile.id.is_empty() && ui.button("Zapomenout uložené heslo").clicked() {
+                self.message = match secrets::delete_password(&self.profile.id) {
+                    Ok(()) => "Uložené heslo odstraněno ze systémového úložiště.".into(),
+                    Err(error) => error.to_string(),
+                };
+            }
+        });
         ui.checkbox(
             &mut self.profile.read_only,
             "Jen pro čtení (produkce): žádné změny, obnovy, akce služby ani zápisy v konzoli",
@@ -3061,6 +3114,244 @@ impl Harbor {
             }
         });
     }
+    fn compare_page(&mut self, ui: &mut egui::Ui, p: Palette) {
+        let current = self
+            .session
+            .profile
+            .as_ref()
+            .map(|p| p.id.clone())
+            .unwrap_or_default();
+        let targets: Vec<Profile> = self
+            .settings
+            .profiles
+            .iter()
+            .filter(|x| x.id != current)
+            .cloned()
+            .collect();
+        let running = self.session.compare.as_ref().is_some_and(|c| c.running());
+        toolbar(ui, |ui| {
+            ui.label("Porovnat s:");
+            let selected = targets.iter().find(|t| t.id == self.compare_target);
+            egui::ComboBox::from_id_salt("compare_target")
+                .selected_text(
+                    selected
+                        .map(|t| safe_text(&t.name))
+                        .unwrap_or_else(|| "vyberte profil".into()),
+                )
+                .show_ui(ui, |ui| {
+                    for target in &targets {
+                        ui.selectable_value(
+                            &mut self.compare_target,
+                            target.id.clone(),
+                            safe_text(&target.name),
+                        );
+                    }
+                });
+            let remembers = selected.is_some_and(|t| t.remember_password);
+            ui.add(
+                egui::TextEdit::singleline(&mut *self.compare_password)
+                    .password(true)
+                    .hint_text(if remembers {
+                        "heslo (prázdné = uložené)"
+                    } else {
+                        "heslo"
+                    })
+                    .desired_width(170.0)
+                    .margin(egui::Margin::symmetric(8, 5)),
+            );
+            ui.checkbox(&mut self.compare_areas.variables, "proměnné");
+            ui.checkbox(&mut self.compare_areas.accounts, "účty");
+            ui.checkbox(&mut self.compare_areas.schema, "schéma");
+            if ui
+                .add_enabled(
+                    !running && selected.is_some() && self.session.snapshot.is_some(),
+                    egui::Button::new("Porovnat"),
+                )
+                .clicked()
+            {
+                if let Some(target) = selected.cloned() {
+                    let password = Secret(std::mem::take(&mut self.compare_password));
+                    match self
+                        .session
+                        .compare_with(target, password, self.compare_areas)
+                    {
+                        Ok(()) => self.selected_diff = None,
+                        Err(error) => self.message = error.to_string(),
+                    }
+                }
+            }
+        });
+        if targets.is_empty() {
+            banner(
+                ui,
+                p,
+                Severity::Info,
+                "Pro porovnání uložte v Připojení alespoň jeden další profil.",
+                None,
+            );
+            return;
+        }
+        let Some(job) = self.session.compare.clone() else {
+            empty_detail(ui, p, "Vyberte profil a spusťte porovnání. Porovnává se připojený server (vlevo) s vybraným (vpravo).");
+            return;
+        };
+        let result = match job.result() {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "{} ({} s)",
+                        safe_text(&job.phase()),
+                        job.started.elapsed().as_secs()
+                    ));
+                });
+                return;
+            }
+            Some(Err(error)) => {
+                banner(ui, p, Severity::Critical, &error, None);
+                return;
+            }
+            Some(Ok(result)) => result,
+        };
+        toolbar(ui, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "Vlevo {} • vpravo {} • {} rozdílů ({})",
+                    safe_text(&result.left),
+                    safe_text(&result.right),
+                    result.differences.len(),
+                    result
+                        .compared
+                        .iter()
+                        .map(|(area, n)| format!("{} {n}", area.label().to_lowercase()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .strong(),
+            );
+        });
+        toolbar(ui, |ui| {
+            search(ui, &mut self.filters[COMPARE]);
+            ui.radio_value(&mut self.compare_filter, None, "vše");
+            for area in [Area::Variables, Area::Accounts, Area::Schema] {
+                ui.radio_value(&mut self.compare_filter, Some(area), area.label());
+            }
+            ui.add(
+                egui::TextEdit::singleline(&mut self.compare_export)
+                    .hint_text("soubor CSV")
+                    .desired_width(220.0)
+                    .margin(egui::Margin::symmetric(8, 5)),
+            );
+            if ui.button("Uložit CSV").clicked() {
+                self.message = match write_private(&self.compare_export, &result.csv()) {
+                    Ok(path) => format!("Uloženo do {path}."),
+                    Err(error) => error,
+                };
+            }
+            if result.ignored > 0 {
+                ui.label(
+                    RichText::new(format!(
+                        "{} proměnných, které se liší vždy (cesty, id, pozice), vynecháno",
+                        result.ignored
+                    ))
+                    .color(p.muted),
+                );
+            }
+        });
+        let visible: Vec<Difference> = result
+            .differences
+            .iter()
+            .filter(|d| self.compare_filter.is_none_or(|a| a == d.area))
+            .filter(|d| matches_filter(&self.filters[COMPARE], &[&d.object, &d.left, &d.right]))
+            .cloned()
+            .collect();
+        if result.differences.is_empty() {
+            banner(
+                ui,
+                p,
+                Severity::Info,
+                "Servery se v porovnávaných oblastech neliší.",
+                None,
+            );
+            return;
+        }
+        let (left_name, right_name) = (result.left.clone(), result.right.clone());
+        self.split(
+            ui,
+            "compare_split",
+            |app, ui| {
+                panel_frame(p).show(ui, |ui| {
+                    ui.set_min_size(ui.available_size());
+                    let selected = visible
+                        .iter()
+                        .position(|d| app.selected_diff.as_ref() == Some(&d.object));
+                    if let Some(i) = data_table(
+                        ui,
+                        "differences",
+                        &["OBLAST", "ROZDÍL", "OBJEKT"],
+                        &[Some(90.0), Some(90.0), None],
+                        visible.len(),
+                        selected,
+                        None,
+                        |ui, row, col| {
+                            let d = &visible[row];
+                            match col {
+                                0 => cell(ui, d.area.label()),
+                                1 => {
+                                    let text = RichText::new(d.kind.label());
+                                    ui.label(match d.kind {
+                                        DiffKind::Different => text.color(p.warn),
+                                        _ => text,
+                                    });
+                                }
+                                _ => cell(ui, &d.object),
+                            }
+                        },
+                    ) {
+                        app.selected_diff = Some(visible[i].object.clone());
+                    }
+                });
+            },
+            |app, ui| {
+                let Some(d) = visible
+                    .iter()
+                    .find(|d| app.selected_diff.as_ref() == Some(&d.object))
+                    .cloned()
+                else {
+                    empty_detail(ui, p, "Vyberte rozdíl v seznamu.");
+                    return;
+                };
+                app.detail_pane(
+                    ui,
+                    p,
+                    "difference_detail",
+                    |_, ui| {
+                        ui.heading(safe_text(&d.object));
+                    },
+                    |_, ui| {
+                        ui.label(
+                            RichText::new(format!("{} • {}", d.area.label(), d.kind.label()))
+                                .color(p.muted),
+                        );
+                        ui.add_space(6.0);
+                        ui.columns(2, |cols| {
+                            for (col, (name, value)) in cols
+                                .iter_mut()
+                                .zip([(&left_name, &d.left), (&right_name, &d.right)])
+                            {
+                                col.strong(safe_text(name));
+                                col.monospace(if value.is_empty() {
+                                    "— neexistuje —".to_string()
+                                } else {
+                                    safe_text(value)
+                                });
+                            }
+                        });
+                    },
+                );
+            },
+        );
+    }
     fn backups_page(&mut self, ui: &mut egui::Ui, p: Palette) {
         if !self.backups_loaded {
             self.reload_backups();
@@ -4534,6 +4825,7 @@ impl Harbor {
                     PERFORMANCE => self.performance_page(ui, p),
                     REPLICATION => self.replication_page(ui, p),
                     CONSOLE => self.console_page(ui, p),
+                    COMPARE => self.compare_page(ui, p),
                     CONNECTION => self.connection(ui, p),
                     _ => self.overview(ui, p),
                 }
@@ -4588,6 +4880,7 @@ fn page_subtitle(page: usize) -> &'static str {
         PERFORMANCE => "nejnáročnější dotazy podle celkového času",
         REPLICATION => "repliky, Galera a binární logy",
         CONSOLE => "jeden příkaz SQL; čtení bezpečně, zápis po potvrzení",
+        COMPARE => "proměnné, účty a schémata dvou serverů vedle sebe",
         BACKUPS => "zálohy do ZIP, obnova a plánování",
         CONNECTION => "uložené profily a připojení",
         _ => "vzhled a chování aplikace",

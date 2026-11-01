@@ -60,9 +60,18 @@ fn profile_storage_preserves_other_clients_changes_and_contains_no_password() {
     assert_eq!(loaded.desktop_theme, "terra");
     assert_eq!(loaded.tui_theme, "nocturne");
     assert_eq!(loaded.profiles.len(), 2);
-    assert!(!std::fs::read_to_string(directory.join("settings.json"))
-        .unwrap()
-        .contains("password"));
+    // Only the boolean "remember_password" flag may mention passwords; never a value.
+    let text = std::fs::read_to_string(directory.join("settings.json")).unwrap();
+    assert!(!text.contains("\"password\""));
+    let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    for profile in json["profiles"].as_array().unwrap() {
+        for (key, value) in profile.as_object().unwrap() {
+            assert!(
+                !key.contains("password") || value.is_boolean(),
+                "{key} must not hold a password"
+            );
+        }
+    }
     std::fs::write(directory.join("settings.json"), "broken").unwrap();
     assert!(a.update(|s| s.desktop_theme = "original".into()).is_err());
     assert_eq!(

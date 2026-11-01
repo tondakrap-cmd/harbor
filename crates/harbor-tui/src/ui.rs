@@ -13,7 +13,7 @@ use ratatui::{
 use std::collections::BTreeSet;
 use zeroize::Zeroizing;
 
-const PAGES: [&str; 13] = [
+const PAGES: [&str; 14] = [
     "Server",
     "Databáze",
     "Účty",
@@ -27,6 +27,7 @@ const PAGES: [&str; 13] = [
     "Výkon",
     "Replikace",
     "Konzole",
+    "Porovnání",
 ];
 const SERVER: usize = 0;
 const DATABASES: usize = 1;
@@ -41,6 +42,7 @@ const SETTINGS: usize = 9;
 const PERFORMANCE: usize = 10;
 const REPLICATION: usize = 11;
 const CONSOLE: usize = 12;
+const COMPARE: usize = 13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Action {
@@ -76,6 +78,8 @@ enum Action {
     ReplicaStart,
     ReplicaStop,
     PurgeBinlogs,
+    CompareRun,
+    CompareExport,
     ConsoleRun,
     ConsoleCancel,
     ConsoleExport,
@@ -118,6 +122,7 @@ const MENU: &[(&str, Action)] = &[
     ("Výkon a dotazy ([ ])", Action::Page(PERFORMANCE)),
     ("Replikace ([ ])", Action::Page(REPLICATION)),
     ("SQL konzole ([ ])", Action::Page(CONSOLE)),
+    ("Porovnání serverů ([ ])", Action::Page(COMPARE)),
     ("Nápověda", Action::Help),
     ("Obnovit", Action::Refresh),
     ("Nový profil", Action::NewProfile),
@@ -150,6 +155,8 @@ const MENU: &[(&str, Action)] = &[
     ("Replikace: spustit vybrané spojení", Action::ReplicaStart),
     ("Replikace: zastavit vybrané spojení…", Action::ReplicaStop),
     ("Binlogy: smazat starší než vybraný…", Action::PurgeBinlogs),
+    ("Porovnání: spustit…", Action::CompareRun),
+    ("Porovnání: uložit do CSV…", Action::CompareExport),
     ("Konzole: spustit dotaz…", Action::ConsoleRun),
     ("Konzole: zrušit běžící dotaz", Action::ConsoleCancel),
     ("Konzole: uložit výsledek do CSV…", Action::ConsoleExport),
@@ -229,6 +236,7 @@ fn page_actions(page: usize) -> &'static [Action] {
             Action::ReplicaStop,
             Action::PurgeBinlogs,
         ],
+        COMPARE => &[Action::CompareRun, Action::CompareExport, Action::Search],
         CONSOLE => &[
             Action::ConsoleRun,
             Action::ConsoleCancel,
@@ -362,6 +370,8 @@ enum Kind {
     ConfigValue(String),
     Console,
     ConsoleExport,
+    Compare,
+    CompareExport,
     ConfigRemove,
     /// Search for the list on this page.
     Search(usize),
@@ -510,7 +520,7 @@ pub struct App {
     picker: Option<PrivilegePicker>,
     confirm: Option<Confirmation>,
     /// One search per page, like the desktop.
-    filters: [String; 13],
+    filters: [String; 14],
     system: bool,
     long: bool,
     key_only: bool,
@@ -959,6 +969,66 @@ impl App {
         lines.extend(r.notes.iter().map(|n| safe_text(n)));
         lines.join("\n")
     }
+    fn differences(&self) -> Vec<Difference> {
+        self.session
+            .compare
+            .as_ref()
+            .and_then(|c| c.result())
+            .and_then(|r| r.ok())
+            .map(|r| {
+                r.differences
+                    .into_iter()
+                    .filter(|d| {
+                        matches_filter(&self.filters[COMPARE], &[&d.object, &d.left, &d.right])
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    fn compare_text(&self) -> String {
+        let Some(job) = &self.session.compare else {
+            return "Porovná proměnné, účty s oprávněními a schémata (tabulky, sloupce, indexy)."
+                .into();
+        };
+        match job.result() {
+            None => format!("{} ({} s)", job.phase(), job.started.elapsed().as_secs()),
+            Some(Err(error)) => format!("! {}", safe_text(&error)),
+            Some(Ok(result)) => {
+                let mut lines = vec![format!(
+                    "Vlevo {} • vpravo {} • {} rozdílů • {} vždy odlišných proměnných vynecháno",
+                    safe_text(&result.left),
+                    safe_text(&result.right),
+                    result.differences.len(),
+                    result.ignored
+                )];
+                if let Some(d) = self.differences().get(self.selected) {
+                    lines.push(format!(
+                        "{} • {} • {}",
+                        d.area.label(),
+                        d.kind.label(),
+                        safe_text(&d.object)
+                    ));
+                    lines.push(format!(
+                        "  vlevo:  {}",
+                        if d.left.is_empty() {
+                            "— neexistuje —".into()
+                        } else {
+                            safe_text(&d.left)
+                        }
+                    ));
+                    lines.push(format!(
+                        "  vpravo: {}",
+                        if d.right.is_empty() {
+                            "— neexistuje —".into()
+                        } else {
+                            safe_text(&d.right)
+                        }
+                    ));
+                }
+                lines.join("\n")
+            }
+        }
+    }
     fn console_rows(&self) -> Vec<String> {
         let Some(job) = &self.session.console else {
             return Vec::new();
@@ -1161,6 +1231,11 @@ impl App {
                 .map(|(k, _)| RowKey::Variable(k))
                 .collect(),
             CONSOLE => (0..self.console_rows().len()).map(RowKey::Log).collect(),
+            COMPARE => self
+                .differences()
+                .into_iter()
+                .map(|d| RowKey::Variable(d.object))
+                .collect(),
             VARIABLES => self
                 .variables()
                 .iter()
@@ -1871,6 +1946,18 @@ impl App {
                 .map(|(_, r)| r)
                 .collect(),
             CONSOLE => self.console_rows(),
+            COMPARE => self
+                .differences()
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{:<9} {:<10} {}",
+                        d.area.label(),
+                        d.kind.label(),
+                        safe_text(&d.object)
+                    )
+                })
+                .collect(),
             PROCESSES => self
                 .processes()
                 .iter()
@@ -1970,6 +2057,12 @@ impl App {
             CONSOLE if self.session.console.is_none() => {
                 Some("Enter nebo F10 → Konzole: spustit dotaz…")
             }
+            COMPARE if self.session.compare.is_none() => {
+                Some("Enter nebo F10 → Porovnání: spustit… (připojený server vs. uložený profil)")
+            }
+            COMPARE if self.differences().is_empty() => {
+                Some("Žádné rozdíly (nebo porovnání běží).")
+            }
             SERVICE if self.session.host.is_none() => {
                 Some("Profil nemá přístup k serveru (F3 → profil → Přístup k serveru).")
             }
@@ -1994,6 +2087,7 @@ impl App {
             SERVICE => self.service_text(),
             REPLICATION => self.replication_text(),
             CONSOLE => self.console_text(),
+            COMPARE => self.compare_text(),
             PERFORMANCE => match self.statements().get(self.selected) {
                 Some(s) => format!(
                     "{}\nschéma {} • {}× • celkem {:.2} s • průměr {:.1} ms • max {:.2} s • řádky prohledané/vrácené {}/{}{}",
@@ -2558,6 +2652,8 @@ impl App {
                 }
             }
             CONSOLE => self.run(Action::ConsoleRun),
+            COMPARE if self.session.compare.is_none() => self.run(Action::CompareRun),
+            COMPARE => self.detail_focus = true,
             PERFORMANCE | REPLICATION => self.detail_focus = true,
             PROCESSES if self.locks_view => self.detail_focus = true,
             PROCESSES => {
@@ -3045,6 +3141,59 @@ impl App {
                     None => self.say("Vyberte binární log na obrazovce Replikace."),
                 }
             }
+            Action::CompareRun => {
+                let current = self
+                    .session
+                    .profile
+                    .as_ref()
+                    .map(|p| p.id.clone())
+                    .unwrap_or_default();
+                let first = self
+                    .settings
+                    .profiles
+                    .iter()
+                    .find(|p| p.id != current)
+                    .map(|p| p.name.clone());
+                match first {
+                    Some(name) if self.session.snapshot.is_some() => {
+                        self.page = COMPARE;
+                        self.dialog = dialog(
+                            Kind::Compare,
+                            vec![
+                                Field::new("Porovnat s profilem (název)", &name),
+                                Field::hidden("Heslo (prázdné = uložené v úložišti)"),
+                                Field::new("Oblasti: VŠE nebo PROMĚNNÉ,ÚČTY,SCHÉMA", "VŠE"),
+                            ],
+                        );
+                    }
+                    Some(_) => self.say("Nejprve se připojte k serveru, který chcete porovnat."),
+                    None => self.say("Pro porovnání uložte alespoň jeden další profil (F3)."),
+                }
+            }
+            Action::CompareExport => {
+                if self
+                    .session
+                    .compare
+                    .as_ref()
+                    .and_then(|c| c.result())
+                    .is_some_and(|r| r.is_ok())
+                {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                    let stamp: String = utc_timestamp(std::time::SystemTime::now())
+                        .chars()
+                        .filter(|c| c.is_ascii_digit())
+                        .collect();
+                    self.dialog = dialog(
+                        Kind::CompareExport,
+                        vec![Field::new(
+                            "Soubor CSV",
+                            &format!("{home}/harbor-porovnani-{stamp}.csv"),
+                        )],
+                    );
+                } else {
+                    self.say("Nejdřív dokončete porovnání.");
+                }
+            }
             Action::ConsoleRun => {
                 let (database, sql) = self
                     .session
@@ -3376,6 +3525,14 @@ impl App {
                     "Jen pro čtení (produkce): ANO / NE",
                     if profile.read_only { "ANO" } else { "NE" },
                 ),
+                Field::new(
+                    "Zapamatovat heslo v systémovém úložišti: ANO / NE",
+                    if profile.remember_password {
+                        "ANO"
+                    } else {
+                        "NE"
+                    },
+                ),
             ],
             focus: 0,
         });
@@ -3623,12 +3780,22 @@ impl App {
                         config_dir: v(13),
                     },
                     read_only: yes_no(v(14), "Jen pro čtení")?,
+                    remember_password: yes_no(v(15), "Zapamatovat heslo")?,
                     // upsert_profile keeps unknown fields of the stored profile.
                     extra: Default::default(),
                 };
                 profile.validate()?;
                 if button == 1 {
+                    // Only a profile that remembered its password asks the keyring.
+                    let forget = !profile.remember_password
+                        && self
+                            .settings
+                            .profile(&profile.id)
+                            .is_some_and(|stored| stored.remember_password);
                     let id = self.try_save(|s| s.upsert_profile(profile))?;
+                    if forget {
+                        let _ = secrets::delete_password(&id);
+                    }
                     // A second save of the same form updates this profile, not a new one.
                     d.kind = Kind::Profile(Some(id));
                     self.say("Profil uložen. Heslo není součástí konfigurace.");
@@ -3836,6 +4003,54 @@ impl App {
                     }
                 }
             }
+            Kind::Compare => {
+                let name = v(0);
+                let right = self
+                    .settings
+                    .profiles
+                    .iter()
+                    .find(|p| p.name.trim().eq_ignore_ascii_case(name.trim()))
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::Validation(format!("Profil {} neexistuje.", safe_text(&name)))
+                    })?;
+                let text = v(2).to_uppercase();
+                let areas = if text == "VŠE" || text.is_empty() {
+                    Areas::default()
+                } else {
+                    Areas {
+                        variables: text.contains("PROMĚNN"),
+                        accounts: text.contains("ÚČT") || text.contains("UCT"),
+                        schema: text.contains("SCHÉM") || text.contains("SCHEM"),
+                    }
+                };
+                self.session
+                    .compare_with(right, d.fields[1].secret(), areas)?;
+                self.selected = 0;
+                return Ok(Outcome::Close);
+            }
+            Kind::CompareExport => {
+                let result = self
+                    .session
+                    .compare
+                    .as_ref()
+                    .and_then(|c| c.result())
+                    .and_then(|r| r.ok())
+                    .ok_or_else(|| Error::Validation("Žádný výsledek k uložení.".into()))?;
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let path = v(0);
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(|e| Error::File(format!("{path}: {e}")))?;
+                file.write_all(result.csv().as_bytes())
+                    .map_err(|e| Error::File(format!("{path}: {e}")))?;
+                self.say(format!("Uloženo do {path}."));
+                return Ok(Outcome::Close);
+            }
             Kind::ConsoleExport => {
                 let result = self
                     .session
@@ -3934,6 +4149,9 @@ impl App {
                         let id = id.clone();
                         match self.try_save(|s| s.remove_profile(&id)) {
                             Ok(profile) => {
+                                if profile.remember_password {
+                                    let _ = secrets::delete_password(&profile.id);
+                                }
                                 self.say(format!(
                                     "Profil „{}“ odstraněn.",
                                     safe_text(&profile.name)
