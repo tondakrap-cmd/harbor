@@ -10,6 +10,7 @@ use ratatui::{
     },
     Frame,
 };
+use zeroize::Zeroizing;
 
 const PAGES: [&str; 6] = [
     "Server",
@@ -44,45 +45,67 @@ const MENU: [&str; 23] = [
     "Odstranit vybraný uložený profil",
     "Konec",
 ];
-#[derive(Clone)]
+/// Values are wiped on drop; dialogs are moved (suspended/restored), never cloned, so a
+/// typed password exists in one buffer only.
 struct Field {
     label: String,
-    value: String,
+    value: Zeroizing<String>,
     secret: bool,
 }
 impl Field {
     fn new(label: &str, value: &str) -> Self {
         Self {
             label: label.into(),
-            value: value.into(),
+            value: Zeroizing::new(value.into()),
             secret: false,
         }
     }
     fn password() -> Self {
         Self {
             label: "Heslo (pouze v paměti)".into(),
-            value: String::new(),
+            value: Zeroizing::new(String::new()),
             secret: true,
         }
     }
+    fn secret(&self) -> Secret {
+        Secret(self.value.clone())
+    }
+}
+/// Selected row identity; the index follows it when a refresh reorders the list.
+#[derive(Clone, PartialEq, Debug)]
+enum RowKey {
+    Database(String),
+    Account(Account),
+    Process(u64),
+    Profile(String),
+}
+enum Outcome {
+    Keep,
+    Close,
+    Suspend,
 }
 #[derive(Clone)]
 enum Kind {
+    /// Id of the saved profile being edited; None = new profile.
     Profile(Option<String>),
     Database,
     Account,
     Password(Account),
     Grant(Account),
-    Search,
+    /// Search for the list on this page.
+    Search(usize),
 }
-#[derive(Clone)]
 struct Dialog {
     kind: Kind,
     fields: Vec<Field>,
     focus: usize,
 }
+enum Pending {
+    Server(Change),
+    DeleteProfile { id: String },
+}
 struct Confirmation {
-    change: Change,
+    action: Pending,
     yes: bool,
 }
 pub struct App {
@@ -94,6 +117,7 @@ pub struct App {
     ascii: bool,
     page: usize,
     selected: usize,
+    selected_key: Option<RowKey>,
     horizontal: usize,
     detail_scroll: u16,
     detail_focus: bool,
@@ -102,11 +126,15 @@ pub struct App {
     dialog: Option<Dialog>,
     suspended: Option<Dialog>,
     confirm: Option<Confirmation>,
-    filter: String,
+    /// One search per page, like the desktop.
+    filters: [String; 6],
     system: bool,
     long: bool,
     detail: String,
     status: String,
+    status_at: std::time::Instant,
+    /// Worker generation the selection and account-bound drafts belong to.
+    scope_generation: u64,
     pub quit: bool,
 }
 #[derive(Clone, Copy)]
@@ -142,6 +170,7 @@ impl App {
             store,
             page: 4,
             selected: 0,
+            selected_key: None,
             horizontal: 0,
             detail_scroll: 0,
             detail_focus: false,
@@ -150,11 +179,13 @@ impl App {
             dialog: None,
             suspended: None,
             confirm: None,
-            filter: String::new(),
+            filters: Default::default(),
             system: false,
             long: false,
             detail: String::new(),
             status,
+            status_at: std::time::Instant::now(),
+            scope_generation: 0,
             quit: false,
         };
         if args.iter().any(|a| a == "--demo") {
@@ -168,10 +199,143 @@ impl App {
             );
             app.page = 0;
         }
+        app.scope_generation = app.session.worker.generation();
         app
     }
     pub fn tick(&mut self) {
         self.session.tick(self.settings.refresh_seconds);
+        self.sync_server_scope();
+        self.reconcile_selection();
+    }
+    fn filter(&self) -> &str {
+        &self.filters[self.page]
+    }
+    fn row_keys(&self) -> Vec<RowKey> {
+        match self.page {
+            1 => self
+                .databases()
+                .iter()
+                .map(|d| RowKey::Database(d.name.clone()))
+                .collect(),
+            2 => self
+                .accounts()
+                .iter()
+                .map(|a| RowKey::Account((*a).clone()))
+                .collect(),
+            3 => self
+                .processes()
+                .iter()
+                .map(|p| RowKey::Process(p.id))
+                .collect(),
+            4 => self
+                .settings
+                .profiles
+                .iter()
+                .map(|p| RowKey::Profile(p.id.clone()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+    fn remember_selection(&mut self) {
+        self.selected_key = self.row_keys().get(self.selected).cloned();
+    }
+    /// After a refresh the list can reorder (processes sort by time): keep the cursor
+    /// on the same row instead of the same index, so actions hit what the user chose.
+    fn reconcile_selection(&mut self) {
+        let keys = self.row_keys();
+        if keys.is_empty() {
+            return;
+        }
+        if let Some(index) = self
+            .selected_key
+            .as_ref()
+            .and_then(|key| keys.iter().position(|k| k == key))
+        {
+            self.selected = index;
+            return;
+        }
+        if self.page != 4 {
+            self.selected = self.selected.min(keys.len() - 1);
+        }
+        self.selected_key = keys.get(self.selected).cloned();
+    }
+    /// Selection, details and account-bound drafts belong to one server; after a
+    /// connect/demo/disconnect they would silently target the new server.
+    fn sync_server_scope(&mut self) {
+        let generation = self.session.worker.generation();
+        let switched = generation != self.scope_generation;
+        if switched {
+            self.scope_generation = generation;
+            self.selected = 0;
+            self.selected_key = None;
+            self.horizontal = 0;
+            self.detail.clear();
+            self.detail_scroll = 0;
+            if matches!(
+                self.confirm.as_ref().map(|c| &c.action),
+                Some(Pending::Server(_))
+            ) {
+                self.confirm = None;
+            }
+        }
+        let accounts = self.session.snapshot.as_ref().map(|s| &s.accounts);
+        let stale = |kind: &Kind| match kind {
+            Kind::Password(a) | Kind::Grant(a) => {
+                switched || accounts.is_some_and(|list| !list.contains(a))
+            }
+            _ => false,
+        };
+        let mut dropped = false;
+        for slot in [&mut self.dialog, &mut self.suspended] {
+            if slot.as_ref().is_some_and(|d| stale(&d.kind)) {
+                *slot = None;
+                dropped = true;
+            }
+        }
+        if let Some(Pending::Server(
+            Change::ChangePassword { account, .. } | Change::DatabaseGrant { account, .. },
+        )) = self.confirm.as_ref().map(|c| &c.action)
+        {
+            if accounts.is_some_and(|list| !list.contains(account)) {
+                self.confirm = None;
+                dropped = true;
+            }
+        }
+        if dropped {
+            self.say("Rozpracovaná změna účtu byla zahozena: účet patří jinému serveru nebo už neexistuje.");
+        }
+    }
+    fn say(&mut self, message: impl Into<String>) {
+        self.status = message.into();
+        self.status_at = std::time::Instant::now();
+    }
+    /// The newest of: own status, session error, connection test result. A stale error
+    /// or test result must not hide newer messages such as form validation errors.
+    fn status_line(&self) -> &str {
+        let session = &self.session;
+        [
+            Some((self.status_at, self.status.as_str())),
+            session.error.as_deref().map(|e| (session.error_at, e)),
+            session
+                .test_result
+                .as_deref()
+                .map(|t| (session.test_result_at, t)),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|(_, text)| !text.is_empty())
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, text)| text)
+        .unwrap_or("")
+    }
+    fn try_save<T>(&mut self, change: impl FnOnce(&mut Settings) -> Result<T>) -> Result<T> {
+        let (settings, value) = self
+            .store
+            .as_ref()
+            .ok_or_else(|| Error::Config("Úložiště není dostupné.".into()))?
+            .try_update(change)?;
+        self.settings = settings;
+        Ok(value)
     }
     fn save(&mut self, change: impl FnOnce(&mut Settings)) {
         match self
@@ -181,7 +345,7 @@ impl App {
             .and_then(|s| s.update(change))
         {
             Ok(settings) => self.settings = settings,
-            Err(e) => self.status = e.to_string(),
+            Err(e) => self.say(e.to_string()),
         }
     }
     fn next_theme(&mut self) {
@@ -343,12 +507,7 @@ impl App {
             5 => self.draw_settings(frame, rows[2], p),
             _ => self.draw_list(frame, rows[2], p),
         }
-        let status = self
-            .session
-            .error
-            .as_deref()
-            .or(self.session.test_result.as_deref())
-            .unwrap_or(&self.status);
+        let status = self.status_line();
         frame.render_widget(
             Paragraph::new(safe_text(status))
                 .wrap(Wrap { trim: false })
@@ -357,7 +516,7 @@ impl App {
         );
         frame.render_widget(
             Paragraph::new(
-                " F1 Pomoc  F3 Profily  F5 Obnovit  F10/Ctrl+M Menu  Esc Zpět  Ctrl+C Konec",
+                " F1 Pomoc  F3 Profily  F5 Obnovit  F10/F9/Alt+M Menu  Esc Zpět  Ctrl+C Konec",
             )
             .style(p.menu),
             rows[4],
@@ -368,7 +527,7 @@ impl App {
         if self.help {
             let area = centered(area, 74, 19);
             frame.render_widget(Clear, area);
-            frame.render_widget(Paragraph::new("F10 nebo Ctrl+M: všechny akce v nabídce\nŠipky / PageUp / PageDown: výběr a posuv\nEnter: otevřít detail, upravit profil nebo nastavení\nTab / Shift+Tab: další/předchozí pole nebo obrazovka\nVlevo/vpravo: vodorovný posuv seznamu\nEsc: zavřít; formulář zůstane rozpracovaný\nF3: profily, Enter: upravit uložený profil\nF5: obnovit data; Ctrl+C: ukončit\n\nZápisy vyžadují potvrzení; výchozí je Zrušit.\nDEMO je simulace bez skutečného serveru.\nTCP standardně vyžaduje ověřenou identitu TLS.\nBarvy 16 / truecolor / mono a ASCII: Nastavení.\nPři chybě zůstávají data označena jako neaktuální.\n\nEsc zavře nápovědu.").block(self.block(" Nápověda ", p)).style(p.base).wrap(Wrap { trim: false }), area);
+            frame.render_widget(Paragraph::new("F10, F9 nebo Alt+M: všechny akce v nabídce\nŠipky / PageUp / PageDown: výběr a posuv\nEnter: otevřít detail, upravit profil nebo nastavení\nTab / Shift+Tab: další/předchozí pole nebo obrazovka\nVlevo/vpravo: vodorovný posuv seznamu\nEsc: zavřít; formulář zůstane rozpracovaný\nF3: profily, Enter: upravit uložený profil\nF5: obnovit data; Ctrl+C: ukončit\n\nZápisy vyžadují potvrzení; výchozí je Zrušit.\nDEMO je simulace bez skutečného serveru.\nTCP standardně vyžaduje ověřenou identitu TLS.\nBarvy 16 / truecolor / mono a ASCII: Nastavení.\nPři chybě zůstávají data označena jako neaktuální.\n\nEsc zavře nápovědu.").block(self.block(" Nápověda ", p)).style(p.base).wrap(Wrap { trim: false }), area);
         }
         if let Some(index) = self.menu {
             let area = centered(area, 64, 24);
@@ -387,22 +546,36 @@ impl App {
         if let Some(confirm) = &self.confirm {
             let area = centered(area, 74, 12);
             frame.render_widget(Clear, area);
-            let query = match &confirm.change {
-                Change::KillQuery { target } => {
-                    format!("\n#{} {}", target.id, safe_text(&target.query))
+            let body = match &confirm.action {
+                Pending::Server(change) => {
+                    let query = match change {
+                        Change::KillQuery { target } => {
+                            format!("\n#{} {}", target.id, safe_text(&target.query))
+                        }
+                        _ => String::new(),
+                    };
+                    format!(
+                        "Server: {}\n{}{}\n\n{}",
+                        safe_text(profile),
+                        safe_text(&change.summary()),
+                        query,
+                        if self.session.snapshot.as_ref().is_some_and(|s| s.demo) {
+                            "DEMO • pouze paměť"
+                        } else {
+                            "Změna na připojeném serveru"
+                        }
+                    )
                 }
-                _ => String::new(),
+                Pending::DeleteProfile { id } => format!(
+                    "Odstranit uložený profil „{}“?\n\nZmění se jen konfigurace Harboru, server ne.",
+                    self.settings
+                        .profile(id)
+                        .map(|p| safe_text(&p.name))
+                        .unwrap_or_else(|| "(už neexistuje)".into())
+                ),
             };
             let text = format!(
-                "Server: {}\n{}{}\n\n{}\n\n{}\nTab / šipky změní volbu, Enter potvrdí, Esc zruší",
-                safe_text(profile),
-                safe_text(&confirm.change.summary()),
-                query,
-                if self.session.snapshot.as_ref().is_some_and(|s| s.demo) {
-                    "DEMO • pouze paměť"
-                } else {
-                    "Změna na připojeném serveru"
-                },
+                "{body}\n\n{}\nTab / šipky změní volbu, Enter potvrdí, Esc zruší",
                 if confirm.yes {
                     "  Zrušit       [ PROVÉST ZMĚNU ]"
                 } else {
@@ -434,7 +607,7 @@ impl App {
             .qps
             .map(|q| format!("{q:.1}"))
             .unwrap_or_else(|| "čekám na druhý vzorek".into());
-        let text = format!("MariaDB {} | Uptime {} dní {} h\nRelace {}/{} | {} databází | {}\nQuestions/s: {} | Dlouhé dotazy: {}\nOS: Nezjištěno | Časové pásmo: {}", safe_text(&s.version), s.uptime/86400, s.uptime/3600%24, s.connections, s.max_connections, s.databases.len(), bytes_label(s.bytes()), rate, s.long_queries(), safe_text(&s.timezone));
+        let text = format!("MariaDB {} | Uptime {} dní {} h\nRelace {}/{} | {} databází | {}\nDotazy klientů/s (bez Harboru): {} | Dlouhé dotazy: {}\nOS: Nezjištěno | Časové pásmo: {}", safe_text(&s.version), s.uptime/86400, s.uptime/3600%24, s.connections, s.max_connections, s.databases.len(), bytes_label(s.bytes()), rate, s.long_queries(), safe_text(&s.timezone));
         frame.render_widget(
             Paragraph::new(text)
                 .block(self.block(" Přehled serveru ", p))
@@ -450,7 +623,7 @@ impl App {
         frame.render_widget(
             Sparkline::default()
                 .data(&data)
-                .block(self.block(" Questions/s • naměřeno od připojení ", p))
+                .block(self.block(" Dotazy klientů/s • bez dotazů Harboru • od připojení ", p))
                 .style(Style::default().fg(p.accent)),
             rows[1],
         );
@@ -477,7 +650,7 @@ impl App {
                     .iter()
                     .filter(|d| {
                         (self.system || !d.system())
-                            && d.name.to_lowercase().contains(&self.filter.to_lowercase())
+                            && matches_filter(self.filter(), &[&d.name, &d.charset, &d.collation])
                     })
                     .collect()
             })
@@ -490,11 +663,7 @@ impl App {
             .map(|s| {
                 s.accounts
                     .iter()
-                    .filter(|a| {
-                        a.label()
-                            .to_lowercase()
-                            .contains(&self.filter.to_lowercase())
-                    })
+                    .filter(|a| matches_filter(self.filter(), &[&a.user, &a.host, &a.plugin]))
                     .collect()
             })
             .unwrap_or_default()
@@ -508,7 +677,10 @@ impl App {
                     .iter()
                     .filter(|p| {
                         (!self.long || p.long_query())
-                            && (p.user.contains(&self.filter) || p.query.contains(&self.filter))
+                            && matches_filter(
+                                self.filter(),
+                                &[&p.user, &p.host, &p.database, &p.command, &p.query],
+                            )
                     })
                     .collect()
             })
@@ -592,7 +764,7 @@ impl App {
                     format!(
                         " {} • filtr: {} • Enter detail ",
                         PAGES[self.page],
-                        safe_text(&self.filter)
+                        safe_text(self.filter())
                     ),
                     p,
                 ))
@@ -631,11 +803,29 @@ impl App {
                 .wrap(Wrap { trim: false })
                 .scroll((self.detail_scroll, 0))
                 .block(self.block(
-                    if self.detail_focus {
-                        " > Detail • šipky posouvají • Tab zpět "
-                    } else {
-                        " Detail • Tab aktivuje posuv • F10 akce "
-                    },
+                    format!(
+                        " {}{} ",
+                        match self.page {
+                            1 => self
+                                .session
+                                .tables_for
+                                .as_deref()
+                                .map(|db| format!("Tabulky {} • ", safe_text(db)))
+                                .unwrap_or_default(),
+                            2 => self
+                                .session
+                                .grants_for
+                                .as_ref()
+                                .map(|a| format!("Oprávnění {} • ", safe_text(&a.label())))
+                                .unwrap_or_default(),
+                            _ => String::new(),
+                        },
+                        if self.detail_focus {
+                            "> Detail • šipky posouvají • Tab zpět"
+                        } else {
+                            "Detail • Tab aktivuje posuv • F10 akce"
+                        }
+                    ),
                     p,
                 ))
                 .style(p.base),
@@ -708,6 +898,10 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        self.handle_key(key);
+        self.remember_selection();
+    }
+    fn handle_key(&mut self, key: KeyEvent) {
         if key.code == K::Char('c') && key.modifiers.contains(M::CONTROL) {
             self.quit = true;
             return;
@@ -716,8 +910,7 @@ impl App {
             self.confirm_key(key);
             return;
         }
-        if key.code == K::F(10) || (key.code == K::Char('m') && key.modifiers.contains(M::CONTROL))
-        {
+        if is_menu_key(&key) {
             self.menu = if self.menu.is_some() {
                 None
             } else {
@@ -760,7 +953,7 @@ impl App {
                 self.selected = 0;
             }
             K::F(5) => {
-                self.session.worker.send(Operation::Refresh);
+                self.session.request(Operation::Refresh);
             }
             K::Tab => {
                 self.detail_focus = !self.detail_focus;
@@ -806,7 +999,7 @@ impl App {
             1 => {
                 if let Some(db) = self.databases().get(self.selected) {
                     let name = db.name.clone();
-                    if self.session.worker.send(Operation::Tables(name)) {
+                    if self.session.request(Operation::Tables(name)) {
                         self.session.tables.clear();
                     }
                 }
@@ -814,7 +1007,7 @@ impl App {
             2 => {
                 if let Some(account) = self.accounts().get(self.selected) {
                     let account = (*account).clone();
-                    if self.session.worker.send(Operation::Grants(account)) {
+                    if self.session.request(Operation::Grants(account)) {
                         self.session.grants.clear();
                     }
                 }
@@ -874,7 +1067,7 @@ impl App {
         match index {
             6 => self.help = true,
             7 => {
-                self.session.worker.send(Operation::Refresh);
+                self.session.request(Operation::Refresh);
             }
             8 => self.profile_dialog(None),
             9 => {
@@ -912,7 +1105,7 @@ impl App {
             }
             13 | 14 => {
                 if self.page != 2 {
-                    self.status = "Nejprve vyberte účet na obrazovce Uživatelé.".into();
+                    self.say("Nejprve vyberte účet na obrazovce Uživatelé.");
                     return;
                 }
                 let account = self.accounts().get(self.selected).map(|a| (*a).clone());
@@ -938,28 +1131,28 @@ impl App {
                         }
                     });
                 } else {
-                    self.status = "Nejprve vyberte účet na obrazovce Uživatelé.".into();
+                    self.say("Nejprve vyberte účet na obrazovce Uživatelé.");
                 }
             }
             15 => {
                 if self.page != 3 {
-                    self.status = "Nejprve vyberte běžící dotaz na obrazovce Spojení.".into();
+                    self.say("Nejprve vyberte běžící dotaz na obrazovce Spojení.");
                     return;
                 }
                 let target = self.processes().get(self.selected).map(|p| (*p).clone());
                 if let Some(target) = target.filter(|p| p.running_query()) {
                     self.confirm = Some(Confirmation {
-                        change: Change::KillQuery { target },
+                        action: Pending::Server(Change::KillQuery { target }),
                         yes: false,
                     });
                 } else {
-                    self.status = "Vyberte běžící dotaz na obrazovce Spojení.".into();
+                    self.say("Vyberte běžící dotaz na obrazovce Spojení.");
                 }
             }
             16 => {
                 self.dialog = Some(Dialog {
-                    kind: Kind::Search,
-                    fields: vec![Field::new("Hledat", &self.filter)],
+                    kind: Kind::Search(self.page),
+                    fields: vec![Field::new("Hledat", self.filter())],
                     focus: 0,
                 })
             }
@@ -969,13 +1162,16 @@ impl App {
             20 => self.dialog = self.suspended.take(),
             21 => {
                 if self.page != 4 {
-                    self.status = "Profil k odstranění vyberte na obrazovce Profily.".into();
+                    self.say("Profil k odstranění vyberte na obrazovce Profily.");
                     return;
                 }
                 if let Some(profile) = self.settings.profiles.get(self.selected) {
-                    let name = profile.name.clone();
-                    self.save(|s| s.profiles.retain(|p| p.name != name));
-                    self.selected = 0;
+                    self.confirm = Some(Confirmation {
+                        action: Pending::DeleteProfile {
+                            id: profile.id.clone(),
+                        },
+                        yes: false,
+                    });
                 }
             }
             22 => self.quit = true,
@@ -983,14 +1179,14 @@ impl App {
         }
     }
     fn profile_dialog(&mut self, profile: Option<Profile>) {
-        let original_name = profile.as_ref().map(|p| p.name.clone());
+        let original_id = profile.as_ref().map(|p| p.id.clone());
         let profile = profile.unwrap_or_default();
         let (host, port, socket) = match profile.transport {
             Transport::Tcp { host, port } => (host, port.to_string(), String::new()),
             Transport::Unix { path } => ("localhost".into(), "3306".into(), path),
         };
         self.dialog = Some(Dialog {
-            kind: Kind::Profile(original_name),
+            kind: Kind::Profile(original_id),
             fields: vec![
                 Field::new("Název profilu", &profile.name),
                 Field::new("Hostitel TCP", &host),
@@ -1024,7 +1220,7 @@ impl App {
         match key.code {
             K::Esc => {
                 self.suspended = Some(d);
-                self.status = "Formulář zůstal rozpracovaný. Otevřete ho přes nabídku.".into();
+                self.say("Formulář zůstal rozpracovaný. Otevřete ho přes nabídku.");
                 return;
             }
             K::Tab | K::Down => d.focus = (d.focus + 1) % total,
@@ -1042,27 +1238,36 @@ impl App {
             K::Enter if d.focus < d.fields.len() => d.focus += 1,
             K::Enter if d.focus == d.fields.len() => {
                 self.suspended = Some(d);
-                self.status = "Formulář ponechán rozpracovaný.".into();
+                self.say("Formulář ponechán rozpracovaný.");
                 return;
             }
-            K::Enter => match self.submit(&d, d.focus - d.fields.len()) {
-                Ok(true) => return,
-                Ok(false) => (),
-                Err(error) => self.status = error.to_string(),
-            },
+            K::Enter => {
+                let button = d.focus - d.fields.len();
+                match self.submit(&mut d, button) {
+                    Ok(Outcome::Close) => return,
+                    Ok(Outcome::Suspend) => {
+                        self.suspended = Some(d);
+                        return;
+                    }
+                    Ok(Outcome::Keep) => (),
+                    Err(error) => self.say(error.to_string()),
+                }
+            }
             _ => (),
         }
         self.dialog = Some(d);
     }
-    fn submit(&mut self, d: &Dialog, button: usize) -> Result<bool> {
-        let v = |i: usize| d.fields[i].value.clone();
+    fn submit(&mut self, d: &mut Dialog, button: usize) -> Result<Outcome> {
+        let v = |i: usize| d.fields[i].value.to_string();
         let change = match &d.kind {
-            Kind::Search => {
-                self.filter = v(0);
-                self.selected = 0;
-                return Ok(true);
+            Kind::Search(page) => {
+                self.filters[*page] = v(0);
+                if *page == self.page {
+                    self.selected = 0;
+                }
+                return Ok(Outcome::Close);
             }
-            Kind::Profile(original_name) => {
+            Kind::Profile(original_id) => {
                 let tls = match v(7).as_str() {
                     "VERIFY" => TlsMode::VerifyIdentity,
                     "INSECURE_TEST_ONLY" => TlsMode::InsecureTestOnly,
@@ -1073,6 +1278,7 @@ impl App {
                     }
                 };
                 let profile = Profile {
+                    id: original_id.clone().unwrap_or_default(),
                     name: v(0),
                     user: v(3),
                     tls,
@@ -1087,28 +1293,27 @@ impl App {
                     } else {
                         Transport::Unix { path: v(5) }
                     },
+                    // upsert_profile keeps unknown fields of the stored profile.
+                    extra: Default::default(),
                 };
                 profile.validate()?;
                 if button == 1 {
-                    self.save(|s| {
-                        s.profiles.retain(|p| {
-                            p.name != profile.name && Some(&p.name) != original_name.as_ref()
-                        });
-                        s.profiles.push(profile);
-                    });
-                    self.status = "Profil uložen. Heslo není součástí konfigurace.".into();
-                    return Ok(false);
+                    let id = self.try_save(|s| s.upsert_profile(profile))?;
+                    // A second save of the same form updates this profile, not a new one.
+                    d.kind = Kind::Profile(Some(id));
+                    self.say("Profil uložen. Heslo není součástí konfigurace.");
+                    return Ok(Outcome::Keep);
                 }
                 if button == 2 {
-                    self.session.worker.send(Operation::TestConnection {
+                    self.session.request(Operation::TestConnection {
                         profile,
-                        password: Secret::new(v(4)),
+                        password: d.fields[4].secret(),
                     });
-                    return Ok(false);
+                    return Ok(Outcome::Keep);
                 }
-                self.session.connect(profile, Secret::new(v(4)), false);
+                self.session.connect(profile, d.fields[4].secret(), false);
                 self.page = 0;
-                return Ok(true);
+                return Ok(Outcome::Close);
             }
             Kind::Database => {
                 identifier(&v(0))?;
@@ -1120,11 +1325,11 @@ impl App {
             Kind::Account => Change::CreateAccount {
                 user: v(0),
                 host: v(1),
-                password: Secret::new(v(2)),
+                password: d.fields[2].secret(),
             },
             Kind::Password(account) => Change::ChangePassword {
                 account: account.clone(),
-                password: Secret::new(v(0)),
+                password: d.fields[0].secret(),
             },
             Kind::Grant(account) => {
                 let privilege = Privilege::ALL
@@ -1144,39 +1349,64 @@ impl App {
                 }
             }
         };
-        self.confirm = Some(Confirmation { change, yes: false });
-        self.suspended = Some(d.clone());
-        Ok(true)
+        self.confirm = Some(Confirmation {
+            action: Pending::Server(change),
+            yes: false,
+        });
+        // The caller moves the dialog to `suspended` (no copy of a typed password).
+        Ok(Outcome::Suspend)
     }
     fn confirm_key(&mut self, key: KeyEvent) {
         let Some(mut confirm) = self.confirm.take() else {
             return;
         };
+        let profile_delete = matches!(confirm.action, Pending::DeleteProfile { .. });
         match key.code {
             K::Esc => {
-                self.dialog = self.suspended.take();
+                if !profile_delete {
+                    self.dialog = self.suspended.take();
+                }
                 return;
             }
             K::Tab | K::BackTab | K::Left | K::Right => confirm.yes = !confirm.yes,
             K::Enter if !confirm.yes => {
-                self.dialog = self.suspended.take();
+                if !profile_delete {
+                    self.dialog = self.suspended.take();
+                }
                 return;
             }
             K::Enter => {
-                if self
-                    .session
-                    .worker
-                    .send(Operation::Apply(confirm.change.clone()))
-                {
+                let change = match &confirm.action {
+                    Pending::DeleteProfile { id } => {
+                        let id = id.clone();
+                        match self.try_save(|s| s.remove_profile(&id)) {
+                            Ok(profile) => {
+                                self.status =
+                                    format!("Profil „{}“ odstraněn.", safe_text(&profile.name));
+                                self.selected = 0;
+                            }
+                            Err(error) => self.say(error.to_string()),
+                        }
+                        return;
+                    }
+                    Pending::Server(change) => change.clone(),
+                };
+                if self.session.request(Operation::Apply(change)) {
                     self.suspended = None;
                     return;
                 }
-                self.status = "Jiná operace právě běží; potvrzení zůstává otevřené.".into();
+                self.say("Jiná operace právě běží; potvrzení zůstává otevřené.");
             }
             _ => (),
         }
         self.confirm = Some(confirm);
     }
+}
+/// Ctrl+M is not usable: terminals send it as CR, which crossterm reports as Enter.
+/// F9 and Alt+M are alternatives for terminals that capture F10 (e.g. GNOME Terminal).
+fn is_menu_key(key: &KeyEvent) -> bool {
+    matches!(key.code, K::F(10) | K::F(9))
+        || (matches!(key.code, K::Char('m') | K::Char('M')) && key.modifiers.contains(M::ALT))
 }
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width);
@@ -1198,7 +1428,7 @@ mod tests {
         let mut app = App::new(&[]);
         app.store = None;
         app.profile_dialog(None);
-        app.dialog.as_mut().unwrap().fields[0].value = "Rozpracováno".into();
+        app.dialog.as_mut().unwrap().fields[0].value = Zeroizing::new("Rozpracováno".into());
         for theme in ThemeId::TERMINAL {
             app.theme = theme;
             for colors in ["16", "mono", "truecolor"] {
@@ -1215,7 +1445,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(app.dialog.unwrap().fields[0].value, "Rozpracováno");
+        assert_eq!(app.dialog.unwrap().fields[0].value.as_str(), "Rozpracováno");
     }
     #[test]
     fn input_menu_theme_keeps_form_and_confirmation_defaults_to_cancel() {
@@ -1227,14 +1457,253 @@ mod tests {
         app.key(KeyEvent::new(K::Enter, M::NONE));
         assert!(app.dialog.is_some());
         app.confirm = Some(Confirmation {
-            change: Change::CreateDatabase {
+            action: Pending::Server(Change::CreateDatabase {
                 name: "test".into(),
                 collation: "utf8mb4_unicode_ci".into(),
-            },
+            }),
             yes: false,
         });
         app.key(KeyEvent::new(K::Enter, M::NONE));
         assert!(app.confirm.is_none());
         assert!(!app.session.worker.busy);
+    }
+    #[test]
+    fn menu_opens_with_f10_f9_alt_m_but_not_enter() {
+        let mut app = App::new(&[]);
+        app.store = None;
+        app.page = 0;
+        for key in [
+            KeyEvent::new(K::F(10), M::NONE),
+            KeyEvent::new(K::F(9), M::NONE),
+            KeyEvent::new(K::Char('m'), M::ALT),
+        ] {
+            app.menu = None;
+            app.key(key);
+            assert!(app.menu.is_some(), "{key:?}");
+        }
+        app.menu = None;
+        app.key(KeyEvent::new(K::Enter, M::NONE));
+        assert!(app.menu.is_none());
+    }
+    #[test]
+    fn newer_form_message_is_not_hidden_by_an_older_connection_error() {
+        let mut app = App::new(&[]);
+        app.store = None;
+        // A refused TCP connection leaves a persistent session error (no snapshot).
+        app.session.connect(
+            Profile {
+                transport: Transport::Tcp {
+                    host: "127.0.0.1".into(),
+                    port: 1,
+                },
+                tls: TlsMode::InsecureTestOnly,
+                ..Default::default()
+            },
+            Secret::default(),
+            false,
+        );
+        let start = std::time::Instant::now();
+        while app.session.worker.busy && start.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.tick();
+        }
+        let error = app.session.error.clone().expect("connection error");
+        assert_eq!(app.status_line(), error);
+        app.profile_dialog(None);
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.fields[2].value = Zeroizing::new("není port".into());
+        dialog.focus = dialog.fields.len() + 1; // "Uložit"
+        key(&mut app, K::Enter);
+        assert_eq!(app.status_line(), "Neplatný vstup: Neplatný port.");
+    }
+    #[test]
+    fn enter_on_a_database_during_refresh_is_queued() {
+        let mut app = App::new(&["--demo".to_string()]);
+        app.store = None;
+        wait_idle(&mut app);
+        app.page = 1;
+        app.selected = 0;
+        assert!(app.session.request(Operation::Refresh));
+        assert!(app.session.worker.busy);
+        key(&mut app, K::Enter);
+        assert!(app.session.has_pending());
+        let start = std::time::Instant::now();
+        while (app.session.worker.busy || app.session.has_pending())
+            && start.elapsed() < std::time::Duration::from_secs(3)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.tick();
+        }
+        assert!(!app.session.tables.is_empty());
+    }
+    #[test]
+    fn selection_follows_the_row_when_a_refresh_reorders_the_list() {
+        let mut app = App::new(&["--demo".to_string()]);
+        app.store = None;
+        wait_idle(&mut app);
+        app.page = 3;
+        let target = app.processes()[1].id;
+        app.selected = 1;
+        app.remember_selection();
+        // A new long query appears on top (processes sort by time).
+        let mut snapshot = (**app.session.snapshot.as_ref().unwrap()).clone();
+        let mut newcomer = snapshot.processes[0].clone();
+        newcomer.id = 9999;
+        newcomer.seconds = 10_000;
+        snapshot.processes.insert(0, newcomer);
+        app.session.snapshot = Some(std::sync::Arc::new(snapshot));
+        app.reconcile_selection();
+        assert_eq!(app.processes()[app.selected].id, target);
+        // The row vanished: the cursor stays in range and picks a real row.
+        let mut snapshot = (**app.session.snapshot.as_ref().unwrap()).clone();
+        snapshot.processes.retain(|p| p.id != target);
+        app.session.snapshot = Some(std::sync::Arc::new(snapshot));
+        app.reconcile_selection();
+        assert!(app.selected < app.processes().len());
+        assert_eq!(
+            app.selected_key,
+            Some(RowKey::Process(app.processes()[app.selected].id))
+        );
+    }
+    #[test]
+    fn filters_are_per_page_and_case_insensitive() {
+        let mut app = App::new(&["--demo".to_string()]);
+        app.store = None;
+        wait_idle(&mut app);
+        app.page = 3;
+        app.action(16);
+        app.dialog.as_mut().unwrap().fields[0].value = Zeroizing::new("SELECT DATE".into());
+        app.dialog.as_mut().unwrap().focus = 2; // "Zkontrolovat"
+        key(&mut app, K::Enter);
+        assert_eq!(
+            app.processes().len(),
+            1,
+            "process query matched case-insensitively"
+        );
+        app.page = 1;
+        assert!(
+            !app.databases().is_empty(),
+            "the database list has its own filter"
+        );
+        app.page = 2;
+        app.filters[2] = "ANALYTICS".into();
+        assert_eq!(app.accounts().len(), 1);
+    }
+    #[test]
+    fn cancelled_confirmation_returns_the_same_draft_with_its_password() {
+        let mut app = App::new(&["--demo".to_string()]);
+        app.store = None;
+        wait_idle(&mut app);
+        app.action(12); // create account
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.fields[0].value = Zeroizing::new("novy".into());
+        dialog.fields[2].value = Zeroizing::new("tajne".into());
+        dialog.focus = dialog.fields.len() + 1;
+        key(&mut app, K::Enter);
+        assert!(app.confirm.is_some());
+        assert!(app.dialog.is_none(), "dialog moved away, not copied");
+        key(&mut app, K::Esc);
+        assert_eq!(
+            app.dialog.as_ref().unwrap().fields[2].value.as_str(),
+            "tajne"
+        );
+        let dialog = app.dialog.as_mut().unwrap();
+        dialog.focus = dialog.fields.len() + 1;
+        key(&mut app, K::Enter);
+        key(&mut app, K::Tab);
+        key(&mut app, K::Enter);
+        assert!(app.suspended.is_none() && app.dialog.is_none());
+    }
+    fn wait_idle(app: &mut App) {
+        let start = std::time::Instant::now();
+        app.tick();
+        while app.session.worker.busy && start.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            app.tick();
+        }
+        assert!(app.session.snapshot.is_some());
+    }
+    fn key(app: &mut App, code: K) {
+        app.key(KeyEvent::new(code, M::NONE));
+    }
+    #[test]
+    fn switching_server_drops_account_bound_drafts_and_confirmation() {
+        let mut app = App::new(&["--demo".to_string()]);
+        app.store = None;
+        wait_idle(&mut app);
+        app.page = 2;
+        app.selected = 1;
+        app.action(13); // change password of the selected account
+        assert!(matches!(
+            app.dialog.as_ref().unwrap().kind,
+            Kind::Password(_)
+        ));
+        key(&mut app, K::Esc); // the draft is kept as suspended
+        assert!(app.suspended.is_some());
+        app.tick();
+        assert!(app.suspended.is_some(), "same server keeps the draft");
+        let account = app.accounts()[1].clone();
+        app.confirm = Some(Confirmation {
+            action: Pending::Server(Change::ChangePassword {
+                account,
+                password: Secret::new("x".into()),
+            }),
+            yes: true,
+        });
+        app.action(9); // open DEMO again = new server session
+        app.tick();
+        assert!(app.suspended.is_none());
+        assert!(app.dialog.is_none());
+        assert!(app.confirm.is_none());
+        assert_eq!(app.selected, 0);
+        assert!(app.status.contains("zahozena"));
+    }
+    #[test]
+    fn profiles_are_keyed_by_id_and_deletion_needs_confirmation() {
+        let directory =
+            std::env::temp_dir().join(format!("harbor-tui-profiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut app = App::new(&[]);
+        app.store = Some(ConfigStore::at(directory.clone()));
+        app.settings = Settings::default();
+        let save = |app: &mut App, name: &str, existing: Option<Profile>| {
+            app.profile_dialog(existing);
+            let dialog = app.dialog.as_mut().unwrap();
+            dialog.fields[0].value = name.to_string().into();
+            dialog.focus = dialog.fields.len() + 1; // "Uložit"
+            key(app, K::Enter);
+        };
+        save(&mut app, "A", None);
+        // Saving the same open form again must update, not duplicate.
+        key(&mut app, K::Enter);
+        assert_eq!(app.settings.profiles.len(), 1);
+        save(&mut app, "B", None);
+        assert_eq!(app.settings.profiles.len(), 2);
+        let a = app.settings.profiles[0].clone();
+        save(&mut app, "b", Some(a.clone()));
+        assert!(app.status.contains("už existuje"), "{}", app.status);
+        assert_eq!(app.settings.profiles.len(), 2);
+        assert_eq!(app.settings.profile(&a.id).unwrap().name, "A");
+        app.dialog = None;
+        app.page = 4;
+        app.selected = 0;
+        app.action(21);
+        assert_eq!(
+            app.settings.profiles.len(),
+            2,
+            "nothing deleted before confirmation"
+        );
+        key(&mut app, K::Enter); // default is Cancel
+        assert_eq!(app.settings.profiles.len(), 2);
+        assert!(
+            app.dialog.is_none(),
+            "cancel must not reopen an unrelated draft"
+        );
+        app.action(21);
+        key(&mut app, K::Tab);
+        key(&mut app, K::Enter);
+        assert_eq!(app.settings.profiles.len(), 1);
+        assert_eq!(app.settings.profiles[0].name, "B");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

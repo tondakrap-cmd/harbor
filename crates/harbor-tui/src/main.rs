@@ -30,7 +30,7 @@ fn run() -> io::Result<()> {
         return Ok(());
     }
     if args.iter().any(|a| a == "--help") {
-        println!("harbor-tui [--demo] [--ascii] [--colors=16|mono|truecolor]\nF1 nápověda • F10 nebo Ctrl+M nabídka • Ctrl+C konec\nBez --demo se aplikace nepřipojí automaticky k žádnému serveru.");
+        println!("harbor-tui [--demo] [--ascii] [--colors=16|mono|truecolor]\nF1 nápověda • F10, F9 nebo Alt+M nabídka • Ctrl+C konec\nBez --demo se aplikace nepřipojí automaticky k žádnému serveru.");
         return Ok(());
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {

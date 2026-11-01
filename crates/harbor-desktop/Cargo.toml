@@ -12,5 +12,6 @@ path = "src/main.rs"
 [dependencies]
 harbor-core.workspace = true
 harbor-themes.workspace = true
+zeroize.workspace = true
 eframe.workspace = true
 

@@ -5,4 +5,4 @@ mod worker;
 pub use backend::Backend;
 pub use config::{ConfigStore, Settings};
 pub use model::*;
-pub use worker::{Operation, Response, Session, Worker};
+pub use worker::{Operation, OperationKind, Response, Session, Worker};

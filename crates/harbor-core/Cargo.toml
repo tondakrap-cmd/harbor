@@ -13,5 +13,6 @@ sqlx.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+sha1.workspace = true
 fs2.workspace = true
 

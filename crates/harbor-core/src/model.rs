@@ -21,6 +21,12 @@ pub enum Error {
     Timeout,
     #[error("Konfigurace: {0}")]
     Config(String),
+    #[error("Interní chyba: databázové vlákno skončilo. Restartujte aplikaci.")]
+    Worker,
+    #[error(
+        "Protokol: na adrese neodpovídá MariaDB/MySQL server (zkontrolujte port a typ služby)."
+    )]
+    Protocol,
     #[error("Databázová operace selhala (kód {0}). Citlivé údaje nejsou vypsány.")]
     Database(String),
 }
@@ -53,6 +59,10 @@ impl From<sqlx::Error> for Error {
                 Self::Database(format!("nekompatibilní typ sloupce {index}"))
             }
             sqlx::Error::ColumnNotFound(index) => Self::Database(format!("chybí sloupec {index}")),
+            sqlx::Error::Configuration(_) => {
+                Self::Config("neplatné parametry připojení (hostitel, socket nebo CA).".into())
+            }
+            sqlx::Error::Protocol(_) => Self::Protocol,
             _ => Self::Database("ovladač".into()),
         }
     }
@@ -79,15 +89,22 @@ pub enum TlsMode {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Profile {
+    /// Stable key of a saved profile. Empty = not saved yet. Names are only labels.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub transport: Transport,
     pub user: String,
     pub tls: TlsMode,
     pub ca: Option<String>,
+    /// Fields written by a newer Harbor version; kept so an older client does not drop them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 impl Default for Profile {
     fn default() -> Self {
         Self {
+            id: String::new(),
             name: "Nové připojení".into(),
             transport: Transport::Tcp {
                 host: "localhost".into(),
@@ -96,6 +113,7 @@ impl Default for Profile {
             user: "harbor".into(),
             tls: TlsMode::VerifyIdentity,
             ca: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -160,6 +178,8 @@ pub struct TableInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Process {
     pub id: u64,
+    /// MariaDB QUERY_ID of the running statement; KILL QUERY ID targets exactly this one.
+    pub query_id: u64,
     pub user: String,
     pub host: String,
     pub database: String,
@@ -189,6 +209,8 @@ pub struct Snapshot {
     pub notices: Vec<String>,
     pub timezone: String,
     pub demo: bool,
+    /// Server connection the counters were read on; a reconnect restarts rate sampling.
+    pub source: u64,
 }
 impl Snapshot {
     pub fn bytes(&self) -> u64 {
@@ -272,6 +294,25 @@ impl Change {
         }
     }
 }
+/// Unique enough for a per-user config file; collisions are additionally checked on insert.
+pub fn new_profile_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "p{nanos:x}-{:x}-{:x}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+/// Case-insensitive search shared by both UIs: empty filter matches everything.
+pub fn matches_filter(filter: &str, fields: &[&str]) -> bool {
+    let filter = filter.trim().to_lowercase();
+    filter.is_empty() || fields.iter().any(|f| f.to_lowercase().contains(&filter))
+}
 pub fn identifier(value: &str) -> Result<String> {
     if value.is_empty()
         || value.chars().count() > 64
@@ -303,16 +344,21 @@ pub fn bytes_label(bytes: u64) -> String {
 }
 #[derive(Default)]
 pub struct Rate {
-    previous: Option<(u64, u64, Instant)>,
+    previous: Option<(u64, u64, u64, Instant)>,
 }
 impl Rate {
-    pub fn sample(&mut self, count: u64, uptime: u64, now: Instant) -> Option<f64> {
-        let result = self.previous.and_then(|(old, old_uptime, at)| {
+    /// `source` identifies the counter's origin (server connection); a change, a server
+    /// restart (uptime going back) or a counter going back starts sampling over.
+    pub fn sample(&mut self, count: u64, uptime: u64, source: u64, now: Instant) -> Option<f64> {
+        let result = self.previous.and_then(|(old, old_uptime, old_source, at)| {
             let duration = now.saturating_duration_since(at);
-            (count >= old && uptime >= old_uptime && duration >= Duration::from_millis(1))
-                .then(|| (count - old) as f64 / duration.as_secs_f64())
+            (source == old_source
+                && count >= old
+                && uptime >= old_uptime
+                && duration >= Duration::from_millis(1))
+            .then(|| (count - old) as f64 / duration.as_secs_f64())
         });
-        self.previous = Some((count, uptime, now));
+        self.previous = Some((count, uptime, source, now));
         result
     }
 }

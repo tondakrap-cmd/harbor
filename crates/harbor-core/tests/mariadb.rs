@@ -44,9 +44,41 @@ async fn isolated_mariadb_round_trip() {
         ..Default::default()
     };
     let mut backend = Backend::connect(&profile, Secret::default()).await.unwrap();
+    backend.set_size_refresh_interval(std::time::Duration::from_secs(3600));
     let snapshot = backend.snapshot().await.unwrap();
     assert!(!snapshot.demo);
     assert!(snapshot.version.contains("MariaDB"));
+    // Questions/s must not count Harbor's own monitoring statements: with no other
+    // client active, the external counter does not move between two snapshots.
+    let again = backend.snapshot().await.unwrap();
+    assert_eq!(again.source, snapshot.source);
+    assert_eq!(again.questions, snapshot.questions);
+    // The overview must report the server's global time zone, not sqlx's session +00:00.
+    let previous_zone: String = sqlx::query_scalar("SELECT @@global.time_zone")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    sqlx::query("SET GLOBAL time_zone = '+02:00'")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    let zone = backend.snapshot().await.unwrap().timezone;
+    sqlx::query("SET GLOBAL time_zone = ?")
+        .bind(&previous_zone)
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(zone, "+02:00");
+    let system_zone: String = sqlx::query_scalar("SELECT @@system_time_zone")
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    if previous_zone == "SYSTEM" {
+        assert_eq!(
+            backend.snapshot().await.unwrap().timezone,
+            format!("SYSTEM ({system_zone})")
+        );
+    }
     sqlx::query("DROP DATABASE IF EXISTS `harborXtest``db`")
         .execute(&mut admin)
         .await
@@ -55,6 +87,26 @@ async fn isolated_mariadb_round_trip() {
         .execute(&mut admin)
         .await
         .unwrap();
+    // Sizes/table counts are measured once per interval, not on every refresh...
+    backend.set_size_refresh_interval(std::time::Duration::ZERO);
+    backend.snapshot().await.unwrap();
+    backend.set_size_refresh_interval(std::time::Duration::from_secs(3600));
+    sqlx::query("CREATE TABLE `harborXtest``db`.`size_probe` (id INT)")
+        .execute(&mut admin)
+        .await
+        .unwrap();
+    let tables_of = |snapshot: &Snapshot, name: &str| {
+        snapshot
+            .databases
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.tables)
+    };
+    assert_eq!(
+        tables_of(&backend.snapshot().await.unwrap(), "harborXtest`db"),
+        Some(0),
+        "cached measurement is reused within the interval"
+    );
     backend
         .apply(Change::CreateDatabase {
             name: "harbor_test`db".into(),
@@ -62,13 +114,13 @@ async fn isolated_mariadb_round_trip() {
         })
         .await
         .unwrap();
-    assert!(backend
-        .snapshot()
-        .await
-        .unwrap()
+    let after_write = backend.snapshot().await.unwrap();
+    assert!(after_write
         .databases
         .iter()
         .any(|d| d.name == "harbor_test`db"));
+    // ...but Harbor's own write invalidates the cache.
+    assert_eq!(tables_of(&after_write, "harborXtest`db"), Some(1));
     sqlx::query("CREATE TABLE `harbor_test``db`.`česká_tabulka` (id INT PRIMARY KEY)")
         .execute(&mut admin)
         .await
@@ -92,6 +144,26 @@ async fn isolated_mariadb_round_trip() {
         host: "localhost".into(),
         plugin: "mysql_native_password".into(),
     };
+    // Harbor sends only the client-side hash; the server must store exactly PASSWORD(plaintext).
+    let same_hash: i64 = sqlx::query_scalar(
+        "SELECT PASSWORD(?) = (SELECT authentication_string FROM mysql.user WHERE User=? AND Host=?)",
+    )
+    .bind("test'p\\ass")
+    .bind(&account.user)
+    .bind(&account.host)
+    .fetch_one(&mut admin)
+    .await
+    .unwrap();
+    assert_eq!(same_hash, 1);
+    Backend::connect(
+        &Profile {
+            user: account.user.clone(),
+            ..profile.clone()
+        },
+        Secret::new("test'p\\ass".into()),
+    )
+    .await
+    .unwrap();
     backend
         .apply(Change::DatabaseGrant {
             account: account.clone(),
@@ -184,7 +256,28 @@ async fn isolated_mariadb_round_trip() {
             .await,
         Err(Error::Validation(_))
     ));
-    backend.apply(Change::KillQuery { target }).await.unwrap();
+    let mut other_statement = target.clone();
+    other_statement.query_id += 1;
+    assert!(matches!(
+        backend
+            .apply(Change::KillQuery {
+                target: other_statement
+            })
+            .await,
+        Err(Error::Validation(_))
+    ));
+    assert_ne!(target.query_id, 0);
+    backend
+        .apply(Change::KillQuery {
+            target: target.clone(),
+        })
+        .await
+        .unwrap();
+    // The same statement cannot be killed twice (it no longer runs).
+    assert!(matches!(
+        backend.apply(Change::KillQuery { target }).await,
+        Err(Error::Validation(_))
+    ));
     let (_, mut sleeper) = task.await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i32>("SELECT 1")

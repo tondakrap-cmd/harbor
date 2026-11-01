@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke, Vec2};
 use harbor_core::*;
 use harbor_themes::{desktop, rgb, ThemeId};
-use std::time::Duration;
+use zeroize::Zeroizing;
 
 const PAGES: [&str; 6] = [
     "Přehled serveru",
@@ -17,24 +17,34 @@ pub struct Harbor {
     settings: Settings,
     theme: ThemeId,
     page: usize,
-    filter: String,
+    /// One search per list page (index = page), so typing on one page does not
+    /// filter another.
+    filters: [String; 4],
     system: bool,
     long_only: bool,
     selected_db: Option<String>,
     selected_account: Option<Account>,
     selected_process: Option<Process>,
     profile: Profile,
-    editing_profile: Option<String>,
+    /// Saved-profile id waiting for delete confirmation.
+    delete_profile: Option<String>,
+    /// Worker generation the selections and drafts below belong to.
+    scope_generation: u64,
     host: String,
     port: u16,
     socket: String,
     unix: bool,
-    password: String,
+    password: Zeroizing<String>,
     change_kind: Option<usize>,
-    change_name: String,
+    change_db_name: String,
+    change_user: String,
     change_host: String,
     change_db: String,
-    change_password: String,
+    change_password: Zeroizing<String>,
+    /// Slider value while it is being dragged; persisted only on release.
+    refresh_draft: Option<u64>,
+    /// Theme whose egui style is currently installed (style is set only on change).
+    styled: Option<ThemeId>,
     collation: String,
     privilege: usize,
     grant: bool,
@@ -150,24 +160,28 @@ impl Harbor {
             settings,
             theme,
             page: if demo { 0 } else { 4 },
-            filter: String::new(),
+            filters: Default::default(),
             system: false,
             long_only: false,
             selected_db: None,
             selected_account: None,
             selected_process: None,
             profile: Profile::default(),
-            editing_profile: None,
+            delete_profile: None,
+            scope_generation: 0,
             host: "localhost".into(),
             port: 3306,
             socket: "/run/mysqld/mysqld.sock".into(),
             unix: false,
-            password: String::new(),
+            password: Zeroizing::new(String::new()),
             change_kind: None,
-            change_name: String::new(),
+            change_db_name: String::new(),
+            change_user: String::new(),
             change_host: "localhost".into(),
             change_db: String::new(),
-            change_password: String::new(),
+            change_password: Zeroizing::new(String::new()),
+            refresh_draft: None,
+            styled: None,
             collation: "utf8mb4_unicode_ci".into(),
             privilege: 0,
             grant: true,
@@ -185,21 +199,101 @@ impl Harbor {
                 true,
             );
         }
+        app.scope_generation = app.session.worker.generation();
         app
     }
-    fn save(&mut self, change: impl FnOnce(&mut Settings)) {
+    /// Selections and account-bound drafts belong to one server. After connect/demo/
+    /// disconnect they would silently target an account on a different server.
+    fn sync_server_scope(&mut self) {
+        let generation = self.session.worker.generation();
+        if generation != self.scope_generation {
+            self.scope_generation = generation;
+            self.selected_db = None;
+            self.selected_account = None;
+            self.selected_process = None;
+            self.confirmation = None;
+            self.change_password.clear();
+            if matches!(self.change_kind, Some(2 | 3)) {
+                self.change_kind = None;
+            }
+        }
+        let Some(snapshot) = &self.session.snapshot else {
+            return;
+        };
+        if self
+            .selected_account
+            .as_ref()
+            .is_some_and(|a| !snapshot.accounts.contains(a))
+        {
+            self.selected_account = None;
+            self.session.grants.clear();
+            if matches!(self.change_kind, Some(2 | 3)) {
+                self.change_kind = None;
+            }
+            if matches!(
+                self.confirmation,
+                Some(Change::ChangePassword { .. } | Change::DatabaseGrant { .. })
+            ) {
+                self.confirmation = None;
+            }
+        }
+        if self
+            .selected_db
+            .as_ref()
+            .is_some_and(|name| !snapshot.databases.iter().any(|d| &d.name == name))
+        {
+            self.selected_db = None;
+            self.session.tables.clear();
+        }
+    }
+    fn try_save<T>(&mut self, change: impl FnOnce(&mut Settings) -> Result<T>) -> Option<T> {
         match self
             .store
             .as_ref()
             .ok_or_else(|| Error::Config("Úložiště není dostupné.".into()))
-            .and_then(|s| s.update(change))
+            .and_then(|s| s.try_update(change))
         {
-            Ok(settings) => {
+            Ok((settings, value)) => {
                 self.settings = settings;
                 self.message.clear();
+                Some(value)
             }
-            Err(error) => self.message = error.to_string(),
+            Err(error) => {
+                self.message = error.to_string();
+                None
+            }
         }
+    }
+    fn save_profile(&mut self) {
+        let profile = self.profile.clone();
+        if let Some(id) = self.try_save(move |s| s.upsert_profile(profile)) {
+            self.profile.id = id;
+        }
+    }
+    fn request_delete_profile(&mut self) {
+        // By id of the loaded profile, never by the (possibly edited) name in the form.
+        if self.settings.profile(&self.profile.id).is_some() {
+            self.delete_profile = Some(self.profile.id.clone());
+            self.confirmation_focus = true;
+        } else {
+            self.message = "Formulář neodpovídá žádnému uloženému profilu.".into();
+        }
+    }
+    fn confirm_delete_profile(&mut self) {
+        let Some(id) = self.delete_profile.take() else {
+            return;
+        };
+        let target = id.clone();
+        if self.try_save(move |s| s.remove_profile(&target)).is_some() && self.profile.id == id {
+            // The form stays filled in as an unsaved draft.
+            self.profile.id.clear();
+        }
+    }
+    fn save(&mut self, change: impl FnOnce(&mut Settings)) {
+        self.try_save(|settings| {
+            change(settings);
+            Ok(())
+        });
     }
     fn style(&self, ctx: &egui::Context, p: Palette) {
         let mut v = if self.theme == ThemeId::Nocturne {
@@ -236,9 +330,15 @@ impl Harbor {
         ui.label("Uložené profily (hesla zůstávají pouze v paměti relace)");
         ui.horizontal_wrapped(|ui| {
             for profile in self.settings.profiles.clone() {
-                if ui.button(&profile.name).clicked() {
+                if ui
+                    .selectable_label(self.profile.id == profile.id, safe_text(&profile.name))
+                    .clicked()
+                {
                     self.load_profile(profile);
                 }
+            }
+            if ui.button("+ Nový profil").clicked() {
+                self.load_profile(Profile::default());
             }
         });
         card(ui, p, |ui| {
@@ -287,43 +387,29 @@ impl Harbor {
             }
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Uložit profil").clicked() {
-                    match self.profile.validate() {
-                        Ok(()) => {
-                            let profile = self.profile.clone();
-                            let old_name = self.editing_profile.clone();
-                            self.save(move |s| {
-                                s.profiles.retain(|p| {
-                                    p.name != profile.name && Some(&p.name) != old_name.as_ref()
-                                });
-                                s.profiles.push(profile);
-                            });
-                        }
-                        Err(e) => self.message = e.to_string(),
-                    }
-                }
-                if ui.button("Odstranit uložený profil").clicked() {
-                    let name = self.profile.name.clone();
-                    self.save(move |s| s.profiles.retain(|p| p.name != name));
+                    self.save_profile();
                 }
                 if ui
                     .add_enabled(
-                        !self.session.worker.busy,
-                        egui::Button::new("Otestovat spojení"),
+                        self.settings.profile(&self.profile.id).is_some(),
+                        egui::Button::new("Odstranit uložený profil…"),
                     )
                     .clicked()
                 {
-                    self.session.worker.send(Operation::TestConnection {
+                    self.request_delete_profile();
+                }
+                // Queued if a refresh is running; never silently dropped.
+                if ui.button("Otestovat spojení").clicked() {
+                    self.session.request(Operation::TestConnection {
                         profile: self.profile.clone(),
-                        password: Secret::new(self.password.clone()),
+                        password: Secret(self.password.clone()),
                     });
                 }
-                if ui
-                    .add_enabled(!self.session.worker.busy, egui::Button::new("Připojit"))
-                    .clicked()
-                {
+                // Connect cancels a running read; Session refuses it only during a write.
+                if ui.button("Připojit").clicked() {
                     self.session.connect(
                         self.profile.clone(),
-                        Secret::new(std::mem::take(&mut self.password)),
+                        Secret(std::mem::take(&mut self.password)),
                         false,
                     );
                     self.page = 0;
@@ -340,7 +426,6 @@ impl Harbor {
         });
     }
     fn load_profile(&mut self, profile: Profile) {
-        self.editing_profile = Some(profile.name.clone());
         match &profile.transport {
             Transport::Tcp { host, port } => {
                 self.host = host.clone();
@@ -397,7 +482,9 @@ impl Harbor {
         ui.add_space(12.0);
         card(ui, p, |ui| {
             ui.heading("Provoz serveru");
-            ui.label("Questions • měřeno od připojení • nejvýše 120 vzorků");
+            ui.label(
+                "Dotazy klientů za sekundu • bez dotazů Harboru • měřeno od připojení • nejvýše 120 vzorků",
+            );
             chart(
                 ui,
                 &self.session.history.iter().copied().collect::<Vec<_>>(),
@@ -412,13 +499,13 @@ impl Harbor {
         }
         card(ui, p, |ui| {
             ui.heading("Informace o instanci");
-            ui.label(format!("MariaDB: {}", s.version));
+            ui.label(format!("MariaDB: {}", safe_text(&s.version)));
             ui.label("Operační systém: Nezjištěno");
-            ui.label(format!("Časové pásmo serveru: {}", s.timezone));
+            ui.label(format!("Časové pásmo serveru: {}", safe_text(&s.timezone)));
             if let Some(profile) = &self.session.profile {
                 ui.label(format!(
                     "Účet: {} • {}",
-                    profile.user,
+                    safe_text(&profile.user),
                     if s.demo {
                         "DEMO bez spojení"
                     } else {
@@ -438,18 +525,15 @@ impl Harbor {
     }
     fn databases(&mut self, ui: &mut egui::Ui, p: Palette) {
         ui.horizontal_wrapped(|ui| {
-            ui.text_edit_singleline(&mut self.filter);
+            ui.text_edit_singleline(&mut self.filters[1]);
             ui.checkbox(&mut self.system, "Systémové databáze");
             if ui.button("+ Vytvořit databázi").clicked() {
                 self.change_kind = Some(0);
             }
         });
-        let databases = self
-            .session
-            .snapshot
-            .as_ref()
-            .map(|s| s.databases.clone())
-            .unwrap_or_default();
+        // Arc clone: the frame keeps the rows without copying them.
+        let snapshot = self.session.snapshot.clone();
+        let databases = snapshot.as_deref().map_or(&[][..], |s| &s.databases);
         card(ui, p, |ui| {
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 egui::Grid::new("databases")
@@ -466,25 +550,26 @@ impl Harbor {
                             ui.strong(h);
                         }
                         ui.end_row();
-                        for db in databases.iter().filter(|d| {
-                            (self.system || !d.system())
-                                && d.name.to_lowercase().contains(&self.filter.to_lowercase())
-                        }) {
+                        let visible: Vec<&Database> = databases
+                            .iter()
+                            .filter(|d| self.database_visible(d))
+                            .collect();
+                        for db in visible {
                             if ui
                                 .selectable_label(
                                     self.selected_db.as_ref() == Some(&db.name),
-                                    &db.name,
+                                    safe_text(&db.name),
                                 )
                                 .clicked()
-                                && self.session.worker.send(Operation::Tables(db.name.clone()))
+                                && self.session.request(Operation::Tables(db.name.clone()))
                             {
                                 self.selected_db = Some(db.name.clone());
                                 self.session.tables.clear();
                             }
                             ui.label(db.tables.to_string());
                             ui.label(bytes_label(db.bytes));
-                            ui.label(&db.charset);
-                            ui.label(&db.collation);
+                            ui.label(safe_text(&db.charset));
+                            ui.label(safe_text(&db.collation));
                             ui.end_row();
                         }
                     });
@@ -492,12 +577,12 @@ impl Harbor {
         });
         if let Some(name) = &self.selected_db {
             card(ui, p, |ui| {
-                ui.heading(format!("Tabulky • {name}"));
+                ui.heading(format!("Tabulky • {}", safe_text(name)));
                 for t in &self.session.tables {
                     ui.label(format!(
                         "{} • {} • ≈ {} řádků • {}",
-                        t.name,
-                        t.engine,
+                        safe_text(&t.name),
+                        safe_text(&t.engine),
                         t.rows,
                         bytes_label(t.bytes)
                     ));
@@ -507,17 +592,13 @@ impl Harbor {
     }
     fn accounts(&mut self, ui: &mut egui::Ui, p: Palette) {
         ui.horizontal_wrapped(|ui| {
-            ui.text_edit_singleline(&mut self.filter);
+            ui.text_edit_singleline(&mut self.filters[2]);
             if ui.button("+ Vytvořit účet").clicked() {
                 self.change_kind = Some(1);
             }
         });
-        let accounts = self
-            .session
-            .snapshot
-            .as_ref()
-            .map(|s| s.accounts.clone())
-            .unwrap_or_default();
+        let snapshot = self.session.snapshot.clone();
+        let accounts = snapshot.as_deref().map_or(&[][..], |s| &s.accounts);
         card(ui, p, |ui| {
             egui::Grid::new("accounts")
                 .striped(true)
@@ -527,29 +608,33 @@ impl Harbor {
                     ui.strong("HOSTITEL");
                     ui.strong("AUTENTIZACE");
                     ui.end_row();
-                    for account in accounts.iter().filter(|a| a.label().contains(&self.filter)) {
+                    let visible: Vec<&Account> = accounts
+                        .iter()
+                        .filter(|a| self.account_visible(a))
+                        .collect();
+                    for account in visible {
                         if ui
                             .selectable_label(
                                 self.selected_account.as_ref() == Some(account),
-                                &account.user,
+                                safe_text(&account.user),
                             )
                             .clicked()
-                            && self.session.worker.send(Operation::Grants(account.clone()))
+                            && self.session.request(Operation::Grants(account.clone()))
                         {
                             self.selected_account = Some(account.clone());
                             self.session.grants.clear();
                         }
-                        ui.label(&account.host);
-                        ui.label(&account.plugin);
+                        ui.label(safe_text(&account.host));
+                        ui.label(safe_text(&account.plugin));
                         ui.end_row();
                     }
                 });
         });
         if let Some(account) = &self.selected_account {
             card(ui, p, |ui| {
-                ui.heading(account.label());
+                ui.heading(safe_text(&account.label()));
                 for grant in &self.session.grants {
-                    ui.monospace(grant);
+                    ui.monospace(safe_text(grant));
                 }
                 ui.horizontal(|ui| {
                     if ui.button("Změnit heslo…").clicked() {
@@ -563,16 +648,15 @@ impl Harbor {
         }
     }
     fn processes(&mut self, ui: &mut egui::Ui, p: Palette) {
-        ui.checkbox(
-            &mut self.long_only,
-            "Jen běžící dotazy nad 30 sekund (Sleep se nepočítá)",
-        );
-        let processes = self
-            .session
-            .snapshot
-            .as_ref()
-            .map(|s| s.processes.clone())
-            .unwrap_or_default();
+        ui.horizontal_wrapped(|ui| {
+            ui.text_edit_singleline(&mut self.filters[3]);
+            ui.checkbox(
+                &mut self.long_only,
+                "Jen běžící dotazy nad 30 sekund (Sleep se nepočítá)",
+            );
+        });
+        let snapshot = self.session.snapshot.clone();
+        let processes = snapshot.as_deref().map_or(&[][..], |s| &s.processes);
         card(ui, p, |ui| {
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 egui::Grid::new("processes")
@@ -583,10 +667,11 @@ impl Harbor {
                             ui.strong(h);
                         }
                         ui.end_row();
-                        for process in processes
+                        let visible: Vec<&Process> = processes
                             .iter()
-                            .filter(|p| !self.long_only || p.long_query())
-                        {
+                            .filter(|p| self.process_visible(p))
+                            .collect();
+                        for process in visible {
                             if ui
                                 .selectable_label(
                                     self.selected_process.as_ref().map(|p| p.id)
@@ -599,7 +684,7 @@ impl Harbor {
                             }
                             ui.label(safe_text(&process.database));
                             ui.label(format!("{} s", process.seconds));
-                            ui.label(&process.command);
+                            ui.label(safe_text(&process.command));
                             ui.label(safe_text(&process.state));
                             ui.end_row();
                         }
@@ -629,14 +714,43 @@ impl Harbor {
                 }
             }
             ui.label("Spojení, rozpracované formuláře i výběr se při přepnutí zachovají.");
-            let mut refresh = self.settings.refresh_seconds;
-            if ui
-                .add(egui::Slider::new(&mut refresh, 1..=300).text("Obnova (s)"))
-                .changed()
-            {
-                self.save(move |s| s.refresh_seconds = refresh);
-            }
+            let mut refresh = self.refresh_draft.unwrap_or(self.settings.refresh_seconds);
+            let slider = ui.add(egui::Slider::new(&mut refresh, 1..=300).text("Obnova (s)"));
+            self.refresh_slider(
+                refresh,
+                slider.dragged(),
+                slider.drag_stopped(),
+                slider.changed(),
+            );
         });
+    }
+    fn database_visible(&self, d: &Database) -> bool {
+        (self.system || !d.system())
+            && matches_filter(&self.filters[1], &[&d.name, &d.charset, &d.collation])
+    }
+    fn account_visible(&self, a: &Account) -> bool {
+        matches_filter(&self.filters[2], &[&a.user, &a.host, &a.plugin])
+    }
+    fn process_visible(&self, p: &Process) -> bool {
+        (!self.long_only || p.long_query())
+            && matches_filter(
+                &self.filters[3],
+                &[&p.user, &p.host, &p.database, &p.command, &p.query],
+            )
+    }
+    /// Dragging only updates the draft; the config file (with fsync) is written once,
+    /// on release or on a keyboard change, not for every pixel of a drag.
+    fn refresh_slider(&mut self, value: u64, dragging: bool, released: bool, changed: bool) {
+        if dragging && !released {
+            self.refresh_draft = Some(value);
+            return;
+        }
+        if released || changed {
+            self.refresh_draft = None;
+            if value != self.settings.refresh_seconds {
+                self.save(move |s| s.refresh_seconds = value);
+            }
+        }
     }
     fn dialogs(&mut self, ctx: &egui::Context) {
         if let Some(kind) = self.change_kind {
@@ -645,11 +759,11 @@ impl Harbor {
                 .resizable(true)
                 .show(ctx, |ui| {
                     if kind == 0 {
-                        field(ui, "Název databáze", &mut self.change_name, false);
+                        field(ui, "Název databáze", &mut self.change_db_name, false);
                         field(ui, "Kolace (ověří server)", &mut self.collation, false);
                     }
                     if kind == 1 {
-                        field(ui, "Uživatel", &mut self.change_name, false);
+                        field(ui, "Uživatel", &mut self.change_user, false);
                         field(ui, "Hostitel účtu", &mut self.change_host, false);
                     }
                     if kind == 1 || kind == 2 {
@@ -669,18 +783,18 @@ impl Harbor {
                         if ui.button("Zkontrolovat změnu…").clicked() {
                             self.confirmation = match kind {
                                 0 => Some(Change::CreateDatabase {
-                                    name: self.change_name.clone(),
+                                    name: self.change_db_name.clone(),
                                     collation: self.collation.clone(),
                                 }),
                                 1 => Some(Change::CreateAccount {
-                                    user: self.change_name.clone(),
+                                    user: self.change_user.clone(),
                                     host: self.change_host.clone(),
-                                    password: Secret::new(self.change_password.clone()),
+                                    password: Secret(self.change_password.clone()),
                                 }),
                                 2 => self.selected_account.clone().map(|account| {
                                     Change::ChangePassword {
                                         account,
-                                        password: Secret::new(self.change_password.clone()),
+                                        password: Secret(self.change_password.clone()),
                                     }
                                 }),
                                 3 => self.selected_account.clone().map(|account| {
@@ -698,6 +812,32 @@ impl Harbor {
                     });
                 });
         }
+        if let Some(id) = self.delete_profile.clone() {
+            let name = self
+                .settings
+                .profile(&id)
+                .map(|p| safe_text(&p.name))
+                .unwrap_or_else(|| "(už neexistuje)".into());
+            egui::Modal::new(egui::Id::new("confirm_profile_delete")).show(ctx, |ui| {
+                ui.heading("Odstranit uložený profil?");
+                ui.label(format!(
+                    "Profil „{name}“ bude odstraněn z konfigurace. Server se nemění."
+                ));
+                ui.horizontal(|ui| {
+                    let cancel = ui.button("Zrušit");
+                    if self.confirmation_focus {
+                        cancel.request_focus();
+                        self.confirmation_focus = false;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Escape)) || cancel.clicked() {
+                        self.delete_profile = None;
+                    }
+                    if ui.button("Odstranit profil").clicked() {
+                        self.confirm_delete_profile();
+                    }
+                });
+            });
+        }
         if let Some(change) = self.confirmation.clone() {
             egui::Modal::new(egui::Id::new("confirm_change")).show(ctx, |ui| {
                 ui.heading("Potvrdit změnu na serveru");
@@ -705,10 +845,10 @@ impl Harbor {
                     self.session
                         .profile
                         .as_ref()
-                        .map(|p| p.name.as_str())
-                        .unwrap_or("Odpojeno"),
+                        .map(|p| safe_text(&p.name))
+                        .unwrap_or_else(|| "Odpojeno".into()),
                 );
-                ui.label(change.summary());
+                ui.label(safe_text(&change.summary()));
                 if self.session.snapshot.as_ref().is_some_and(|s| s.demo) {
                     ui.label("DEMO • změna pouze v paměti");
                 }
@@ -730,7 +870,7 @@ impl Harbor {
                             egui::Button::new("Provést změnu"),
                         )
                         .clicked()
-                        && self.session.worker.send(Operation::Apply(change))
+                        && self.session.request(Operation::Apply(change))
                     {
                         self.confirmation = None;
                         self.change_kind = None;
@@ -749,9 +889,15 @@ impl eframe::App for Harbor {
 impl Harbor {
     fn render(&mut self, ctx: &egui::Context) {
         self.session.tick(self.settings.refresh_seconds);
-        ctx.request_repaint_after(Duration::from_millis(100));
+        self.sync_server_scope();
+        // Results arrive over a channel egui cannot see: poll quickly only while work is
+        // in flight, otherwise wake for the next refresh.
+        ctx.request_repaint_after(self.session.next_wakeup(self.settings.refresh_seconds));
         let p = Palette::new(self.theme);
-        self.style(ctx, p);
+        if self.styled != Some(self.theme) {
+            self.style(ctx, p);
+            self.styled = Some(self.theme);
+        }
         egui::SidePanel::left("navigation")
             .exact_width(224.0)
             .frame(egui::Frame::new().fill(p.side).inner_margin(20.0))
@@ -767,10 +913,10 @@ impl Harbor {
                     self.session
                         .profile
                         .as_ref()
-                        .map(|p| p.name.as_str())
-                        .unwrap_or("Žádné spojení"),
+                        .map(|p| safe_text(&p.name))
+                        .unwrap_or_else(|| "Žádné spojení".into()),
                 );
-                ui.label(&self.session.status);
+                ui.label(safe_text(&self.session.status));
                 ui.add_space(30.0);
                 for (index, label) in PAGES.iter().enumerate() {
                     if ui
@@ -796,8 +942,8 @@ impl Harbor {
                         self.session
                             .profile
                             .as_ref()
-                            .map(|p| p.name.as_str())
-                            .unwrap_or("—")
+                            .map(|p| safe_text(&p.name))
+                            .unwrap_or_else(|| "—".into())
                     ));
                     ui.strong(&self.session.status);
                     if self.session.worker.busy {
@@ -805,7 +951,7 @@ impl Harbor {
                         ui.label("Pracuji…");
                     }
                     if ui.button("Obnovit (F5)").clicked() {
-                        self.session.worker.send(Operation::Refresh);
+                        self.session.request(Operation::Refresh);
                     }
                 });
             });
@@ -854,13 +1000,13 @@ impl Harbor {
                         }
                         if let Some(snapshot) = &self.session.snapshot {
                             for notice in &snapshot.notices {
-                                ui.label(RichText::new(notice).small().color(p.muted));
+                                ui.label(RichText::new(safe_text(notice)).small().color(p.muted));
                             }
                         }
                     });
             });
         if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            self.session.worker.send(Operation::Refresh);
+            self.session.request(Operation::Refresh);
         }
         self.dialogs(ctx);
     }
@@ -930,12 +1076,13 @@ fn chart(ui: &mut egui::Ui, values: &[f64], p: Palette) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     #[test]
     fn themes_preserve_drafts_selection_and_render_at_both_sizes() {
         let ctx = egui::Context::default();
         let mut app = Harbor::new(&ctx, false);
         app.store = None;
-        app.change_name = "rozpracovaná_db".into();
+        app.change_db_name = "rozpracovaná_db".into();
         app.selected_db = Some("commerce".into());
         for theme in ThemeId::DESKTOP {
             app.theme = theme;
@@ -956,7 +1103,211 @@ mod tests {
                 }
             }
         }
-        assert_eq!(app.change_name, "rozpracovaná_db");
+        assert_eq!(app.change_db_name, "rozpracovaná_db");
         assert_eq!(app.selected_db.as_deref(), Some("commerce"));
+    }
+    fn frame(ctx: &egui::Context, app: &mut Harbor) -> egui::FullOutput {
+        ctx.run(egui::RawInput::default(), |ctx| app.render(ctx))
+    }
+    fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                _ => (),
+            }
+        }
+        let mut out = Vec::new();
+        shapes.iter().for_each(|s| walk(&s.shape, &mut out));
+        out
+    }
+    #[test]
+    fn server_text_with_control_or_bidi_characters_is_neutralized() {
+        let ctx = egui::Context::default();
+        let mut app = Harbor::new(&ctx, true);
+        app.store = None;
+        wait_for_snapshot(&ctx, &mut app);
+        let mut snapshot = (**app.session.snapshot.as_ref().unwrap()).clone();
+        snapshot.databases[0].name = "faktury\u{202e}gpj.exe\nDROP".into();
+        snapshot.accounts[0].host = "evil\u{2066}host".into();
+        app.session.snapshot = Some(std::sync::Arc::new(snapshot));
+        app.selected_account = None;
+        for page in [1, 2] {
+            app.page = page;
+            let all = texts(&frame(&ctx, &mut app).shapes).join("");
+            assert!(
+                !all.contains('\u{202e}') && !all.contains('\u{2066}'),
+                "page {page}"
+            );
+            assert!(all.contains("faktury") || page == 2);
+        }
+    }
+    #[test]
+    fn dragging_the_refresh_slider_writes_the_config_once() {
+        let directory =
+            std::env::temp_dir().join(format!("harbor-desktop-slider-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let ctx = egui::Context::default();
+        let mut app = Harbor::new(&ctx, false);
+        app.store = Some(ConfigStore::at(directory.clone()));
+        app.settings = Settings::default();
+        for value in 6..40 {
+            app.refresh_slider(value, true, false, true);
+        }
+        assert!(
+            !directory.join("settings.json").exists(),
+            "no write while dragging"
+        );
+        assert_eq!(app.refresh_draft, Some(39));
+        app.refresh_slider(39, false, true, false);
+        assert_eq!(app.settings.refresh_seconds, 39);
+        assert_eq!(app.refresh_draft, None);
+        assert_eq!(
+            ConfigStore::at(directory.clone())
+                .load()
+                .unwrap()
+                .refresh_seconds,
+            39
+        );
+        // Keyboard change (no drag) is saved right away.
+        app.refresh_slider(40, false, false, true);
+        assert_eq!(app.settings.refresh_seconds, 40);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn filters_are_per_page_case_insensitive_and_forms_do_not_share_drafts() {
+        let ctx = egui::Context::default();
+        let mut app = Harbor::new(&ctx, true);
+        app.store = None;
+        wait_for_snapshot(&ctx, &mut app);
+        let snapshot = app.session.snapshot.clone().unwrap();
+        app.filters[2] = "ANALYTICS".into();
+        assert_eq!(
+            snapshot
+                .accounts
+                .iter()
+                .filter(|a| app.account_visible(a))
+                .count(),
+            1
+        );
+        assert!(snapshot.databases.iter().any(|d| app.database_visible(d)));
+        app.filters[3] = "select date".into();
+        assert_eq!(
+            snapshot
+                .processes
+                .iter()
+                .filter(|p| app.process_visible(p))
+                .count(),
+            1
+        );
+        app.change_db_name = "nova_db".into();
+        assert!(app.change_user.is_empty());
+    }
+    #[test]
+    fn idle_window_does_not_repaint_ten_times_a_second() {
+        let ctx = egui::Context::default();
+        let mut app = Harbor::new(&ctx, false);
+        app.store = None;
+        // The first frames repaint at once (fonts, style install); then it settles.
+        for _ in 0..3 {
+            frame(&ctx, &mut app);
+        }
+        let output = frame(&ctx, &mut app);
+        let delay = output.viewport_output[&egui::ViewportId::ROOT].repaint_delay;
+        assert!(delay >= Duration::from_millis(900), "{delay:?}");
+    }
+    fn wait_for_snapshot(ctx: &egui::Context, app: &mut Harbor) {
+        let start = std::time::Instant::now();
+        frame(ctx, app);
+        while app.session.worker.busy && start.elapsed() < std::time::Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(5));
+            frame(ctx, app);
+        }
+        assert!(app.session.snapshot.is_some());
+    }
+    #[test]
+    fn switching_server_drops_selection_and_account_bound_drafts() {
+        let ctx = egui::Context::default();
+        let mut app = Harbor::new(&ctx, true);
+        app.store = None;
+        wait_for_snapshot(&ctx, &mut app);
+        let account = app.session.snapshot.as_ref().unwrap().accounts[0].clone();
+        app.selected_account = Some(account.clone());
+        app.selected_db = Some("commerce".into());
+        app.change_kind = Some(2);
+        app.change_password = Zeroizing::new("tajne".into());
+        app.confirmation = Some(Change::ChangePassword {
+            account,
+            password: Secret::new("tajne".into()),
+        });
+        frame(&ctx, &mut app);
+        assert!(
+            app.selected_account.is_some(),
+            "same server keeps the selection"
+        );
+        // Another server (here a fresh demo session) must not inherit the target account.
+        app.session
+            .connect(Profile::default(), Secret::default(), true);
+        frame(&ctx, &mut app);
+        assert!(app.selected_account.is_none());
+        assert!(app.selected_db.is_none());
+        assert!(app.confirmation.is_none());
+        assert!(app.change_kind.is_none());
+        assert!(app.change_password.is_empty());
+    }
+    #[test]
+    fn selection_missing_from_new_snapshot_is_dropped() {
+        let ctx = egui::Context::default();
+        let mut app = Harbor::new(&ctx, true);
+        app.store = None;
+        wait_for_snapshot(&ctx, &mut app);
+        app.selected_account = Some(Account {
+            user: "neexistuje".into(),
+            host: "%".into(),
+            plugin: "mysql_native_password".into(),
+        });
+        app.change_kind = Some(3);
+        frame(&ctx, &mut app);
+        assert!(app.selected_account.is_none());
+        assert!(app.change_kind.is_none());
+    }
+    #[test]
+    fn profiles_are_saved_and_deleted_by_id_with_confirmation() {
+        let directory =
+            std::env::temp_dir().join(format!("harbor-desktop-profiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let ctx = egui::Context::default();
+        let mut app = Harbor::new(&ctx, false);
+        app.store = Some(ConfigStore::at(directory.clone()));
+        app.settings = Settings::default();
+        for name in ["A", "B"] {
+            app.load_profile(Profile::default());
+            app.profile.name = name.into();
+            app.save_profile();
+            assert!(!app.profile.id.is_empty());
+        }
+        // Saving the same form twice updates it instead of duplicating it.
+        app.save_profile();
+        assert_eq!(app.settings.profiles.len(), 2);
+        let a = app.settings.profiles[0].clone();
+        app.load_profile(a.clone());
+        // Renaming A onto B is refused; B is not silently replaced.
+        app.profile.name = "B".into();
+        app.save_profile();
+        assert!(app.message.contains("už existuje"));
+        assert_eq!(app.settings.profiles.len(), 2);
+        // Delete targets the loaded profile id even though the form now says "B".
+        app.request_delete_profile();
+        assert_eq!(
+            app.settings.profiles.len(),
+            2,
+            "nothing deleted before confirmation"
+        );
+        assert_eq!(app.delete_profile.as_deref(), Some(a.id.as_str()));
+        app.confirm_delete_profile();
+        assert_eq!(app.settings.profiles.len(), 1);
+        assert_eq!(app.settings.profiles[0].name, "B");
+        assert!(app.profile.id.is_empty());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

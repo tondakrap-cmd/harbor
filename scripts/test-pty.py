@@ -58,7 +58,45 @@ def run_case(ending, command=None):
             os.close(master)
             os.close(slave)
 
+def menu_keys_case():
+    """Real terminal bytes: F9 and Alt+M (ESC m) open the menu; Ctrl+M arrives as CR = Enter."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+    title = "Nabídka".encode()
+    with tempfile.TemporaryDirectory(prefix="harbor-pty-") as config:
+        env = dict(os.environ, TERM="xterm-256color", XDG_CONFIG_HOME=config)
+        process = subprocess.Popen([str(BINARY), "--demo", "--colors=16"], stdin=slave, stdout=slave, stderr=slave, env=env)
+        output = bytearray()
+        def collect(seconds):
+            until = time.monotonic() + seconds
+            while time.monotonic() < until:
+                if select.select([master], [], [], 0.05)[0]:
+                    output.extend(os.read(master, 65536))
+        def after(keys):
+            output.clear()
+            os.write(master, keys)
+            collect(0.4)
+            return bytes(output)
+        try:
+            collect(0.5)
+            assert title not in after(b"\r"), "CR (Ctrl+M) must not open the menu"
+            assert title in after(b"\x1b[20~"), "F9 did not open the menu"
+            after(b"\x1b")
+            collect(0.2)
+            assert title in after(b"\x1bm"), "Alt+M did not open the menu"
+            os.write(master, b"\x03")
+            process.wait(timeout=5)
+            assert process.returncode == 0
+            print("PASS PTY menu keys F9 / Alt+M")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
 if __name__ == "__main__":
+    menu_keys_case()
     for ending in ["keyboard", signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
         run_case(ending)
     result = subprocess.run([str(BINARY)], input=b"", stdout=subprocess.PIPE, stderr=subprocess.PIPE)

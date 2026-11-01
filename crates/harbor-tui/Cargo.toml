@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 harbor-core.workspace = true
 harbor-themes.workspace = true
+zeroize.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 signal-hook.workspace = true

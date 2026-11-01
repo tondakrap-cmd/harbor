@@ -22,6 +22,7 @@ async fn tls_identity_ca_and_explicit_insecure_mode() {
         },
         tls: TlsMode::VerifyIdentity,
         ca: Some(ca.to_str().unwrap().into()),
+        ..Default::default()
     };
     let mut backend = Backend::connect(&profile, Secret::default()).await.unwrap();
     let snapshot = backend.snapshot().await.unwrap();
@@ -50,6 +51,20 @@ async fn tls_identity_ca_and_explicit_insecure_mode() {
         Backend::connect(&profile, Secret::new("incorrect".into())).await,
         Err(Error::Authentication)
     ));
+    // Without an explicit CA the system trust store is used (rustls-native-certs honors
+    // SSL_CERT_FILE, which stands in for update-ca-trust / update-ca-certificates here).
+    let system_store = Profile {
+        ca: None,
+        ..profile.clone()
+    };
+    assert!(matches!(
+        Backend::connect(&system_store, Secret::default()).await,
+        Err(Error::Tls)
+    ));
+    std::env::set_var("SSL_CERT_FILE", &ca);
+    let trusted = Backend::connect(&system_store, Secret::default()).await;
+    std::env::remove_var("SSL_CERT_FILE");
+    trusted.expect("CA from the system trust store is accepted");
     let insecure = Profile {
         tls: TlsMode::InsecureTestOnly,
         ca: None,

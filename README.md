@@ -36,7 +36,7 @@ sestavení DEB v Ubuntu samo o sobě tuto kontrolu nenahrazuje.
 
 ## TUI
 
-F10 nebo Ctrl+M otevře nabídku všech akcí. F1 zobrazí nápovědu, F3 profily a F5
+F10 (nebo F9 či Alt+M, pokud F10 zachytí terminál) otevře nabídku všech akcí. F1 zobrazí nápovědu, F3 profily a F5
 obnoví data. Šipky a PageUp/PageDown posouvají seznam, Enter otevírá detail.
 Tab přepíná seznam a detail; v detailu šipky posouvají dlouhý text. Vlevo/vpravo
 posouvá široký seznam. Ve formuláři Tab/Shift+Tab střídá pole a tlačítka.

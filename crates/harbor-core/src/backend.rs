@@ -3,7 +3,10 @@ use sqlx::{
     mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlSslMode},
     ConnectOptions, MySqlPool, Row,
 };
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 use zeroize::Zeroizing;
 
 pub struct Backend {
@@ -11,7 +14,17 @@ pub struct Backend {
 }
 enum Kind {
     Demo(Snapshot),
-    MariaDb(MySqlPool),
+    MariaDb(Server),
+}
+/// Per-schema table counts and sizes need a scan of information_schema.TABLES, which is
+/// slow on servers with many tables. It runs at most once per interval, not every refresh.
+pub const SIZE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Schema name -> (table count, bytes), with the time it was measured.
+type SchemaSizes = (Instant, HashMap<String, (u64, u64)>);
+struct Server {
+    pool: MySqlPool,
+    sizes: Option<SchemaSizes>,
+    size_interval: Duration,
 }
 impl Backend {
     pub fn demo() -> Self {
@@ -52,6 +65,7 @@ impl Backend {
                 processes: vec![
                     Process {
                         id: 1842,
+                        query_id: 90_211,
                         user: "analytics_ro".into(),
                         host: "demo:5000".into(),
                         database: "analytics".into(),
@@ -62,6 +76,7 @@ impl Backend {
                     },
                     Process {
                         id: 1871,
+                        query_id: 0,
                         user: "commerce_app".into(),
                         host: "demo:5001".into(),
                         database: "commerce".into(),
@@ -74,6 +89,7 @@ impl Backend {
                 notices: vec!["DEMO: ukázková data, změny platí jen v paměti do odpojení.".into()],
                 timezone: "Nezjištěno (demo)".into(),
                 demo: true,
+                source: 0,
             }),
         }
     }
@@ -97,6 +113,11 @@ impl Backend {
                 Transport::Unix { path } => options.socket(path).ssl_mode(MySqlSslMode::Disabled),
             };
         if let Some(ca) = &profile.ca {
+            if matches!(profile.transport, Transport::Tcp { .. })
+                && profile.tls == TlsMode::VerifyIdentity
+            {
+                check_ca_file(ca)?;
+            }
             options = options.ssl_ca(ca);
         }
         let pool = MySqlPoolOptions::new()
@@ -126,40 +147,94 @@ impl Backend {
             ));
         }
         Ok(Self {
-            inner: Kind::MariaDb(pool),
+            inner: Kind::MariaDb(Server {
+                pool,
+                sizes: None,
+                size_interval: SIZE_REFRESH_INTERVAL,
+            }),
         })
     }
+    /// How often per-database sizes and table counts are re-measured (default 60 s).
+    pub fn set_size_refresh_interval(&mut self, interval: Duration) {
+        if let Kind::MariaDb(server) = &mut self.inner {
+            server.size_interval = interval;
+        }
+    }
     pub async fn snapshot(&mut self) -> Result<Snapshot> {
-        let pool = match &mut self.inner {
+        let server = match &mut self.inner {
             Kind::Demo(snapshot) => {
                 snapshot.questions += 125;
                 snapshot.uptime += 5;
                 return Ok(snapshot.clone());
             }
-            Kind::MariaDb(pool) => pool,
+            Kind::MariaDb(server) => server,
         };
-        let row = sqlx::query("SELECT VERSION() AS version, @@time_zone AS timezone, CAST(@@max_connections AS UNSIGNED) AS maximum").fetch_one(&*pool).await?;
+        let pool = &server.pool;
+        // One statement, so global and own-session counters are read at the same instant.
+        // Questions/s then excludes Harbor's own statements (global minus this session).
+        // sqlx sets the *session* time_zone to +00:00, so @@time_zone would always say UTC.
+        let row = sqlx::query(
+            "SELECT VERSION() AS version, \
+             IF(@@global.time_zone = 'SYSTEM', CONCAT('SYSTEM (', @@system_time_zone, ')'), @@global.time_zone) AS timezone, \
+             CAST(@@max_connections AS UNSIGNED) AS maximum, \
+             CAST(CONNECTION_ID() AS UNSIGNED) AS source, \
+             CAST((SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'UPTIME') AS UNSIGNED) AS uptime, \
+             CAST((SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'QUESTIONS') AS UNSIGNED) AS questions, \
+             CAST((SELECT VARIABLE_VALUE FROM information_schema.SESSION_STATUS WHERE VARIABLE_NAME = 'QUESTIONS') AS UNSIGNED) AS own_questions, \
+             CAST((SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS WHERE VARIABLE_NAME = 'THREADS_CONNECTED') AS UNSIGNED) AS threads",
+        )
+        .fetch_one(pool)
+        .await?;
+        let counter = |name: &str| -> std::result::Result<u64, sqlx::Error> {
+            Ok(row.try_get::<Option<u64>, _>(name)?.unwrap_or(0))
+        };
         let mut snapshot = Snapshot {
             version: row.try_get("version")?,
             timezone: row.try_get("timezone")?,
             max_connections: row.try_get("maximum")?,
+            source: counter("source")?,
+            uptime: counter("uptime")?,
+            questions: counter("questions")?.saturating_sub(counter("own_questions")?),
+            connections: counter("threads")?,
             ..Default::default()
         };
-        let status: HashMap<String, String> = sqlx::query(
-            "SHOW GLOBAL STATUS WHERE Variable_name IN ('Uptime','Questions','Threads_connected')",
-        )
-        .fetch_all(&*pool)
-        .await?
-        .into_iter()
-        .map(|r| (r.get(0), r.get(1)))
-        .collect();
-        let metric = |name: &str| status.get(name).and_then(|v| v.parse().ok()).unwrap_or(0);
-        snapshot.uptime = metric("Uptime");
-        snapshot.questions = metric("Questions");
-        snapshot.connections = metric("Threads_connected");
-        snapshot.databases = sqlx::query("SELECT s.SCHEMA_NAME AS name, s.DEFAULT_CHARACTER_SET_NAME AS charset, s.DEFAULT_COLLATION_NAME AS collation, CAST(COUNT(t.TABLE_NAME) AS UNSIGNED) AS tables, CAST(COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH),0) AS UNSIGNED) AS bytes FROM information_schema.SCHEMATA s LEFT JOIN information_schema.TABLES t ON t.TABLE_SCHEMA=s.SCHEMA_NAME GROUP BY s.SCHEMA_NAME,s.DEFAULT_CHARACTER_SET_NAME,s.DEFAULT_COLLATION_NAME ORDER BY s.SCHEMA_NAME").fetch_all(&*pool).await?.iter().map(|r| Ok(Database { name: r.try_get("name")?, charset: r.try_get("charset")?, collation: r.try_get("collation")?, tables: r.try_get("tables")?, bytes: r.try_get("bytes")? })).collect::<std::result::Result<_, sqlx::Error>>()?;
+        let due = server
+            .sizes
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= server.size_interval);
+        if due {
+            let sizes = sqlx::query("SELECT TABLE_SCHEMA AS name, CAST(COUNT(*) AS UNSIGNED) AS tables, CAST(COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS UNSIGNED) AS bytes FROM information_schema.TABLES GROUP BY TABLE_SCHEMA")
+                .fetch_all(pool)
+                .await?
+                .iter()
+                .map(|r| Ok((r.try_get("name")?, (r.try_get("tables")?, r.try_get("bytes")?))))
+                .collect::<std::result::Result<HashMap<String, (u64, u64)>, sqlx::Error>>()?;
+            server.sizes = Some((Instant::now(), sizes));
+        }
+        let (measured, sizes) = server.sizes.as_ref().expect("measured above");
+        snapshot.databases = sqlx::query("SELECT SCHEMA_NAME AS name, DEFAULT_CHARACTER_SET_NAME AS charset, DEFAULT_COLLATION_NAME AS collation FROM information_schema.SCHEMATA ORDER BY SCHEMA_NAME")
+            .fetch_all(pool)
+            .await?
+            .iter()
+            .map(|r| {
+                let name: String = r.try_get("name")?;
+                let (tables, bytes) = sizes.get(&name).copied().unwrap_or((0, 0));
+                Ok(Database {
+                    name,
+                    charset: r.try_get("charset")?,
+                    collation: r.try_get("collation")?,
+                    tables,
+                    bytes,
+                })
+            })
+            .collect::<std::result::Result<_, sqlx::Error>>()?;
+        snapshot.notices.push(format!(
+            "Počty tabulek a velikosti změřeny před {} s; měří se nejvýše jednou za {} s.",
+            measured.elapsed().as_secs(),
+            server.size_interval.as_secs()
+        ));
         match sqlx::query("SELECT CONVERT(User USING utf8mb4) COLLATE utf8mb4_unicode_ci AS User, CONVERT(Host USING utf8mb4) COLLATE utf8mb4_unicode_ci AS Host, CONVERT(plugin USING utf8mb4) COLLATE utf8mb4_unicode_ci AS plugin FROM mysql.user ORDER BY User,Host")
-            .fetch_all(&*pool)
+            .fetch_all(pool)
             .await
         {
             Ok(rows) => {
@@ -182,7 +257,7 @@ impl Backend {
                     Error::from(error)
                 ));
                 let current: String = sqlx::query_scalar("SELECT CURRENT_USER()")
-                    .fetch_one(&*pool)
+                    .fetch_one(pool)
                     .await?;
                 if let Some((user, host)) = current.rsplit_once('@') {
                     snapshot.accounts.push(Account {
@@ -200,7 +275,7 @@ impl Backend {
     pub async fn tables(&self, database: &str) -> Result<Vec<TableInfo>> {
         match &self.inner {
             Kind::Demo(_) => Ok(vec![TableInfo { name: "daily_sales (demo)".into(), engine: "InnoDB".into(), rows: 4096, bytes: 1_048_576 }]),
-            Kind::MariaDb(pool) => Ok(sqlx::query("SELECT TABLE_NAME, COALESCE(ENGINE,'VIEW') AS engine, CAST(COALESCE(TABLE_ROWS,0) AS UNSIGNED) AS rows_count, CAST(COALESCE(DATA_LENGTH+INDEX_LENGTH,0) AS UNSIGNED) AS bytes FROM information_schema.TABLES WHERE TABLE_SCHEMA=? ORDER BY TABLE_NAME").bind(database).fetch_all(pool).await?.iter().map(|r| Ok(TableInfo { name: r.try_get("TABLE_NAME")?, engine: r.try_get("engine")?, rows: r.try_get("rows_count")?, bytes: r.try_get("bytes")? })).collect::<std::result::Result<_, sqlx::Error>>()?),
+            Kind::MariaDb(Server { pool, .. }) => Ok(sqlx::query("SELECT TABLE_NAME, COALESCE(ENGINE,'VIEW') AS engine, CAST(COALESCE(TABLE_ROWS,0) AS UNSIGNED) AS rows_count, CAST(COALESCE(DATA_LENGTH+INDEX_LENGTH,0) AS UNSIGNED) AS bytes FROM information_schema.TABLES WHERE TABLE_SCHEMA=? ORDER BY TABLE_NAME").bind(database).fetch_all(pool).await?.iter().map(|r| Ok(TableInfo { name: r.try_get("TABLE_NAME")?, engine: r.try_get("engine")?, rows: r.try_get("rows_count")?, bytes: r.try_get("bytes")? })).collect::<std::result::Result<_, sqlx::Error>>()?),
         }
     }
     pub async fn grants(&self, account: &Account) -> Result<Vec<String>> {
@@ -209,7 +284,7 @@ impl Backend {
                 "DEMO: SELECT na analytics pro {}",
                 account.label()
             )]),
-            Kind::MariaDb(pool) => {
+            Kind::MariaDb(Server { pool, .. }) => {
                 let current: String = sqlx::query_scalar("SELECT CURRENT_USER()")
                     .fetch_one(pool)
                     .await?;
@@ -223,8 +298,8 @@ impl Backend {
                     .fetch_all(pool)
                     .await?
                     .iter()
-                    .map(|r| redact_grant(r.get::<String, _>(0)))
-                    .collect())
+                    .map(|r| Ok(redact_grant(r.try_get::<String, _>(0)?)))
+                    .collect::<std::result::Result<_, sqlx::Error>>()?)
             }
         }
     }
@@ -238,40 +313,38 @@ impl Backend {
             }
             return Ok(());
         }
-        let Kind::MariaDb(pool) = &self.inner else {
+        let Kind::MariaDb(server) = &mut self.inner else {
             unreachable!()
         };
+        let pool = &server.pool;
+        let kill = matches!(change, Change::KillQuery { .. });
         let sql = match change {
             Change::CreateDatabase { name, collation } => {
                 let charset: Option<String> = sqlx::query_scalar("SELECT CHARACTER_SET_NAME FROM information_schema.COLLATIONS WHERE COLLATION_NAME=?").bind(&collation).fetch_optional(pool).await?;
                 let charset = charset
                     .ok_or_else(|| Error::Validation("Server tuto kolaci nepodporuje.".into()))?;
-                format!(
+                Zeroizing::new(format!(
                     "CREATE DATABASE {} CHARACTER SET {} COLLATE {}",
                     identifier(&name)?,
                     identifier(&charset)?,
                     identifier(&collation)?
-                )
+                ))
             }
             Change::CreateAccount {
                 user,
                 host,
                 password,
             } => {
-                validate_password(&password)?;
                 let account = Account {
                     user,
                     host,
                     plugin: "mysql_native_password".into(),
                 };
-                format!(
-                    "CREATE USER {} IDENTIFIED BY {}",
-                    account_sql(&account)?,
-                    quoted(&password.0)
-                )
+                create_account_sql(&account, &password)?
             }
             Change::ChangePassword { account, password } => {
                 validate_password(&password)?;
+                validate_account(&account.user, &account.host)?;
                 let plugin: Option<String> =
                     sqlx::query_scalar("SELECT CONVERT(plugin USING utf8mb4) COLLATE utf8mb4_unicode_ci FROM mysql.user WHERE User=? AND Host=?")
                         .bind(&account.user)
@@ -283,25 +356,21 @@ impl Backend {
                 if plugin.as_deref() != Some("mysql_native_password") || methods != Some(0) {
                     return Err(Error::Unsupported("Změna hesla je povolena pouze pro ověřený samostatný mysql_native_password; jiné mechanismy se nepřepisují.".into()));
                 }
-                format!(
-                    "SET PASSWORD FOR {} = PASSWORD({})",
-                    account_sql(&account)?,
-                    quoted(&password.0)
-                )
+                change_password_sql(&account, &password)?
             }
             Change::DatabaseGrant {
                 account,
                 database,
                 privilege,
                 grant,
-            } => format!(
+            } => Zeroizing::new(format!(
                 "{} {} ON {}.* {} {}",
                 if grant { "GRANT" } else { "REVOKE" },
                 privilege.sql(),
                 grant_identifier(&database)?,
                 if grant { "TO" } else { "FROM" },
                 account_sql(&account)?
-            ),
+            )),
             Change::KillQuery { target } => {
                 let current = processes(pool)
                     .await?
@@ -312,6 +381,8 @@ impl Backend {
                     || current.host != target.host
                     || current.database != target.database
                     || current.query != target.query
+                    || current.query_id != target.query_id
+                    || current.query_id == 0
                     || !current.running_query()
                     || current.seconds < target.seconds
                 {
@@ -319,16 +390,49 @@ impl Backend {
                         "Cíl se změnil; znovu otevřete detail.".into(),
                     ));
                 }
-                format!("KILL QUERY {}", target.id)
+                // QUERY_ID, not the thread id: if the statement ended in the meantime,
+                // the next statement on that connection is not hit.
+                Zeroizing::new(format!("KILL QUERY ID {}", target.query_id))
             }
         };
-        let sql = Zeroizing::new(sql);
-        sqlx::query(&sql).execute(pool).await?;
-        Ok(())
+        // Text protocol: DDL must not be prepared and kept in sqlx's per-connection
+        // statement cache (keyed by the SQL text) or as an open statement on the server.
+        match sqlx::raw_sql(&sql).execute(pool).await {
+            Ok(_) => {
+                // Our own write can change counts and sizes: measure on the next snapshot.
+                server.sizes = None;
+                Ok(())
+            }
+            // ER_NO_SUCH_QUERY: the statement finished between the check and KILL.
+            Err(sqlx::Error::Database(e))
+                if kill
+                    && e.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
+                        .map(|e| e.number())
+                        == Some(1957) =>
+            {
+                Err(Error::Validation(
+                    "Dotaz mezitím skončil; nic nebylo ukončeno.".into(),
+                ))
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 async fn processes(pool: &MySqlPool) -> Result<Vec<Process>> {
-    Ok(sqlx::query("SELECT CAST(ID AS UNSIGNED) AS ID,USER,HOST,COALESCE(DB,'') AS db_name,COMMAND,CAST(TIME AS UNSIGNED) AS elapsed,COALESCE(STATE,'') AS state_name,COALESCE(INFO,'') AS query_text FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() ORDER BY TIME DESC").fetch_all(pool).await?.iter().map(|r| Ok(Process { id: r.try_get("ID")?, user: r.try_get("USER")?, host: r.try_get("HOST")?, database: r.try_get("db_name")?, command: r.try_get("COMMAND")?, seconds: r.try_get("elapsed")?, state: r.try_get("state_name")?, query: r.try_get("query_text")? })).collect::<std::result::Result<_, sqlx::Error>>()?)
+    Ok(sqlx::query("SELECT CAST(ID AS UNSIGNED) AS ID,CAST(QUERY_ID AS UNSIGNED) AS query_id,USER,HOST,COALESCE(DB,'') AS db_name,COMMAND,CAST(TIME AS UNSIGNED) AS elapsed,COALESCE(STATE,'') AS state_name,COALESCE(INFO,'') AS query_text FROM information_schema.PROCESSLIST WHERE ID <> CONNECTION_ID() ORDER BY TIME DESC").fetch_all(pool).await?.iter().map(|r| Ok(Process { id: r.try_get("ID")?, query_id: r.try_get("query_id")?, user: r.try_get("USER")?, host: r.try_get("HOST")?, database: r.try_get("db_name")?, command: r.try_get("COMMAND")?, seconds: r.try_get("elapsed")?, state: r.try_get("state_name")?, query: r.try_get("query_text")? })).collect::<std::result::Result<_, sqlx::Error>>()?)
+}
+fn check_ca_file(path: &str) -> Result<()> {
+    let data = std::fs::read(path)
+        .map_err(|_| Error::Config(format!("soubor CA „{}“ nelze přečíst.", safe_text(path))))?;
+    if !data
+        .windows(27)
+        .any(|w| w == b"-----BEGIN CERTIFICATE-----")
+    {
+        return Err(Error::Config(
+            "soubor CA neobsahuje certifikát ve formátu PEM.".into(),
+        ));
+    }
+    Ok(())
 }
 fn validate_password(password: &Secret) -> Result<()> {
     if password.0.is_empty() {
@@ -348,6 +452,38 @@ fn validate_account(user: &str, host: &str) -> Result<()> {
     } else {
         Ok(())
     }
+}
+/// mysql_native_password stored form: '*' + upper hex of SHA1(SHA1(password)).
+/// Only this hash is sent, so the plaintext never appears in SQL text, PROCESSLIST,
+/// server logs or on an explicitly unencrypted test connection.
+fn native_password_hash(password: &Secret) -> Zeroizing<String> {
+    use sha1::{Digest, Sha1};
+    let stage1 = Zeroizing::new(<[u8; 20]>::from(Sha1::digest(password.0.as_bytes())));
+    let stage2 = Sha1::digest(stage1.as_slice());
+    let mut hash = Zeroizing::new(String::with_capacity(41));
+    hash.push('*');
+    for byte in stage2 {
+        hash.push_str(&format!("{byte:02X}"));
+    }
+    hash
+}
+fn create_account_sql(account: &Account, password: &Secret) -> Result<Zeroizing<String>> {
+    validate_password(password)?;
+    Ok(Zeroizing::new(format!(
+        "CREATE USER {} IDENTIFIED VIA mysql_native_password USING {}",
+        account_sql(account)?,
+        quoted(&native_password_hash(password))
+    )))
+}
+fn change_password_sql(account: &Account, password: &Secret) -> Result<Zeroizing<String>> {
+    validate_password(password)?;
+    // A literal (not PASSWORD()) is stored as the hash; the plugin was verified as
+    // mysql_native_password before this is called.
+    Ok(Zeroizing::new(format!(
+        "SET PASSWORD FOR {} = {}",
+        account_sql(account)?,
+        quoted(&native_password_hash(password))
+    )))
 }
 fn quoted(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -390,5 +526,33 @@ mod tests {
             "GRANT USAGE ON *.* TO 'u'@'h' IDENTIFIED BY PASSWORD 'hash'".into()
         )
         .contains("hash"));
+    }
+    #[test]
+    fn password_hash_matches_mariadb_password_function() {
+        // SELECT PASSWORD('password') on MariaDB / MySQL 5.x.
+        assert_eq!(
+            native_password_hash(&Secret::new("password".into())).as_str(),
+            "*2470C0C06DEE42FD1618BB99005ADCA2EC9D1E19"
+        );
+    }
+    #[test]
+    fn account_ddl_never_contains_the_plaintext_password() {
+        let account = Account {
+            user: "u'x".into(),
+            host: "localhost".into(),
+            plugin: "mysql_native_password".into(),
+        };
+        let password = Secret::new("Tajné'heslo\\x".into());
+        let hash = native_password_hash(&password);
+        for sql in [
+            create_account_sql(&account, &password).unwrap(),
+            change_password_sql(&account, &password).unwrap(),
+        ] {
+            assert!(!sql.contains("Tajné"), "{}", sql.as_str());
+            assert!(!sql.contains("PASSWORD("));
+            assert!(sql.contains(hash.as_str()));
+            assert!(sql.contains("'u''x'@'localhost'"));
+        }
+        assert!(create_account_sql(&account, &Secret::default()).is_err());
     }
 }
