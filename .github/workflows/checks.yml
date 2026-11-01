@@ -6,7 +6,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Native dependencies
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev ripgrep
       - name: Pinned Rust
         run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --all -- --check
@@ -14,4 +14,8 @@ jobs:
       - run: cargo test --locked --workspace
       - run: cargo build --locked --workspace
       - run: python3 scripts/test-pty.py
-      - run: bash scripts/package.sh
+      # package.sh builds offline; locally from .build-tools/cargo (not in git),
+      # here from the runner's cargo cache, filled for all platforms first.
+      - run: cargo fetch --locked
+      - name: Packages (offline)
+        run: CARGO_HOME="$HOME/.cargo" bash scripts/package.sh
