@@ -93,6 +93,7 @@ impl Backend {
                 notices: vec!["DEMO: ukázková data, změny platí jen v paměti do odpojení.".into()],
                 timezone: "Nezjištěno (demo)".into(),
                 datadir: "/var/lib/mysql/".into(),
+                accounts_limited: None,
                 log_error: String::new(),
                 demo: true,
                 source: 0,
@@ -201,9 +202,10 @@ impl Backend {
                 if kind == "VIEW" { "pohled".to_string() } else { format!("{engine} {collation}") },
             );
         }
-        for (db, table, column, column_type, nullable, default, extra) in
-            sqlx::query_as::<_, (String, String, String, String, String, Option<String>, String)>(&format!(
-                "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA \
+        for (db, table, column, column_type, nullable, default, extra, collation, generation) in
+            sqlx::query_as::<_, (String, String, String, String, String, Option<String>, String, Option<String>, Option<String>)>(&format!(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, \
+                 COLLATION_NAME, GENERATION_EXPRESSION \
                  FROM information_schema.COLUMNS WHERE TABLE_SCHEMA NOT IN {system}"
             ))
             .fetch_all(pool)
@@ -211,37 +213,42 @@ impl Backend {
         {
             objects.insert(
                 format!("{db}.{table}.{column}"),
-                format!(
-                    "{column_type}{}{}{}",
-                    if nullable == "NO" { " NOT NULL" } else { "" },
-                    default.map(|d| format!(" DEFAULT {d}")).unwrap_or_default(),
-                    if extra.is_empty() { String::new() } else { format!(" {extra}") }
+                compare::column_description(
+                    &column_type,
+                    nullable == "NO",
+                    default.as_deref(),
+                    &extra,
+                    collation.as_deref(),
+                    generation.as_deref(),
                 ),
             );
         }
-        let mut indexes: std::collections::BTreeMap<String, (bool, Vec<String>)> =
+        let mut indexes: std::collections::BTreeMap<String, compare::IndexShape> =
             Default::default();
-        for (db, table, index, non_unique, column) in sqlx::query_as::<_, (String, String, String, u64, String)>(&format!(
-            "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, CAST(NON_UNIQUE AS UNSIGNED), COLUMN_NAME \
-             FROM information_schema.STATISTICS WHERE TABLE_SCHEMA NOT IN {system} ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
-        ))
-        .fetch_all(pool)
-        .await?
+        for (db, table, index, non_unique, column, sub_part, index_type) in
+            sqlx::query_as::<_, (String, String, String, u64, Option<String>, Option<u64>, String)>(&format!(
+                "SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, CAST(NON_UNIQUE AS UNSIGNED), COLUMN_NAME, \
+                 CAST(SUB_PART AS UNSIGNED), INDEX_TYPE \
+                 FROM information_schema.STATISTICS WHERE TABLE_SCHEMA NOT IN {system} ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+            ))
+            .fetch_all(pool)
+            .await?
         {
             let entry = indexes
                 .entry(format!("{db}.{table} [index {index}]"))
-                .or_insert((non_unique == 0, Vec::new()));
-            entry.1.push(column);
+                .or_insert_with(|| compare::IndexShape {
+                    unique: non_unique == 0,
+                    kind: index_type,
+                    columns: Vec::new(),
+                });
+            let column = column.unwrap_or_else(|| "(výraz)".into());
+            entry.columns.push(match sub_part {
+                Some(length) => format!("{column}({length})"),
+                None => column,
+            });
         }
-        for (key, (unique, columns)) in indexes {
-            objects.insert(
-                key,
-                format!(
-                    "{}({})",
-                    if unique { "UNIQUE " } else { "" },
-                    columns.join(", ")
-                ),
-            );
+        for (key, shape) in indexes {
+            objects.insert(key, shape.description());
         }
         Ok(compare::SchemaOverview { objects })
     }
@@ -357,10 +364,11 @@ impl Backend {
                     .collect::<std::result::Result<_, sqlx::Error>>()?
             }
             Err(error) => {
-                snapshot.notices.push(format!(
-                    "Seznam všech účtů není dostupný: {}",
-                    Error::from(error)
-                ));
+                let reason = Error::from(error).to_string();
+                snapshot
+                    .notices
+                    .push(format!("Seznam všech účtů není dostupný: {reason}"));
+                snapshot.accounts_limited = Some(reason);
                 let current: String = sqlx::query_scalar("SELECT CURRENT_USER()")
                     .fetch_one(pool)
                     .await?;

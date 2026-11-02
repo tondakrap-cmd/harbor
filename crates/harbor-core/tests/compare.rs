@@ -46,7 +46,8 @@ async fn two_servers_compare_variables_accounts_and_schema() {
     let (mut left, mut right) = (admin(&a).await, admin(&b).await);
     for conn in [&mut left, &mut right] {
         sqlx::raw_sql(
-            "DROP DATABASE IF EXISTS harbor_cmp; DROP USER IF EXISTS 'harbor_cmp_only'@'localhost'",
+            "DROP DATABASE IF EXISTS harbor_cmp; DROP USER IF EXISTS 'harbor_cmp_only'@'localhost'; \
+             DROP USER IF EXISTS 'harbor_cmp_both'@'localhost'; DROP USER IF EXISTS 'harbor_cmp_limited'@'localhost'",
         )
         .execute(&mut *conn)
         .await
@@ -60,6 +61,27 @@ async fn two_servers_compare_variables_accounts_and_schema() {
         .execute(&mut right)
         .await
         .unwrap();
+    // Collation, generated column, index prefix and type, routine grant (issues #3–#5).
+    let shape = |collation: &str, plus: u8, prefix: u8, fulltext: &str| {
+        format!(
+            "CREATE TABLE harbor_cmp.x (id INT PRIMARY KEY, name VARCHAR(40) COLLATE {collation}, \
+             g INT AS (id+{plus}) VIRTUAL, UNIQUE KEY by_name (name({prefix})), {fulltext} ft (name)); \
+             CREATE PROCEDURE harbor_cmp.p() SELECT 1; \
+             CREATE USER 'harbor_cmp_both'@'localhost'; GRANT SELECT ON harbor_cmp.* TO 'harbor_cmp_both'@'localhost'"
+        )
+    };
+    sqlx::raw_sql(&shape("utf8mb4_unicode_ci", 1, 10, "KEY"))
+        .execute(&mut left)
+        .await
+        .unwrap();
+    sqlx::raw_sql(&format!(
+        "{}; GRANT EXECUTE ON PROCEDURE harbor_cmp.p TO 'harbor_cmp_both'@'localhost'; \
+         CREATE USER 'harbor_cmp_limited'@'localhost'",
+        shape("utf8mb4_bin", 2, 20, "FULLTEXT")
+    ))
+    .execute(&mut right)
+    .await
+    .unwrap();
     let mut session = Session::default();
     session.connect(profile("A", &a), Secret::default(), false);
     let wait = |session: &mut Session| {
@@ -118,9 +140,61 @@ async fn two_servers_compare_variables_accounts_and_schema() {
     );
     assert!(result.ignored > 0);
     assert!(result.left.contains("A (") && result.right.contains("B ("));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    let differs = |object: &str| {
+        let d = find(object).unwrap_or_else(|| panic!("{object} differs"));
+        assert_eq!(d.kind, DiffKind::Different, "{d:?}");
+        (d.left.clone(), d.right.clone())
+    };
+    let (l, r) = differs("harbor_cmp.x.name");
+    assert!(
+        l.contains("utf8mb4_unicode_ci") && r.contains("utf8mb4_bin"),
+        "{l} / {r}"
+    );
+    let (l, r) = differs("harbor_cmp.x.g");
+    assert!(l.contains("+ 1") || l.contains("+1"), "{l}");
+    assert!(r.contains("+ 2") || r.contains("+2"), "{r}");
+    let (l, r) = differs("harbor_cmp.x [index by_name]");
+    assert!(
+        l.contains("name(10)") && r.contains("name(20)"),
+        "{l} / {r}"
+    );
+    let (l, r) = differs("harbor_cmp.x [index ft]");
+    assert!(l.contains("BTREE") && r.contains("FULLTEXT"), "{l} / {r}");
+    let routine = find("harbor_cmp_both@localhost • oprávnění PROCEDURE harbor_cmp.p")
+        .expect("routine grant differs");
+    assert_eq!(
+        (routine.kind, routine.right.as_str()),
+        (DiffKind::OnlyRight, "EXECUTE")
+    );
+    // An account that cannot read mysql.user sees only itself: the result says so (#2).
+    let limited = Profile {
+        user: "harbor_cmp_limited".into(),
+        ..profile("B-limited", &b)
+    };
+    session
+        .compare_with(
+            limited,
+            Secret::default(),
+            Areas {
+                variables: false,
+                accounts: true,
+                schema: false,
+            },
+        )
+        .unwrap();
+    wait(&mut session);
+    let result = session.compare.as_ref().unwrap().result().unwrap().unwrap();
+    assert_eq!(result.warnings.len(), 1, "{:?}", result.warnings);
+    assert!(
+        result.warnings[0].contains("vpravo"),
+        "{:?}",
+        result.warnings
+    );
     for conn in [&mut left, &mut right] {
         sqlx::raw_sql(
-            "DROP DATABASE harbor_cmp; DROP USER IF EXISTS 'harbor_cmp_only'@'localhost'",
+            "DROP DATABASE harbor_cmp; DROP USER IF EXISTS 'harbor_cmp_only'@'localhost'; \
+             DROP USER IF EXISTS 'harbor_cmp_both'@'localhost'; DROP USER IF EXISTS 'harbor_cmp_limited'@'localhost'",
         )
         .execute(&mut *conn)
         .await

@@ -56,6 +56,9 @@ pub struct Comparison {
     pub compared: Vec<(Area, usize)>,
     /// Variables skipped because they differ on every server (paths, ids, positions).
     pub ignored: usize,
+    /// Areas that could not be compared completely (e.g. accounts the connected user
+    /// cannot list); "no differences" does not hold for them.
+    pub warnings: Vec<String>,
 }
 impl Comparison {
     /// CSV of the differences (oblast, objekt, rozdíl, vlevo, vpravo).
@@ -256,8 +259,87 @@ pub fn account_map(details: &[AccountDetail]) -> BTreeMap<String, String> {
         for column in &detail.columns {
             map.insert(format!("{name} • sloupec {column}"), "ano".into());
         }
+        for (object, privileges) in routine_grants(&detail.grants) {
+            map.insert(format!("{name} • oprávnění {object}"), privileges);
+        }
     }
     map
+}
+/// Privileges on single procedures, functions and packages, which exist only in SHOW
+/// GRANTS: "GRANT EXECUTE ON PROCEDURE `shop`.`p` TO ..." → ("PROCEDURE shop.p", "EXECUTE").
+pub fn routine_grants(grants: &[String]) -> Vec<(String, String)> {
+    const KINDS: &[&str] = &["PROCEDURE ", "FUNCTION ", "PACKAGE BODY ", "PACKAGE "];
+    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for grant in grants {
+        let Some(rest) = grant.strip_prefix("GRANT ") else {
+            continue;
+        };
+        let Some((privileges, rest)) = rest.split_once(" ON ") else {
+            continue;
+        };
+        let Some(kind) = KINDS.iter().find(|k| rest.starts_with(**k)) else {
+            continue;
+        };
+        let Some((object, tail)) = rest[kind.len()..].rsplit_once(" TO ") else {
+            continue;
+        };
+        let set = out
+            .entry(format!("{kind}{}", object.replace('`', "")))
+            .or_default();
+        set.extend(privileges.split(", ").map(|p| p.trim().to_string()));
+        if tail.contains(" WITH GRANT OPTION") {
+            set.insert(GRANT_OPTION.into());
+        }
+    }
+    out.into_iter()
+        .map(|(object, set)| (object, set.into_iter().collect::<Vec<_>>().join(", ")))
+        .collect()
+}
+/// How a column is shown and compared: type, nullability, default, extra, a collation
+/// and the expression of a generated column (both change stored or compared data).
+pub fn column_description(
+    column_type: &str,
+    not_null: bool,
+    default: Option<&str>,
+    extra: &str,
+    collation: Option<&str>,
+    generation: Option<&str>,
+) -> String {
+    let mut out = column_type.to_string();
+    if let Some(collation) = collation.filter(|c| !c.is_empty()) {
+        out.push_str(&format!(" COLLATE {collation}"));
+    }
+    if not_null {
+        out.push_str(" NOT NULL");
+    }
+    if let Some(default) = default {
+        out.push_str(&format!(" DEFAULT {default}"));
+    }
+    if !extra.is_empty() {
+        out.push_str(&format!(" {extra}"));
+    }
+    if let Some(expression) = generation.filter(|g| !g.is_empty()) {
+        out.push_str(&format!(" AS ({expression})"));
+    }
+    out
+}
+/// An index as compared: uniqueness, type (BTREE, HASH, FULLTEXT, SPATIAL…) and columns
+/// with their prefix length ("name(10)").
+#[derive(Clone, Debug, Default)]
+pub struct IndexShape {
+    pub unique: bool,
+    pub kind: String,
+    pub columns: Vec<String>,
+}
+impl IndexShape {
+    pub fn description(&self) -> String {
+        format!(
+            "{}{} ({})",
+            if self.unique { "UNIQUE " } else { "" },
+            self.kind,
+            self.columns.join(", ")
+        )
+    }
 }
 /// Schema objects of one server: "db", "db.table", "db.table.column", "db.table [index]".
 #[derive(Clone, Debug, Default)]
@@ -366,6 +448,14 @@ async fn compare(
             details.1.push(b.account_detail(account).await?);
         }
         let (ma, mb) = (account_map(&details.0), account_map(&details.1));
+        for (side, snapshot) in [("vlevo", &snap_a), ("vpravo", &snap_b)] {
+            if let Some(reason) = &snapshot.accounts_limited {
+                result.warnings.push(format!(
+                    "Účty nejsou porovnány úplně: {side} je vidět jen přihlášený účet \
+                     (seznam všech účtů není dostupný: {reason})."
+                ));
+            }
+        }
         result.compared.push((
             Area::Accounts,
             snap_a.accounts.len().max(snap_b.accounts.len()),
@@ -459,6 +549,66 @@ mod tests {
         let objects: Vec<&str> = diff.iter().map(|d| d.object.as_str()).collect();
         assert_eq!(objects, ["app@% • oprávnění shop.*", "app@% • stav"]);
         assert_eq!(diff[0].right, "INSERT, SELECT");
+    }
+    #[test]
+    fn routine_grants_are_compared() {
+        let detail = |grants: &[&str]| AccountDetail {
+            account: Some(Account {
+                user: "app".into(),
+                host: "%".into(),
+                plugin: String::new(),
+            }),
+            grants: grants.iter().map(|g| g.to_string()).collect(),
+            ..Default::default()
+        };
+        let base = "GRANT USAGE ON *.* TO `app`@`%`";
+        let diff = diff_maps(
+            Area::Accounts,
+            &account_map(&[detail(&[base])]),
+            &account_map(&[detail(&[
+                base,
+                "GRANT EXECUTE, ALTER ROUTINE ON PROCEDURE `shop`.`p` TO `app`@`%` WITH GRANT OPTION",
+                "GRANT `reporting` TO `app`@`%`",
+            ])]),
+        );
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!(diff[0].object, "app@% • oprávnění PROCEDURE shop.p");
+        assert_eq!(diff[0].kind, DiffKind::OnlyRight);
+        assert_eq!(diff[0].right, "ALTER ROUTINE, EXECUTE, GRANT OPTION");
+    }
+    #[test]
+    fn columns_include_collation_and_generation() {
+        let column = |collation, generation| {
+            column_description("varchar(20)", true, None, "", collation, generation)
+        };
+        assert_ne!(
+            column(Some("utf8mb4_unicode_ci"), None),
+            column(Some("utf8mb4_bin"), None)
+        );
+        assert_ne!(
+            column(None, Some("`id` + 1")),
+            column(None, Some("`id` + 2"))
+        );
+        assert_eq!(
+            column(Some("utf8mb4_bin"), Some("`id` + 1")),
+            "varchar(20) COLLATE utf8mb4_bin NOT NULL AS (`id` + 1)"
+        );
+    }
+    #[test]
+    fn indexes_include_prefix_and_type() {
+        let index = |kind: &str, column: &str| IndexShape {
+            unique: false,
+            kind: kind.into(),
+            columns: vec![column.into()],
+        };
+        assert_ne!(
+            index("BTREE", "name(10)").description(),
+            index("BTREE", "name(20)").description()
+        );
+        assert_ne!(
+            index("BTREE", "name").description(),
+            index("FULLTEXT", "name").description()
+        );
     }
     #[test]
     fn csv_lists_every_difference() {

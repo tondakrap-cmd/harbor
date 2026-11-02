@@ -642,19 +642,46 @@ impl Harbor {
         }
     }
     fn save_profile(&mut self) {
-        let profile = self.profile.clone();
+        let mut profile = self.profile.clone();
         // Turning "remember" off removes what was stored (only then is the keyring asked).
         let forget = !profile.remember_password
             && self
                 .settings
                 .profile(&profile.id)
                 .is_some_and(|stored| stored.remember_password);
+        // When the password cannot be removed, the profile keeps remembering it, so saving
+        // again (or "Zapomenout uložené heslo") finishes the removal.
+        let failed = forget
+            .then(|| secrets::delete_password(&profile.id).err())
+            .flatten();
+        if failed.is_some() {
+            profile.remember_password = true;
+            self.profile.remember_password = true;
+        }
         if let Some(id) = self.try_save(move |s| s.upsert_profile(profile)) {
             self.profile.id = id;
-            if forget {
-                let _ = secrets::delete_password(&self.profile.id);
+            if let Some(error) = failed {
+                self.message = format!(
+                    "Profil uložen, ale uložené heslo se nepodařilo odstranit: {error}. \
+                     Zapamatování zůstává zapnuté; po odemknutí úložiště to zkuste znovu."
+                );
             }
         }
+    }
+    /// Finishes removing passwords of deleted profiles that the secret service refused.
+    fn retry_password_removals(&mut self) {
+        let ids = self.settings.pending_password_removals.clone();
+        let (done, error) = secrets::retry_removals(&ids);
+        if !done.is_empty() {
+            self.try_save(|s| {
+                s.pending_password_removals.retain(|id| !done.contains(id));
+                Ok(())
+            });
+        }
+        self.message = match error {
+            Some(error) => error.to_string(),
+            None => "Uložená hesla odstraněných profilů jsou odstraněna.".into(),
+        };
     }
     fn request_delete_profile(&mut self) {
         // By id of the loaded profile, never by the (possibly edited) name in the form.
@@ -674,9 +701,20 @@ impl Harbor {
             .settings
             .profile(&id)
             .is_some_and(|p| p.remember_password);
-        let removed = self.try_save(move |s| s.remove_profile(&target)).is_some();
-        if removed && remembered {
-            let _ = secrets::delete_password(&id);
+        // The password goes first; if that fails the profile is still removed, but its id
+        // stays recorded so the removal can be finished later (Profily → Dokončit).
+        let failed = remembered
+            .then(|| secrets::delete_password(&id).err())
+            .flatten();
+        let left = failed.is_some();
+        let removed = self
+            .try_save(move |s| s.remove_profile_keeping(&target, left))
+            .is_some();
+        if let (true, Some(error)) = (removed, failed) {
+            self.message = format!(
+                "Profil odstraněn, ale jeho uložené heslo se nepodařilo odstranit: {error}. \
+                 Po odemknutí úložiště použijte „Dokončit odstranění hesel“."
+            );
         }
         if removed && self.profile.id == id {
             // The form stays filled in as an unsaved draft.
@@ -959,6 +997,18 @@ impl Harbor {
                 };
             }
         });
+        let pending = self.settings.pending_password_removals.len();
+        if pending > 0 {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(
+                    Palette::new(self.theme).warn,
+                    format!("Odstraněné profily s neodstraněným uloženým heslem: {pending}"),
+                );
+                if ui.button("Dokončit odstranění hesel").clicked() {
+                    self.retry_password_removals();
+                }
+            });
+        }
         ui.checkbox(
             &mut self.profile.read_only,
             "Jen pro čtení (produkce): žádné změny, obnovy, akce služby ani zápisy v konzoli",
@@ -3265,12 +3315,19 @@ impl Harbor {
             .filter(|d| matches_filter(&self.filters[COMPARE], &[&d.object, &d.left, &d.right]))
             .cloned()
             .collect();
+        for warning in &result.warnings {
+            banner(ui, p, Severity::Warning, &safe_text(warning), None);
+        }
         if result.differences.is_empty() {
             banner(
                 ui,
                 p,
                 Severity::Info,
-                "Servery se v porovnávaných oblastech neliší.",
+                if result.warnings.is_empty() {
+                    "Servery se v porovnávaných oblastech neliší."
+                } else {
+                    "Mezi načtenými objekty nejsou rozdíly; porovnání ale není úplné (viz výše)."
+                },
                 None,
             );
             return;
@@ -4690,7 +4747,13 @@ impl Harbor {
                     dark_sidebar(ui.visuals_mut(), p);
                 }
                 ui.add_space(6.0);
-                ui.heading(RichText::new("h  harbor").size(26.0));
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(30.0, 30.0), egui::Sense::hover());
+                    crate::logo::paint(ui.painter(), rect, p.accent);
+                    ui.add_space(4.0);
+                    ui.heading(RichText::new("Harbor").size(26.0).strong());
+                });
                 ui.small("MARIADB WORKSPACE");
                 ui.add_space(14.0);
                 ui.label(

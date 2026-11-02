@@ -17,6 +17,10 @@ pub struct Settings {
     pub ascii: bool,
     /// Directory for backups; empty = the default (~/.local/share/harbor/backups).
     pub backup_dir: String,
+    /// Ids of deleted profiles whose stored password could not be removed from the
+    /// secret service (locked or unavailable, e.g. over SSH); removal is retried on request.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending_password_removals: Vec<String>,
     /// Keys written by a newer Harbor version (desktop and TUI packages can differ);
     /// kept on read-modify-write instead of being dropped.
     #[serde(flatten)]
@@ -32,6 +36,7 @@ impl Default for Settings {
             terminal_colors: "auto".into(),
             ascii: false,
             backup_dir: String::new(),
+            pending_password_removals: Vec::new(),
             extra: serde_json::Map::new(),
         }
     }
@@ -82,7 +87,10 @@ impl Settings {
         }
         if profile.id.is_empty() {
             profile.id = new_profile_id();
-            while self.profile(&profile.id).is_some() {
+            // Never reuse the id of a password still waiting for removal.
+            while self.profile(&profile.id).is_some()
+                || self.pending_password_removals.contains(&profile.id)
+            {
                 profile.id = new_profile_id();
             }
         }
@@ -109,6 +117,15 @@ impl Settings {
             .position(|p| p.id == id)
             .ok_or_else(|| Error::Validation("Profil už v konfiguraci neexistuje.".into()))?;
         Ok(self.profiles.remove(index))
+    }
+    /// Removes a profile and records its stored password for a later removal when
+    /// `password_left` (deleting it from the secret service failed).
+    pub fn remove_profile_keeping(&mut self, id: &str, password_left: bool) -> Result<Profile> {
+        let profile = self.remove_profile(id)?;
+        if password_left && !self.pending_password_removals.iter().any(|p| p == id) {
+            self.pending_password_removals.push(id.to_string());
+        }
+        Ok(profile)
     }
 }
 #[derive(Clone)]

@@ -230,6 +230,9 @@ pub struct Snapshot {
     pub max_connections: u64,
     pub databases: Vec<Database>,
     pub accounts: Vec<Account>,
+    /// Why `accounts` holds only the connected account (mysql.user not readable);
+    /// None when the list is complete.
+    pub accounts_limited: Option<String>,
     pub processes: Vec<Process>,
     pub notices: Vec<String>,
     pub timezone: String,

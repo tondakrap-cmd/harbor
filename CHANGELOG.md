@@ -1,5 +1,19 @@
 # Změny
 
+## 0.6.1
+
+- Logo: značka „H“ ze dvou sloupků mola nad vlnou, vlevo nahoře v desktopu (v barvě
+  motivu) i jako ikona okna a balíčků (packaging/harbor.svg). Dříve tam byl jen text
+  „h harbor“, protože se z návrhu ztratil čtvereček značky.
+- Uložené heslo, které se nepodařilo odstranit (zamčené nebo nedostupné úložiště, SSH),
+  už nezmizí bez upozornění (#1): při vypnutí zapamatování zůstane volba zapnutá, aby
+  šlo odstranění zopakovat; u smazaného profilu se heslo zapamatuje k pozdějšímu
+  odstranění (desktop: Profily → Dokončit odstranění hesel, TUI: F10).
+- Porovnání serverů: upozorní, když účet nevidí všechny účty a porovnání účtů tedy není
+  úplné (#2); porovnává kolaci a výraz generovaných sloupců (#3), prefix a typ indexu
+  (#4) a oprávnění k jednotlivým procedurám, funkcím a balíčkům (#5).
+- scripts/test-keyring.sh bez HARBOR_TEST_HOST_DB_PORT nespouští databázovou část testu (#6).
+
 ## 0.6.0
 
 - Porovnání dvou serverů: připojený server proti uloženému profilu; proměnné (bez těch,

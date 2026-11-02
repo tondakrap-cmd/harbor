@@ -1,4 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Harbor: an "H" of two pier posts standing in a wave. Same geometry as
+       crates/harbor-desktop/src/logo.rs. -->
   <rect width="128" height="128" rx="28" fill="#087f75"/>
-  <path fill="#fff" d="M34 27h14v29h32V27h14v74H80V70H48v31H34z"/>
+  <path fill="#fff" d="M36 24h14v22h28V24h14v56H78V58H50v22H36z"/>
+  <path fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"
+        d="M28.0 97.0 L30.0 95.3 L32.0 93.8 L34.0 92.7 L36.0 92.1 L38.0 92.1 L40.0 92.7 L42.0 93.8 L44.0 95.3 L46.0 97.0 L48.0 98.7 L50.0 100.2 L52.0 101.3 L54.0 101.9 L56.0 101.9 L58.0 101.3 L60.0 100.2 L62.0 98.7 L64.0 97.0 L66.0 95.3 L68.0 93.8 L70.0 92.7 L72.0 92.1 L74.0 92.1 L76.0 92.7 L78.0 93.8 L80.0 95.3 L82.0 97.0 L84.0 98.7 L86.0 100.2 L88.0 101.3 L90.0 101.9 L92.0 101.9 L94.0 101.3 L96.0 100.2 L98.0 98.7 L100.0 97.0"/>
 </svg>

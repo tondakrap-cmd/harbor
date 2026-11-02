@@ -1,3 +1,4 @@
+mod logo;
 mod ui;
 use eframe::egui;
 fn main() -> eframe::Result {
@@ -43,7 +44,10 @@ fn main() -> eframe::Result {
         eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_inner_size([1440.0, 960.0])
-                .with_min_inner_size([1024.0, 720.0]),
+                .with_min_inner_size([1024.0, 720.0])
+                // X11 shows this icon; Wayland takes it from harbor.desktop by app id.
+                .with_icon(logo::icon(128))
+                .with_app_id("harbor"),
             ..Default::default()
         },
         Box::new(move |cc| Ok(Box::new(ui::Harbor::new(&cc.egui_ctx, demo)))),

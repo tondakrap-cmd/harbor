@@ -333,6 +333,20 @@ fn renaming_onto_another_profile_name_is_rejected_and_nothing_is_written() {
     assert_eq!(removed.name, "B");
     assert_eq!(settings.profiles.len(), 1);
     assert!(store.try_update(|s| s.remove_profile(&b)).is_err());
+    // A password the secret service refused to delete stays recorded across restarts.
+    let (settings, _) = store
+        .try_update(|s| s.remove_profile_keeping(&a, true))
+        .unwrap();
+    assert!(settings.profiles.is_empty());
+    assert_eq!(settings.pending_password_removals, [a.clone()]);
+    assert_eq!(store.load().unwrap().pending_password_removals, [a.clone()]);
+    let settings = store
+        .update(|s| s.pending_password_removals.retain(|id| id != &a))
+        .unwrap();
+    assert!(settings.pending_password_removals.is_empty());
+    assert!(!std::fs::read_to_string(directory.join("settings.json"))
+        .unwrap()
+        .contains("pending_password_removals"));
     std::fs::remove_dir_all(directory).unwrap();
 }
 #[test]

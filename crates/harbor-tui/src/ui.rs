@@ -106,6 +106,7 @@ enum Action {
     NextTheme,
     ResumeDraft,
     DeleteProfile,
+    RetryPasswordRemovals,
     Quit,
 }
 const MENU: &[(&str, Action)] = &[
@@ -191,6 +192,10 @@ const MENU: &[(&str, Action)] = &[
     ("Další motiv (zachová formulář)", Action::NextTheme),
     ("Rozpracovaný formulář", Action::ResumeDraft),
     ("Odstranit vybraný uložený profil", Action::DeleteProfile),
+    (
+        "Dokončit odstranění hesel smazaných profilů",
+        Action::RetryPasswordRemovals,
+    ),
     ("Konec", Action::Quit),
 ];
 /// Actions of a screen, offered first in the menu (F10) on that screen.
@@ -269,7 +274,12 @@ fn page_actions(page: usize) -> &'static [Action] {
             Action::ScheduleCreate,
             Action::ScheduleRemove,
         ],
-        PROFILES => &[Action::NewProfile, Action::DeleteProfile, Action::Demo],
+        PROFILES => &[
+            Action::NewProfile,
+            Action::DeleteProfile,
+            Action::RetryPasswordRemovals,
+            Action::Demo,
+        ],
         _ => &[Action::Refresh, Action::Demo, Action::Disconnect],
     }
 }
@@ -1001,6 +1011,12 @@ impl App {
                     result.differences.len(),
                     result.ignored
                 )];
+                lines.extend(
+                    result
+                        .warnings
+                        .iter()
+                        .map(|w| format!("! {}", safe_text(w))),
+                );
                 if let Some(d) = self.differences().get(self.selected) {
                     lines.push(format!(
                         "{} • {} • {}",
@@ -3465,6 +3481,27 @@ impl App {
                     }));
                 }
             }
+            Action::RetryPasswordRemovals => {
+                let ids = self.settings.pending_password_removals.clone();
+                if ids.is_empty() {
+                    self.say("Žádné uložené heslo nečeká na odstranění.");
+                    return;
+                }
+                let (done, error) = secrets::retry_removals(&ids);
+                if !done.is_empty() {
+                    if let Err(error) = self.try_save(|s| {
+                        s.pending_password_removals.retain(|id| !done.contains(id));
+                        Ok(())
+                    }) {
+                        self.say(error.to_string());
+                        return;
+                    }
+                }
+                match error {
+                    Some(error) => self.say(error.to_string()),
+                    None => self.say("Uložená hesla odstraněných profilů jsou odstraněna."),
+                }
+            }
             Action::Quit => self.quit = true,
             Action::Page(_) | Action::NextTheme => unreachable!(),
         }
@@ -3786,19 +3823,32 @@ impl App {
                 };
                 profile.validate()?;
                 if button == 1 {
+                    let mut profile = profile;
                     // Only a profile that remembered its password asks the keyring.
                     let forget = !profile.remember_password
                         && self
                             .settings
                             .profile(&profile.id)
                             .is_some_and(|stored| stored.remember_password);
-                    let id = self.try_save(|s| s.upsert_profile(profile))?;
-                    if forget {
-                        let _ = secrets::delete_password(&id);
+                    // If the password cannot be removed, the profile keeps remembering it
+                    // so that saving again finishes the removal.
+                    let failed = forget
+                        .then(|| secrets::delete_password(&profile.id).err())
+                        .flatten();
+                    if failed.is_some() {
+                        profile.remember_password = true;
+                        d.fields[15].value = Zeroizing::new("ANO".into());
                     }
+                    let id = self.try_save(|s| s.upsert_profile(profile))?;
                     // A second save of the same form updates this profile, not a new one.
                     d.kind = Kind::Profile(Some(id));
-                    self.say("Profil uložen. Heslo není součástí konfigurace.");
+                    match failed {
+                        Some(error) => self.say(format!(
+                            "Profil uložen, ale uložené heslo se nepodařilo odstranit: {error}. \
+                             Zapamatování zůstává zapnuté; zkuste to znovu po odemknutí úložiště."
+                        )),
+                        None => self.say("Profil uložen. Heslo není součástí konfigurace."),
+                    }
                     return Ok(Outcome::Keep);
                 }
                 if button == 2 {
@@ -4147,15 +4197,26 @@ impl App {
                 let change = match &confirm.action {
                     Pending::DeleteProfile { id } => {
                         let id = id.clone();
-                        match self.try_save(|s| s.remove_profile(&id)) {
+                        // The password goes first; if that fails the profile is removed
+                        // anyway and its id stays recorded for a later removal.
+                        let failed = self
+                            .settings
+                            .profile(&id)
+                            .is_some_and(|p| p.remember_password)
+                            .then(|| secrets::delete_password(&id).err())
+                            .flatten();
+                        let left = failed.is_some();
+                        match self.try_save(|s| s.remove_profile_keeping(&id, left)) {
                             Ok(profile) => {
-                                if profile.remember_password {
-                                    let _ = secrets::delete_password(&profile.id);
+                                let name = safe_text(&profile.name);
+                                match failed {
+                                    Some(error) => self.say(format!(
+                                        "Profil „{name}“ odstraněn, ale uložené heslo se \
+                                         nepodařilo odstranit: {error}. Po odemknutí úložiště \
+                                         použijte F10 → Dokončit odstranění hesel."
+                                    )),
+                                    None => self.say(format!("Profil „{name}“ odstraněn.")),
                                 }
-                                self.say(format!(
-                                    "Profil „{}“ odstraněn.",
-                                    safe_text(&profile.name)
-                                ));
                                 self.selected = 0;
                             }
                             Err(error) => self.say(error.to_string()),

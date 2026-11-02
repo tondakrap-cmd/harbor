@@ -43,6 +43,19 @@ pub fn delete_password(profile_id: &str) -> Result<()> {
         Err(error) => Err(unavailable(error)),
     }
 }
+/// Retries removing passwords of deleted profiles (`Settings::pending_password_removals`).
+/// Returns the ids that are now gone and the error that stopped it (a locked or missing
+/// secret service would fail, and ask to be unlocked, for every remaining id).
+pub fn retry_removals(ids: &[String]) -> (Vec<String>, Option<Error>) {
+    let mut done = Vec::new();
+    for id in ids {
+        if let Err(error) = delete_password(id) {
+            return (done, Some(error));
+        }
+        done.push(id.clone());
+    }
+    (done, None)
+}
 /// The password to use for a profile: the typed one, else the stored one when the
 /// profile remembers it.
 pub fn password_for(profile: &Profile, typed: Secret) -> Result<Secret> {

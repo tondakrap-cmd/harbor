@@ -9,9 +9,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" RUSTUP_AUTO_INSTALL=0
 cargo build --locked -p harbor-core --tests >/dev/null 2>&1 || true
 home=$(mktemp -d)
+# HARBOR_TEST_HOST_DB_PORT passes through only when set; the database part is optional.
 trap 'rm -rf "$home"' EXIT
 HOME="$home" XDG_DATA_HOME="$home/.local/share" XDG_RUNTIME_DIR="$home/run" \
-HARBOR_KEYRING_TEST=isolated HARBOR_TEST_HOST_DB_PORT="${HARBOR_TEST_HOST_DB_PORT:-}" \
+HARBOR_KEYRING_TEST=isolated \
   dbus-run-session -- bash -c '
     mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
     printf "test-keyring" | gnome-keyring-daemon --unlock --components=secrets >/dev/null

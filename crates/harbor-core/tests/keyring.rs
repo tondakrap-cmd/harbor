@@ -23,16 +23,17 @@ fn passwords_are_stored_loaded_and_used_for_connecting() {
         secrets::store_password("", &Secret::new("x".into())).is_err(),
         "unsaved profile"
     );
+    // The database part runs only with a valid port; an empty or invalid value skips it.
+    let db_port: Option<u16> = std::env::var("HARBOR_TEST_HOST_DB_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse().ok());
     let mut profile = Profile {
         id: id.into(),
         name: "keyring".into(),
         user: "harbor".into(),
         transport: Transport::Tcp {
             host: "127.0.0.1".into(),
-            port: std::env::var("HARBOR_TEST_HOST_DB_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(33318),
+            port: db_port.unwrap_or(33318),
         },
         tls: TlsMode::InsecureTestOnly,
         ..Default::default()
@@ -59,7 +60,7 @@ fn passwords_are_stored_loaded_and_used_for_connecting() {
         "a typed password wins"
     );
     // A session connects with an empty password field using the stored one.
-    if std::env::var("HARBOR_TEST_HOST_DB_PORT").is_ok() {
+    if db_port.is_some() {
         let mut session = Session::default();
         session.connect(profile.clone(), Secret::default(), false);
         let start = Instant::now();
